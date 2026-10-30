@@ -207,6 +207,8 @@ def test_faces_are_blanked_and_photo_cropped_to_the_product():
     out, mime = crop_without_faces(buf.getvalue(), [250, 0, 1000, 1000], [[0, 300, 200, 700]])
     res = Image.open(io.BytesIO(out))
     assert mime == "image/png" and res.size[1] < 200  # cropped below the top
+    nested, _ = crop_without_faces(buf.getvalue(), [[250, 0, 1000, 1000]], [])
+    assert Image.open(io.BytesIO(nested)).size[1] < 200
     assert crop_without_faces(buf.getvalue(), None, []) is None  # nothing to hide
     blank, _ = crop_without_faces(buf.getvalue(), None, [[0, 300, 200, 700]])
     assert Image.open(io.BytesIO(blank)).getpixel((50, 20)) == (255, 255, 255)

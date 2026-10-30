@@ -324,6 +324,8 @@ def crop_without_faces(data: bytes, product_box, faces: list) -> tuple[bytes, st
     for x0, y0, x1, y1 in face_boxes:
         pad = round(0.1 * max(x1 - x0, y1 - y0))
         draw.rectangle((x0 - pad, y0 - pad, x1 + pad, y1 + pad), fill="white")
+    if isinstance(product_box, list | tuple) and product_box and isinstance(product_box[0], list | tuple):
+        product_box = product_box[0]  # models sometimes nest the single box
     crop = _box(product_box, w, h) if isinstance(product_box, list | tuple) else None
     if crop:
         m = round(0.03 * max(w, h))
