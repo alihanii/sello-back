@@ -5,6 +5,7 @@ Wire formats: `gemini` (a key straight from Google AI Studio), `metis` (the same
 the MetisAI gateway), `openai` (OpenAI and compatible gateways), `anthropic`. Each key may carry its own
 proxy, stored with the key in the encrypted blob, because Google and OpenAI refuse requests from Iran."""
 
+import asyncio
 import base64
 import json
 import re
@@ -166,6 +167,21 @@ async def _call(
     raise AIError("نوع سرویس هوش مصنوعی پشتیبانی نمی‌شود.", code="ai_bad_kind")
 
 
+_BUSY = {"ai_http_503", "ai_http_500", "ai_http_502", "ai_http_504"}
+BUSY_RETRY_DELAYS = (3.0, 8.0)  # Gemini answers 503 "high demand" in bursts; a short wait usually clears it
+
+
+async def _retry_busy(fn):
+    """Runs `fn` again on transient provider overload (5xx) before falling back to the next key/model."""
+    for delay in (*BUSY_RETRY_DELAYS, None):
+        try:
+            return await fn()
+        except AIError as exc:
+            if exc.code not in _BUSY or delay is None:
+                raise
+            await asyncio.sleep(delay)
+
+
 def _raise_for(resp: httpx.Response) -> None:
     low = resp.text[:2000].lower()
     if "location is not supported" in low or "unsupported_country" in low or "not available in your country" in low:
@@ -181,6 +197,9 @@ def _raise_for(resp: httpx.Response) -> None:
         raise AIError("کلید API نامعتبر است یا دسترسی ندارد.", code=f"ai_http_{resp.status_code}", detail=resp.text[:500])
     if resp.status_code == 429:
         raise AIError("سقف استفاده از کلید API پر شده است.", code="ai_rate_limited", detail=resp.text[:500])
+    if resp.status_code in (500, 502, 503, 504):
+        raise AIError("سرویس هوش مصنوعی الان شلوغ است (خطای سمت گوگل/سرویس‌دهنده)؛ چند دقیقه بعد دوباره امتحان کن.",
+                      code=f"ai_http_{resp.status_code}", detail=resp.text[:500])
     if resp.status_code >= 400:
         raise AIError("سرویس هوش مصنوعی خطا داد.", code=f"ai_http_{resp.status_code}", detail=resp.text[:500])
 
@@ -246,7 +265,7 @@ async def generate_json(
     for provider, model, temp, is_fallback in candidates:
         started = time.monotonic()
         try:
-            text, tin, tout = await _call(provider, model, system, prompt, images or [], temp)
+            text, tin, tout = await _retry_busy(lambda: _call(provider, model, system, prompt, images or [], temp))
             result = json.loads(_strip_fences(text))
             await _log(provider, task, model, store_id, ok=True, is_fallback=is_fallback,
                        latency_ms=int((time.monotonic() - started) * 1000), input_tokens=tin, output_tokens=tout)
@@ -276,7 +295,8 @@ async def generate_text(
     for provider, model, temp, is_fallback in candidates:
         started = time.monotonic()
         try:
-            text, tin, tout = await _call(provider, model, system, prompt, images or [], temp, json_mode=False)
+            text, tin, tout = await _retry_busy(
+                lambda: _call(provider, model, system, prompt, images or [], temp, json_mode=False))
             if not text.strip():
                 raise AIError("مدل پاسخ خالی داد.", code="ai_empty")
             await _log(provider, task, model, store_id, ok=True, is_fallback=is_fallback,
@@ -306,7 +326,7 @@ async def generate_image(
         base = (provider.base_url or DEFAULT_BASE_URLS[provider.kind]).rstrip("/")
         parts: list[dict[str, Any]] = [{"text": prompt}]
         parts += [{"inlineData": {"mimeType": m, "data": base64.b64encode(d).decode()}} for d, m in images]
-        try:
+        async def post(provider=provider, model=model, base=base, parts=parts, temp=temp):
             async with httpx.AsyncClient(timeout=180, proxy=provider_proxy(provider) or None) as client:
                 resp = await client.post(
                     f"{base}/v1beta/models/{model}:generateContent", headers={"x-goog-api-key": _api_key(provider)},
@@ -315,7 +335,10 @@ async def generate_image(
                           "generationConfig": {"temperature": temp, "responseModalities": ["IMAGE"],
                                                "imageConfig": {"aspectRatio": "1:1", "imageSize": "2K"}}})
             _raise_for(resp)
-            data = resp.json()
+            return resp.json()
+
+        try:
+            data = await _retry_busy(post)
             blob = next((p["inlineData"] for c in data.get("candidates", []) for p in c.get("content", {}).get("parts", [])
                          if isinstance(p.get("inlineData"), dict) and p["inlineData"].get("data")), None)
             if not blob:

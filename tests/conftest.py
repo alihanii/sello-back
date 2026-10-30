@@ -10,6 +10,10 @@ os.environ["SELLO_ADMIN_PHONES"] = '["09120000000"]'
 os.environ["SELLO_OTP_MAX_SENDS_PER_10MIN"] = "100"
 
 import httpx  # noqa: E402
+
+from app.services import ai as _ai  # noqa: E402
+
+_ai.BUSY_RETRY_DELAYS = (0.0, 0.0)
 import pytest  # noqa: E402
 
 from app.main import app  # noqa: E402

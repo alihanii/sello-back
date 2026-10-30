@@ -57,3 +57,18 @@ async def test_metis_kind_uses_metis_gateway(monkeypatch):
     _patch(monkeypatch, handler, seen)
     await ai._call(_provider(kind="metis"), "gemini-2.5-flash", "s", "p", [], 0)
     assert seen["url"].startswith("https://api.metisai.ir/v1beta/models/")
+
+
+async def test_busy_503_is_retried_before_failing(monkeypatch):
+    hits = []
+
+    def handler(req):
+        hits.append(1)
+        if len(hits) < 3:
+            return httpx.Response(503, json={"error": {"message": "This model is currently experiencing high demand."}})
+        return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": '{"ok": true}'}]}}]})
+
+    _patch(monkeypatch, handler, {})
+    monkeypatch.setattr(ai, "BUSY_RETRY_DELAYS", (0.0, 0.0))
+    text, _, _ = await ai._retry_busy(lambda: ai._call(_provider(), "gemini-3.6-flash", "s", "p", [], 0))
+    assert text == '{"ok": true}' and len(hits) == 3
