@@ -46,6 +46,7 @@ class OpContext:
         self.db = db
         self.op = op
         self._order = len(op.steps) if op.steps else 0
+        self.empty_reason: str = ""  # set by a crawl adapter to explain why it found nothing
 
     @asynccontextmanager
     async def step(self, name: str, label_fa: str, request: Any = None):

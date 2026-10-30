@@ -12,14 +12,14 @@ from app.core.db import utcnow
 from app.core.security import decrypt_credentials, encrypt_credentials
 from app.deps import DB, AdminUser
 from app.models import (
-    AI_TASKS, AdminAuditLog, AiProvider, AiTaskRoute, AiUsageLog, Channel, ChannelListing, FeatureInterest,
+    AI_TASKS, IMAGE_TASKS, AdminAuditLog, AiProvider, AiTaskRoute, AiUsageLog, Channel, ChannelListing, FeatureInterest,
     Operation, Payment, Plan, PlanRequest, Product, Store, Subscription, User,
 )
 from app.services.bank import BANKS
 from app.services.integrations import INSTAGRAM_SCOPES, instagram_app, payment_config, save_instagram_app, save_payment_config
 from app.services.plans import PLAN_TIER, create_subscription, plan_config
 from app.schemas import ChannelOut, PlanConfig, PlanOut, StoreOut, UserOut
-from app.services.ai import DEFAULT_BASE_URLS, AIError, list_models, provider_proxy, test_provider
+from app.services.ai import DEFAULT_BASE_URLS, AIError, check_model, list_models, model_kind, provider_proxy, test_provider
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -345,9 +345,9 @@ async def providers(admin: AdminUser, db: DB):
     return {"providers": [_provider_out(p) for p in (await db.execute(select(AiProvider).order_by(AiProvider.id))).scalars()],
             "kinds": [{"kind": "gemini", "label": "Google Gemini (کلید مستقیم AI Studio)", "base_url": DEFAULT_BASE_URLS["gemini"],
                        "hint": "کلید را از aistudio.google.com/apikey بگیر. گوگل ایران را تحریم کرده؛ روی سرور داخل ایران پروکسی لازم است.",
-                       "model": "gemini-3.8-flash"},
+                       "model": "gemini-3.6-flash"},
                       {"kind": "metis", "label": "Gemini از طریق متیس", "base_url": DEFAULT_BASE_URLS["metis"],
-                       "hint": "کلید متیس؛ از داخل ایران بدون پروکسی کار می‌کند.", "model": "gemini-3.8-flash"},
+                       "hint": "کلید متیس؛ از داخل ایران بدون پروکسی کار می‌کند.", "model": "gemini-3.6-flash"},
                       {"kind": "openai", "label": "OpenAI یا سرویس سازگار", "base_url": DEFAULT_BASE_URLS["openai"],
                        "hint": "هر سرویس سازگار با OpenAI (مثلاً واسط‌های ایرانی)", "model": "gpt-4.1-mini"},
                       {"kind": "anthropic", "label": "Claude (Anthropic)", "base_url": DEFAULT_BASE_URLS["anthropic"], "hint": "", "model": "claude-sonnet-5-5"}],
@@ -356,6 +356,8 @@ async def providers(admin: AdminUser, db: DB):
 
 @router.post("/ai/providers")
 async def add_provider(body: ProviderIn, admin: AdminUser, db: DB):
+    if problem := check_model("product_generate", body.default_model.strip()):
+        raise HTTPException(422, f"مدل پیش‌فرض: {problem}")
     if body.kind not in DEFAULT_BASE_URLS:
         raise HTTPException(422, "نوع سرویس نامعتبر است.")
     if not body.api_key.strip():
@@ -372,6 +374,8 @@ async def add_provider(body: ProviderIn, admin: AdminUser, db: DB):
 
 @router.put("/ai/providers/{pid}")
 async def update_provider(pid: int, body: ProviderIn, admin: AdminUser, db: DB):
+    if problem := check_model("product_generate", body.default_model.strip()):
+        raise HTTPException(422, f"مدل پیش‌فرض: {problem}")
     p = await db.get(AiProvider, pid)
     if not p:
         raise HTTPException(404, "کلید پیدا نشد.")
@@ -422,7 +426,9 @@ async def available_models(body: ModelsIn, admin: AdminUser, db: DB, provider_id
     probe = AiProvider(name="probe", kind=body.kind, base_url=body.base_url,
                        api_key_encrypted=encrypt_credentials({"api_key": key, "proxy": body.proxy.strip()}))
     try:
-        return {"models": await list_models(probe)}
+        ids = await list_models(probe)
+        return {"models": [m for m in ids if model_kind(m)[0] == "text"],
+                "image_models": [m for m in ids if model_kind(m)[0] == "image"]}
     except AIError as exc:
         raise HTTPException(400, exc.message_fa)
     except httpx.HTTPError:
@@ -443,7 +449,7 @@ async def test_key(pid: int, admin: AdminUser, db: DB):
 @router.get("/ai/routes")
 async def routes(admin: AdminUser, db: DB):
     existing = {r.task: r for r in (await db.execute(select(AiTaskRoute))).scalars()}
-    return [{"task": t, "label": label,
+    return [{"task": t, "label": label, "needs": "image" if t in IMAGE_TASKS else "text",
              **({c: getattr(existing[t], c) for c in ("provider_id", "model", "fallback_provider_id", "fallback_model", "temperature")}
                 if t in existing else {"provider_id": None, "model": "", "fallback_provider_id": None, "fallback_model": "", "temperature": 30})}
             for t, label in AI_TASKS.items()]
@@ -461,6 +467,15 @@ class RouteIn(BaseModel):
 async def set_route(task: str, body: RouteIn, admin: AdminUser, db: DB):
     if task not in AI_TASKS:
         raise HTTPException(404, "کار نامعتبر است.")
+    for model, pid, label in ((body.model, body.provider_id, "مدل اصلی"), (body.fallback_model, body.fallback_provider_id, "مدل جایگزین")):
+        if not pid:
+            continue
+        p = await db.get(AiProvider, pid)
+        effective = model.strip() or (p.default_model if p and task not in IMAGE_TASKS else "")
+        if problem := check_model(task, effective):
+            raise HTTPException(422, f"{label}: {problem}")
+        if task in IMAGE_TASKS and p and p.kind not in ("gemini", "metis"):
+            raise HTTPException(422, f"{label}: تمیز کردن عکس فعلاً فقط با کلید Gemini (مستقیم یا متیس) کار می‌کند.")
     r = (await db.execute(select(AiTaskRoute).where(AiTaskRoute.task == task))).scalar_one_or_none()
     if not r:
         r = AiTaskRoute(task=task)

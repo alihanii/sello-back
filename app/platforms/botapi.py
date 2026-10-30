@@ -200,10 +200,14 @@ class BotApiAdapter:
         items: dict[str, CrawledItem] = {}
         groups: dict[str, CrawledItem] = {}
         chat_id = str(channel.config.get("chat_id"))
+        other_chats: set[str] = set()
         for upd in updates:
             offset = max(offset, upd["update_id"] + 1)
             post = upd.get("channel_post") or upd.get("edited_channel_post")
-            if not post or str(post.get("chat", {}).get("id")) != chat_id:
+            if not post:
+                continue
+            if str(post.get("chat", {}).get("id")) != chat_id:
+                other_chats.add(post.get("chat", {}).get("title") or str(post.get("chat", {}).get("id")))
                 continue
             photo = (post.get("photo") or [{}])[-1].get("file_id")
             caption = post.get("caption") or post.get("text") or ""
@@ -220,7 +224,22 @@ class BotApiAdapter:
             if photo:
                 item.image_urls.append(f"botfile:{photo}")
         channel.config = {**channel.config, "update_offset": offset}
+        if not items:
+            ctx.empty_reason = self._empty_reason(bool(channel.config.get("crawled_once")), other_chats)
+        channel.config = {**channel.config, "crawled_once": True}
         return list(items.values())[-limit:]
+
+    def _empty_reason(self, crawled_before: bool, other_chats: set[str]) -> str:
+        name = self.label_fa
+        if other_chats:
+            return (f"ربات پست‌هایی دریافت کرد ولی از کانال دیگری ({'، '.join(sorted(other_chats))[:120]}) بودند، "
+                    "نه کانالی که اینجا وصل است. کانال درست را در صفحهٔ کانال‌ها وصل کن.")
+        base = (f"ربات {name} نمی‌تواند پست‌های قدیمی کانال را بخواند؛ فقط پست‌هایی را می‌بیند که بعد از ادمین شدنش "
+                "در کانال منتشر شده‌اند، و پیام‌رسان این‌ها را حداکثر ۲۴ ساعت نگه می‌دارد. ")
+        if crawled_before:
+            return base + "از کرال قبلی تا الان پست جدیدی در کانال منتشر نشده. یک پست محصول بگذار و دوباره کرال کن."
+        return base + "یک پست محصول (عکس + متن با قیمت) در کانال بگذار و دوباره کرال کن."
+
 
     async def download_file(self, channel: Channel, file_id: str) -> tuple[bytes, str]:
         token = self._token(channel)

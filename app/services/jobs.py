@@ -19,6 +19,7 @@ from app.platforms.base import CrawledItem, EDIT_PRODUCT, PlatformError
 from app.platforms.registry import get_adapter
 from app.services import ai
 from app.services.media import read_local, save_bytes
+from app.services.product_images import clean_photo
 from app.services.automation import queue_publish
 from app.services.notify import notify
 from app.services.ops import OpContext, record_event
@@ -239,7 +240,7 @@ async def run_crawl(ctx: OpContext) -> None:
         op.status = "partial"
         op.error_message_fa = f"{counts['failed']} آیتم از {counts['seen']} آیتم استخراج نشد."
     if counts["seen"] == 0:
-        op.result["note"] = "آیتم جدیدی پیدا نشد."
+        op.result["note"] = ctx.empty_reason or "آیتم جدیدی پیدا نشد."
 
 
 # ---------- link fetching (reference + url crawl) ----------
@@ -342,10 +343,46 @@ async def generate_from_reference(ctx: OpContext, ref: ReferenceSet) -> Product:
     op.product_id = product.id
     op.result = {"product_id": product.id, "url_fetches": fetches}
     await record_event(db, store.id, "product_created", operation_id=op.id)
+    problems = []
     if any(f["status"] == "failed" for f in fetches):
+        problems.append("بعضی لینک‌ها کرال نشدند؛ محصول با بقیهٔ رفرنس‌ها ساخته شد.")
+    if (op.payload or {}).get("clean_image") and ref.images:
+        await db.commit()  # keep the product even if the image step fails
+        try:
+            url = await clean_photo(ctx, store_id=store.id, image_url=ref.images[0], title=product.title, note=ref.note,
+                                    category=str(result.get("image_category") or "general"))
+            await _set_main_image(db, product.id, url, origin=ref.images[0])
+            op.result = {**op.result, "clean_image": url}
+        except (ai.AIError, ValueError) as exc:
+            problems.append(f"محصول ساخته شد ولی عکس تمیز نشد: {getattr(exc, 'message_fa', None) or exc}")
+    if problems:
         op.status = "partial"
-        op.error_message_fa = "بعضی لینک‌ها کرال نشدند؛ محصول با بقیهٔ رفرنس‌ها ساخته شد."
+        op.error_message_fa = " ".join(problems)
     return product
+
+
+async def _set_main_image(db, product_id: int, url: str, origin: str) -> None:
+    """Puts the cleaned photo first and keeps the seller's originals after it."""
+    for img in (await db.execute(select(ProductImage).where(ProductImage.product_id == product_id))).scalars():
+        img.position += 1
+    db.add(ProductImage(product_id=product_id, url=url, position=0, origin_url=origin))
+    await db.flush()
+
+
+async def run_image_clean(ctx: OpContext) -> None:
+    """Cleans one existing product photo (product page button)."""
+    db, op = ctx.db, ctx.op
+    product = await _load_product(db, op.product_id)
+    image = await db.get(ProductImage, int(op.payload["image_id"]))
+    if not image or image.product_id != product.id:
+        raise PlatformError("عکس پیدا نشد.", "image_not_found")
+    try:
+        url = await clean_photo(ctx, store_id=product.store_id, image_url=image.url, title=product.title,
+                                note=product.description[:500], category=str(op.payload.get("category") or "general"))
+    except ValueError as exc:
+        raise PlatformError(str(exc), "image_not_found")
+    await _set_main_image(db, product.id, url, origin=image.url)
+    op.result = {"clean_image": url, "source_image_id": image.id}
 
 
 async def _style_context(db, store_id: int) -> tuple[dict | None, list[dict]]:
@@ -468,6 +505,7 @@ HANDLERS = {
     "health_check": run_health,
     "publish": run_publish,
     "crawl": run_crawl,
+    "image_clean": run_image_clean,
     "reference": run_reference,
     "style_profile": run_style_profile,
 }
