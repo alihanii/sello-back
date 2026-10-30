@@ -252,7 +252,9 @@ async def route_problem(task: str) -> str:
                                      .order_by(AiUsageLog.id.desc()).limit(1))).scalar_one_or_none()
             provider = await db.get(AiProvider, route.provider_id) if route.provider_id else None
             changed = max(route.updated_at, provider.updated_at if provider else route.updated_at)
-            if last and last.error_code == "ai_free_tier" and _aware(last.created_at) > _aware(changed):
+            no_quota = last and (last.error_code == "ai_free_tier"
+                                 or ("free_tier" in last.error_message and "limit: 0" in last.error_message))
+            if no_quota and _aware(last.created_at) > _aware(changed):
                 return ("کلید فعلی گوگل روی پلن رایگان است و گوگل برای مدل‌های تصویری سهمیهٔ صفر می‌دهد. برای ساخت عکس، "
                         "Billing را روی پروژهٔ گوگلِ این کلید فعال کن یا در پنل ادمین کلید دیگری برای «تمیز کردن عکس» بگذار؛ "
                         "بعد از ذخیرهٔ دوبارهٔ کلید یا مسیر، دوباره امتحان می‌شود.")
