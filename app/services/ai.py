@@ -239,6 +239,11 @@ async def _route(task: str) -> list[tuple[AiProvider, str, float, bool]]:
                 and (task not in IMAGE_TASKS or c[0].kind in ("gemini", "metis"))]
 
 
+async def has_route(task: str) -> bool:
+    async with SessionLocal() as db:
+        return (await db.execute(select(AiTaskRoute.id).where(AiTaskRoute.task == task))).first() is not None
+
+
 async def route_problem(task: str) -> str:
     """Why `task` can't run with the current admin settings, in Persian; empty when it can."""
     async with SessionLocal() as db:

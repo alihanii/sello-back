@@ -188,14 +188,22 @@ _TAIL = "1:1 aspect ratio, 2048x2048 pixels resolution, clean e-commerce cutout 
 
 
 def _sanitize(text: str) -> str:
-    text = re.sub(r"```\w*", "", text).replace("**", "").strip().strip('"“”\'')
-    text = " ".join(text.split())
-    return text if text.endswith(_TAIL) else f"{text.rstrip('.')}. {_TAIL}"
+    """platform-wrappers sanitize_generated_prompt, verbatim."""
+    cleaned = text.replace("**", "").strip()
+    cleaned = re.sub(r"^```(?:\w+)?\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip().strip('"')
 
 
-def _builder_input(*, title: str, note: str, category: str, has_photo: bool, design: bool = False,
-                   no_people: bool = False) -> str:
+def _builder_input(*, title: str, note: str, category: str, has_photo: bool, design: bool = False) -> str:
     num, label = IMAGE_CATEGORIES.get(category, IMAGE_CATEGORIES["general"])
+    if has_photo and not design:
+        # platform-wrappers build_prompt_builder_user_input, verbatim: the seller's text is the instruction.
+        instruction = note or title
+        return (f"PRODUCT NAME: {instruction}\n"
+                f"user description: {instruction}\n"
+                f"Selected category (prompt_type {num}): {label}\n\n"
+                "Analyze the attached e-commerce image and return exactly one raw English paragraph.")
     lines = [f"PRODUCT NAME: {title}", f"user description: {note or title}",
              f"Selected category (prompt_type {num}): {label}", ""]
     if has_photo and design:
@@ -204,17 +212,10 @@ def _builder_input(*, title: str, note: str, category: str, has_photo: bool, des
                      "this design applied to it (for clothing: printed on the chest, centred, at a natural print size, in a "
                      "colour that contrasts with the garment unless the description says otherwise). The design must be "
                      "reproduced exactly: same shapes, proportions and line work. Do not invent other logos or text.")
-    elif has_photo:
-        lines.append("Attached image 1 is the product photo (the ATTACHED IMAGE).")
-        if no_people:
-            lines.append("The product was worn or held by a person whose face has been cut out or blanked. Show the "
-                         "product ALONE: no person, no body, no skin, no hands, no face (clothing: invisible ghost "
-                         "mannequin or flat lay). Do not mention the person or any identity in the prompt.")
     else:
         lines.append("There is NO product photo: write a text-to-image prompt that depicts the product exactly as the "
                      "name and description say. Do not invent logos, brand names, printed text or details not stated.")
-    lines += ["", "Analyze the attached e-commerce image and return exactly one raw English paragraph."
-              if has_photo and not design else "Return exactly one raw English paragraph."]
+    lines += ["", "Return exactly one raw English paragraph."]
     return "\n".join(lines)
 
 
@@ -227,19 +228,13 @@ async def make_photo(ctx, *, store_id: int, title: str, note: str, category: str
     if image_url and not loaded:
         raise ValueError("عکس اصلی روی سرور پیدا نشد.")
     design = design and bool(loaded)
-    no_people = False
-    if loaded and not design and category == "modeled_clothing":
-        # Image models refuse photos of real, identifiable people (IMAGE_OTHER), so the face goes before any call.
-        hidden = await _hide_people(ctx, store_id, loaded)
-        if hidden:
-            loaded, no_people, category = hidden, True, "flat_clothing"
     images = [loaded] if loaded else []
     async with ctx.step("image_prompt", "تحلیل عکس و نوشتن دستور ویرایش" if loaded and not design else "نوشتن دستور ساخت عکس",
                         request={"category": category, "has_photo": bool(loaded), "design": design}) as s:
         raw = await ai.generate_text(
-            task="vision", system=PROMPT_BUILDER_SYSTEM, images=images, store_id=store_id,
-            prompt=_builder_input(title=title, note=note, category=category, has_photo=bool(loaded), design=design,
-                                  no_people=no_people))
+            task="image_prompt" if await ai.has_route("image_prompt") else "vision",
+            system=PROMPT_BUILDER_SYSTEM, images=images, store_id=store_id,
+            prompt=_builder_input(title=title, note=note, category=category, has_photo=bool(loaded), design=design))
         prompt = _sanitize(raw)
         s.response = {"prompt": prompt}
     label = "تمیز کردن عکس" if loaded and not design else "ساخت عکس محصول"
@@ -256,10 +251,8 @@ async def make_photo(ctx, *, store_id: int, title: str, note: str, category: str
             raise
         # The model returns no picture (IMAGE_OTHER) for a real person's face or a long, conflicting prompt.
         # One retry with a short, plain instruction, on the photo without its faces.
-        if loaded and not design and not no_people:
-            hidden = await _hide_people(ctx, store_id, loaded)
-            if hidden:
-                images, no_people = [hidden], True
+        if loaded and not design and (hidden := await _hide_people(ctx, store_id, loaded)):
+            images = [hidden]
         simple = _simple_prompt(title=title, note=note, has_photo=bool(loaded), design=design)
         async with ctx.step("image_retry", "تلاش دوباره با دستور ساده‌تر",
                             request={"prompt": simple, "images": 1 if loaded else 0, "design": design}) as s:
