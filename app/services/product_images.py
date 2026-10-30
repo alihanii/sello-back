@@ -257,7 +257,10 @@ async def make_photo(ctx, *, store_id: int, title: str, note: str, category: str
     styles = []
     if ctx.db is not None:
         styles = await chosen_styles(ctx.db, store_id, style_urls or [], style_product_ids or [])
-        styles = styles or await style_references(ctx.db, store_id, product_id)
+        # A design is drawn onto a new product: other products' prints (faces, logos) in automatic references
+        # confuse the image model, so only references the seller picked are used then.
+        if not styles and not (design and loaded):
+            styles = await style_references(ctx.db, store_id, product_id)
     images = ([loaded] if loaded else []) + styles
     design = design and bool(loaded)
     async with ctx.step("image_prompt", "تحلیل عکس و نوشتن دستور ویرایش" if loaded and not design else "نوشتن دستور ساخت عکس",
