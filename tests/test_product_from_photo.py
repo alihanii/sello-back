@@ -147,7 +147,8 @@ async def test_raw_photo_becomes_product_with_clean_main_image(client, monkeypat
     op4 = (await client.get(f"/operations/{r.json()['id']}", headers=h)).json()
     assert op4["status"] == "failed" and "Billing" in op4["error_message_fa"]
     status = (await client.get("/ai/status", headers=h)).json()
-    assert status["image_edit"] is False and "رایگان" in status["image_edit_problem"]
+    assert status["image_edit"] is False and status["image_edit_problem"] == ""  # sellers get no technical details
+    assert "رایگان" in (await client.get("/ai/status", headers=admin)).json()["image_edit_problem"]
     r = await client.post(f"/products/{prod3['id']}/clean-image", headers=h, json={})
     assert r.status_code == 422
     assert (await client.put("/admin/ai/routes/image_edit", headers=admin,
