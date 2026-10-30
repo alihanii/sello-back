@@ -232,8 +232,6 @@ async def export_csv(store_id: int, user: CurrentUser, db: DB):
 class CleanImageIn(BaseModel):
     image_id: int | None = None  # empty: generate a photo from the product text
     category: str = "general"  # flat_clothing | modeled_clothing | footwear | general
-    style_images: list[str] = []  # style samples; empty = the shop's earlier products
-    style_product_ids: list[int] = []
 
 
 @router.post("/products/{product_id}/clean-image", response_model=OperationOut, status_code=202)
@@ -246,7 +244,6 @@ async def clean_image(product_id: int, body: CleanImageIn, user: CurrentUser, db
         raise HTTPException(422, problem)
     op = await enqueue(db, store_id=p.store_id, type="image_clean", product_id=p.id, actor="ai",
                        title_fa=f"{'تمیز کردن' if body.image_id else 'ساخت'} عکس «{p.title[:60]}»",
-                       payload={"image_id": body.image_id, "category": body.category,
-                                "style_images": body.style_images[:3], "style_product_ids": body.style_product_ids[:3]})
+                       payload={"image_id": body.image_id, "category": body.category})
     await db.commit()
     return op

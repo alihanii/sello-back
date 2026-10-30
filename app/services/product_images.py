@@ -171,39 +171,7 @@ def _sanitize(text: str) -> str:
     return text if text.endswith(_TAIL) else f"{text.rstrip('.')}. {_TAIL}"
 
 
-async def style_references(db, store_id: int, exclude_product_id: int | None = None, limit: int = 2):
-    """Main photos of the shop's earlier products, so a new photo matches the catalogue's look."""
-    from sqlalchemy import select
-    from sqlalchemy.orm import selectinload
-
-    from app.models import Product
-
-    q = (select(Product).where(Product.store_id == store_id, Product.id != (exclude_product_id or 0))
-         .options(selectinload(Product.images)).order_by(Product.is_golden_sample.desc(), Product.id.desc()).limit(30))
-    refs = []
-    for prod in (await db.execute(q)).scalars():
-        for img in sorted(prod.images, key=lambda i: i.position)[:1]:
-            if loaded := read_local(img.url):
-                refs.append(loaded)
-        if len(refs) >= limit:
-            break
-    return refs
-
-
-DESIGN_IMAGE_SYSTEM = (
-    "You are generating a clean marketplace main product image. The first attached image is a DESIGN (artwork, logo, "
-    "pattern or print), not a photo of the product: show the product described in the prompt with that design applied "
-    "to it exactly, keeping the design's shapes, proportions and line work. Never add props, text overlays, watermarks, "
-    "people or extra objects unless the prompt requires them."
-)
-
-PHOTO_KIND_SYSTEM = """Look at the attached image from an online seller. Decide what it is.
-"product": a photo of a real, physical product (even a raw, badly lit phone photo, on a person, a hanger or a table).
-"design": a flat artwork, logo, drawing, pattern or print file the seller wants printed on a product (no physical product visible).
-Respond ONLY with JSON: {"kind":"product"} or {"kind":"design"}"""
-
-
-def _builder_input(*, title: str, note: str, category: str, has_photo: bool, styles: int, design: bool = False) -> str:
+def _builder_input(*, title: str, note: str, category: str, has_photo: bool, design: bool = False) -> str:
     num, label = IMAGE_CATEGORIES.get(category, IMAGE_CATEGORIES["general"])
     lines = [f"PRODUCT NAME: {title}", f"user description: {note or title}",
              f"Selected category (prompt_type {num}): {label}", ""]
@@ -218,58 +186,26 @@ def _builder_input(*, title: str, note: str, category: str, has_photo: bool, sty
     else:
         lines.append("There is NO product photo: write a text-to-image prompt that depicts the product exactly as the "
                      "name and description say. Do not invent logos, brand names, printed text or details not stated.")
-    if styles:
-        first = 2 if has_photo else 1
-        lines.append(f"Attached images {first}-{first + styles - 1} are STYLE REFERENCES: photos of this shop's other products. "
-                     "The new photo must look like it belongs to the same catalogue: match their background, lighting, "
-                     "camera angle, framing and layout. These style references override the default pure-white background "
-                     "rule when they use a different background. Never copy the products shown in them.")
     lines += ["", "Analyze the attached e-commerce image and return exactly one raw English paragraph."
               if has_photo and not design else "Return exactly one raw English paragraph."]
     return "\n".join(lines)
 
 
-async def chosen_styles(db, store_id: int, urls: list[str], product_ids: list[int], limit: int = 3):
-    """Style samples the seller picked: uploaded photos and/or the main photo of chosen products."""
-    from sqlalchemy import select
-    from sqlalchemy.orm import selectinload
-
-    from app.models import Product
-
-    picked = [u for u in urls if u.startswith(f"/media/{store_id}/")]
-    if product_ids:
-        q = (select(Product).where(Product.store_id == store_id, Product.id.in_(product_ids))
-             .options(selectinload(Product.images)))
-        for prod in (await db.execute(q)).scalars():
-            picked += [i.url for i in sorted(prod.images, key=lambda i: i.position)[:1]]
-    return [b for b in (read_local(u) for u in picked) if b][:limit]
-
-
 async def make_photo(ctx, *, store_id: int, title: str, note: str, category: str = "general",
-                     image_url: str | None = None, product_id: int | None = None,
-                     style_urls: list[str] | None = None, style_product_ids: list[int] | None = None,
-                     design: bool = False) -> str:
-    """Cleans `image_url`, or generates a photo from the text when there is none, in the style of the samples the
-    seller picked, else of the shop's earlier product photos. `design`: the photo is artwork to put on the product. Returns the /media URL. Raises AIError/ValueError with a Persian message."""
+                     image_url: str | None = None, design: bool = False) -> str:
+    """Cleans the seller's photo the way platform-wrappers made Digikala main images, or, when the photo is a design
+    (`design`) or missing, generates the product photo from the description (and the design). Only the seller's own
+    photo is sent. Returns the /media URL. Raises AIError/ValueError with a Persian message."""
     loaded = read_local(image_url) if image_url else None
     if image_url and not loaded:
         raise ValueError("عکس اصلی روی سرور پیدا نشد.")
-    styles = []
-    if ctx.db is not None:
-        styles = await chosen_styles(ctx.db, store_id, style_urls or [], style_product_ids or [])
-        # A design is drawn onto a new product: other products' prints (faces, logos) in automatic references
-        # confuse the image model, so only references the seller picked are used then.
-        if not styles and not (design and loaded):
-            styles = await style_references(ctx.db, store_id, product_id)
-    images = ([loaded] if loaded else []) + styles
+    images = [loaded] if loaded else []
     design = design and bool(loaded)
     async with ctx.step("image_prompt", "تحلیل عکس و نوشتن دستور ویرایش" if loaded and not design else "نوشتن دستور ساخت عکس",
-                        request={"category": category, "has_photo": bool(loaded), "design": design,
-                                 "style_refs": len(styles)}) as s:
+                        request={"category": category, "has_photo": bool(loaded), "design": design}) as s:
         raw = await ai.generate_text(
             task="vision", system=PROMPT_BUILDER_SYSTEM, images=images, store_id=store_id,
-            prompt=_builder_input(title=title, note=note, category=category, has_photo=bool(loaded), styles=len(styles),
-                                  design=design))
+            prompt=_builder_input(title=title, note=note, category=category, has_photo=bool(loaded), design=design))
         prompt = _sanitize(raw)
         s.response = {"prompt": prompt}
     label = "تمیز کردن عکس" if loaded and not design else "ساخت عکس محصول"
@@ -277,23 +213,19 @@ async def make_photo(ctx, *, store_id: int, title: str, note: str, category: str
         "You are generating a clean marketplace main product image from a text prompt. Depict only the described "
         "product, accurately; never add props, text overlays, watermarks, people or extra objects unless the prompt "
         "requires them.")
-    style_note = (" The last attached images are style references from the same shop: match their background, "
-                  "lighting, angle and framing, but never copy their products.") if styles else ""
     try:
-        async with ctx.step("image_edit", f"{label} (به سبک عکس‌های قبلی فروشگاه)" if styles else label,
-                            request={"prompt": prompt, "images": len(images), "design": design, "style_refs": len(styles)}) as s:
-            data, mime = await ai.generate_image(system=system + style_note, prompt=prompt, images=images, store_id=store_id)
+        async with ctx.step("image_edit", label, request={"prompt": prompt, "images": len(images), "design": design}) as s:
+            data, mime = await ai.generate_image(system=system, prompt=prompt, images=images, store_id=store_id)
             s.response = {"bytes": len(data), "mime": mime}
     except ai.AIError as exc:
         if exc.code != "ai_no_image":
             raise
-        # The model sometimes returns no picture (IMAGE_OTHER) for long prompts with several reference images.
-        # One retry with only the seller's photo and a short, plain instruction.
+        # The model sometimes returns no picture (IMAGE_OTHER) for a long or conflicting prompt.
+        # One retry with a short, plain instruction.
         simple = _simple_prompt(title=title, note=note, has_photo=bool(loaded), design=design)
         async with ctx.step("image_retry", "تلاش دوباره با دستور ساده‌تر",
                             request={"prompt": simple, "images": 1 if loaded else 0, "design": design}) as s:
-            data, mime = await ai.generate_image(system=system, prompt=simple, images=[loaded] if loaded else [],
-                                                 store_id=store_id)
+            data, mime = await ai.generate_image(system=system, prompt=simple, images=images, store_id=store_id)
             s.response = {"bytes": len(data), "mime": mime}
     url = save_bytes(store_id, data, content_type=mime)
     return url

@@ -354,10 +354,8 @@ async def generate_from_reference(ctx: OpContext, ref: ReferenceSet) -> Product:
         source = ref.images[0] if ref.images else None
         try:
             url = await make_photo(ctx, store_id=store.id, image_url=source, title=product.title,
-                                   note=ref.note or product.description[:400], product_id=product.id,
+                                   note=ref.note or product.description[:400],
                                    category=str(result.get("image_category") or "general"),
-                                   style_urls=op.payload.get("style_images") or [],
-                                   style_product_ids=op.payload.get("style_product_ids") or [],
                                    design=op.payload.get("photo_kind") == "design")
             await _set_main_image(db, product.id, url, origin=source or "")
             op.result = {**op.result, "clean_image": url}
@@ -389,10 +387,8 @@ async def run_image_clean(ctx: OpContext) -> None:
         raise PlatformError("عکس پیدا نشد.", "image_not_found")
     try:
         url = await make_photo(ctx, store_id=product.store_id, image_url=image.url if image else None, title=product.title,
-                               note=product.description[:500], product_id=product.id,
-                               category=str(op.payload.get("category") or "general"),
-                               style_urls=op.payload.get("style_images") or [],
-                               style_product_ids=op.payload.get("style_product_ids") or [])
+                               note=product.description[:500],
+                               category=str(op.payload.get("category") or "general"))
     except ValueError as exc:
         raise PlatformError(str(exc), "image_not_found")
     await _set_main_image(db, product.id, url, origin=image.url if image else "")

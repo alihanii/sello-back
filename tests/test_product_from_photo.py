@@ -107,7 +107,7 @@ async def test_raw_photo_becomes_product_with_clean_main_image(client, monkeypat
     assert [x["name"] for x in op2["steps"]][-2:] == ["image_edit", "image_retry"]  # one simpler retry
     assert "IMAGE_SAFETY" in str(op2["steps"][-2]["response"])  # the reason stays in the log
 
-    # no photo: a product with only text gets a generated photo, styled after the shop's earlier product photos
+    # no photo: a product with only text gets a photo generated from the text; other products' photos are never sent
     calls.clear()
 
     def ok(req):
@@ -123,20 +123,11 @@ async def test_raw_photo_becomes_product_with_clean_main_image(client, monkeypat
     op3 = (await client.get(f"/operations/{ops[0]['id']}", headers=h)).json()
     assert op3["status"] == "succeeded", op3
     builder = next(s for s in op3["steps"] if s["name"] == "image_prompt")
-    assert builder["request"]["has_photo"] is False and builder["request"]["style_refs"] >= 1
-    assert calls[-1][1] is False and calls[-1][2] == builder["request"]["style_refs"]  # only style photos were sent
-    assert b"style references" in sent["body"]
+    assert builder["request"]["has_photo"] is False
+    assert calls[-1][1] is False and calls[-1][2] == 0  # no images at all
+    assert b"inlineData" not in sent["body"]
     prod3 = (await client.get(f"/products/{op3['result']['product_id']}", headers=h)).json()
     assert prod3["images"][0]["url"] == op3["result"]["clean_image"]
-
-    # seller-picked style samples replace the automatic ones
-    r = await client.post(f"/products/{prod3['id']}/clean-image", headers=h,
-                          json={"style_product_ids": [prod["id"]], "style_images": ["/media/999/x.png"]})
-    await drain()
-    op5 = (await client.get(f"/operations/{r.json()['id']}", headers=h)).json()
-    assert op5["status"] == "succeeded", op5
-    step = next(s for s in op5["steps"] if s["name"] == "image_prompt")
-    assert step["request"]["style_refs"] == 1  # the chosen product's photo; the other store's path is ignored
 
     # free tier with no image quota: after Google says so once, the app stops calling until the admin re-saves
     def free(req):
@@ -162,8 +153,8 @@ def test_design_photo_builds_product_around_the_artwork():
     from app.services.product_images import _builder_input
 
     text = _builder_input(title="هودی مشکی", note="هودی مشکی با طرح، سایز XXL", category="flat_clothing",
-                          has_photo=True, styles=0, design=True)
+                          has_photo=True, design=True)
     assert "NOT the product" in text and "printed on the chest" in text
     assert "Analyze the attached e-commerce image" not in text
-    plain = _builder_input(title="هودی", note="", category="general", has_photo=True, styles=0)
+    plain = _builder_input(title="هودی", note="", category="general", has_photo=True)
     assert "is the product photo" in plain
