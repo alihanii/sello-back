@@ -7,7 +7,7 @@ ADAPTERS = {a.platform: a for a in (telegram, bale, digikala, instagram)}
 PLATFORM_INFO = {
     "telegram": {"label": "تلگرام", "connect": "bot", "can_publish": True, "can_crawl": True},
     "bale": {"label": "بله", "connect": "bot", "can_publish": True, "can_crawl": True},
-    "digikala": {"label": "دیجی‌کالا", "connect": "otp", "can_publish": False, "can_crawl": True},
+    "digikala": {"label": "دیجی‌کالا", "connect": "otp", "can_publish": True, "can_crawl": True},
     "instagram": {"label": "اینستاگرام", "connect": "token", "can_publish": True, "can_crawl": True, "flag": True},
 }
 

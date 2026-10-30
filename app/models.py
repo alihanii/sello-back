@@ -99,6 +99,8 @@ class Product(TimestampMixin, Base):
     created_by: Mapped[str] = mapped_column(String(10), default="user")  # user | ai | crawler
     tags: Mapped[list[str]] = mapped_column(JSON, default=list)
     is_golden_sample: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Ready-to-post text written by AI (content automations); channels use it instead of title + description.
+    post_caption: Mapped[str] = mapped_column(Text, default="")
 
     images: Mapped[list["ProductImage"]] = relationship(
         back_populates="product", order_by="ProductImage.position", cascade="all, delete-orphan"
@@ -275,7 +277,8 @@ class Automation(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), index=True)
     name: Mapped[str] = mapped_column(String(160))
-    trigger: Mapped[str] = mapped_column(String(20))  # product_created | product_updated | stock_changed | schedule
+    # product_created | product_updated | stock_changed | schedule | ai_content
+    trigger: Mapped[str] = mapped_column(String(20))
     conditions: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     # {"channel_ids": [...], "mode": "auto"|"approval", "schedule_hour": 10}
     actions: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
@@ -292,6 +295,22 @@ class Approval(TimestampMixin, Base):
     automation_id: Mapped[int | None] = mapped_column(ForeignKey("automations.id"))
     channel_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
     status: Mapped[str] = mapped_column(String(12), default="pending")  # pending | approved | rejected
+    kind: Mapped[str] = mapped_column(String(12), default="publish")  # publish | ai_post
+    operation_id: Mapped[int | None] = mapped_column(ForeignKey("operations.id"))
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Notification(TimestampMixin, Base):
+    __tablename__ = "notifications"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    store_id: Mapped[int | None] = mapped_column(ForeignKey("stores.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(20))  # approval | publish_failed | channel_error | info
+    title_fa: Mapped[str] = mapped_column(String(200))
+    body_fa: Mapped[str] = mapped_column(Text, default="")
+    link: Mapped[str] = mapped_column(String(300), default="")
+    image_url: Mapped[str] = mapped_column(String(1000), default="")
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 # ---------- calendar ----------
@@ -435,3 +454,12 @@ class AiUsageLog(Base):
     cost_toman: Mapped[int] = mapped_column(BigInteger, default=0)
     error_code: Mapped[str] = mapped_column(String(60), default="")
     error_message: Mapped[str] = mapped_column(Text, default="")
+
+
+class AppSetting(TimestampMixin, Base):
+    """Admin-managed integration settings (e.g. the Meta app for Instagram). Secrets are Fernet-encrypted."""
+
+    __tablename__ = "app_settings"
+    key: Mapped[str] = mapped_column(String(60), primary_key=True)
+    value: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    secret_encrypted: Mapped[str | None] = mapped_column(Text)

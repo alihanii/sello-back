@@ -109,12 +109,18 @@ async def test_admin_plans_and_ai_keys(client, monkeypatch):
     seller = await login(client, "09123333333")
     plans = (await client.get("/plans")).json()
     assert {p["duration_months"] for p in plans} == {1, 3, 12}
-    pro3 = next(p for p in plans if p["tier"] == "pro" and p["duration_months"] == 3)
+    assert len({p["tier"] for p in plans}) == 1  # one plan, three billing periods
+    cfg = (await client.get("/admin/plan-config", headers=admin)).json()
+    cfg["prices"][1]["price_toman"] = 2_500_000
+    cfg["limits"]["max_stores"] = 3
+    assert (await client.put("/admin/plan-config", headers=admin, json=cfg)).status_code == 200
+    pro3 = next(p for p in (await client.get("/plans")).json() if p["duration_months"] == 3)
+    assert pro3["price_toman"] == 2_500_000
     assert (await client.post("/plan-requests", headers=seller, json={"plan_id": pro3["id"]})).status_code == 200
     reqs = (await client.get("/admin/plan-requests", headers=admin)).json()
     assert (await client.post(f"/admin/plan-requests/{reqs[0]['id']}", headers=admin, json={"approve": True})).status_code == 200
     sub = (await client.get("/me/subscription", headers=seller)).json()
-    assert sub["subscription"]["plan"]["tier"] == "pro" and sub["limits"]["max_stores"] == 3
+    assert sub["subscription"]["plan"]["duration_months"] == 3 and sub["limits"]["max_stores"] == 3
     assert (await client.get("/admin/stats", headers=seller)).status_code == 403
 
     # AI key + route + a generation call, mocked at the HTTP layer
@@ -140,6 +146,6 @@ async def test_admin_plans_and_ai_keys(client, monkeypatch):
     assert prod["source"] == "ai" and prod["status"] == "draft" and prod["price"] == 1500000
 
     usage = (await client.get("/admin/ai/usage", headers=admin)).json()
-    row = usage["providers"][0]
+    row = next(r for r in usage["providers"] if r["provider"]["id"] == prov["id"])
     assert row["calls"] == 1 and row["input_tokens"] == 1000 and row["cost_toman"] == 2000
-    assert usage["by_task"][0]["task"] == "product_generate"
+    assert "product_generate" in {t["task"] for t in usage["by_task"]}

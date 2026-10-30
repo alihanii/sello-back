@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     credentials_key: str = ""
     cors_origins: list[str] = ["http://localhost:3000"]
     public_base_url: str = "http://localhost:8000"
+    # Where the seller app runs; OAuth redirects (Instagram) come back here.
+    frontend_base_url: str = "http://localhost:3000"
     media_dir: str = "./media"
 
     # OTP: in dev the code is returned in the response and logged instead of sent by SMS.
@@ -28,9 +30,12 @@ class Settings(BaseSettings):
 
     # AI keys, models and routing are managed from the admin panel (ai_providers table).
 
-    # Feature flags
+    # Instagram: the Meta app id/secret and an optional proxy are set in the admin panel; these are fallbacks.
     instagram_enabled: bool = False
-    instagram_graph_version: str = "v21.0"
+    instagram_graph_version: str = "v25.0"
+    instagram_app_id: str = ""
+    instagram_app_secret: str = ""
+    instagram_proxy: str = ""
 
     worker_enabled: bool = True
     worker_concurrency: int = 4

@@ -5,6 +5,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.db import utcnow
 from app.models import Channel, Plan, Product, Store, Subscription, User
 
+PLAN_TIER = "sello"  # the single plan; its 1/3/12-month variants share this tier
+
 # Limits for users without a subscription (trial / free).
 FREE_LIMITS = {"max_stores": 1, "max_channels": 2, "max_products": 30, "monthly_ai_credits": 20,
                "monthly_publishes": 50, "crawl_frequency": "daily"}
@@ -49,3 +51,20 @@ async def check_limit(db: AsyncSession, user: User, kind: str) -> None:
             Store.owner_id == user.id, Product.status != "archived"))
         if n >= limits["max_products"]:
             raise _limit_error("تعداد محصول", limits["max_products"])
+
+
+async def plan_config(db: AsyncSession) -> dict:
+    """The single plan as one feature set plus a price per billing period."""
+    rows = (await db.execute(select(Plan).where(Plan.tier == PLAN_TIER).order_by(Plan.duration_months))).scalars().all()
+    base = rows[0] if rows else None
+    by_months = {p.duration_months: p for p in rows}
+    return {
+        "name": base.name if base else "Sello",
+        "description": base.description if base else "",
+        "features": base.features if base else [],
+        "limits": base.limits if base else {},
+        "prices": [{"duration_months": m, "plan_id": by_months[m].id if m in by_months else None,
+                    "price_toman": by_months[m].price_toman if m in by_months else 0,
+                    "compare_at_toman": by_months[m].compare_at_toman if m in by_months else 0,
+                    "is_active": by_months[m].is_active if m in by_months else False} for m in (1, 3, 12)],
+    }

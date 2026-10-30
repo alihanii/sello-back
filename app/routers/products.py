@@ -107,10 +107,11 @@ async def update_product(product_id: int, body: ProductPatch, user: CurrentUser,
             l.status = "out_of_sync"
     await db.commit()
     trigger = "stock_changed" if set(data) == {"stock_qty"} else "product_updated"
-    await automation.fire(db, p.store_id, trigger, p.id)
+    pid, store_id = p.id, p.store_id  # read before expire_all: lazy loads aren't allowed in async sessions
+    await automation.fire(db, store_id, trigger, pid)
     await db.commit()
-    db.expire_all()
-    return await _get(db, user, p.id)
+    db.expunge_all()  # reload relationships fresh; expire_all would force lazy loads on `user`
+    return await _get(db, user, pid)
 
 
 @router.delete("/products/{product_id}")
@@ -132,10 +133,11 @@ async def set_stock(product_id: int, body: StockIn, user: CurrentUser, db: DB):
     db.add(InventoryMovement(product_id=p.id, delta=body.qty - p.stock_qty, qty_after=body.qty, reason="manual", note=body.note))
     p.stock_qty = body.qty
     await db.commit()
-    await automation.fire(db, p.store_id, "stock_changed", p.id)
+    pid = p.id
+    await automation.fire(db, p.store_id, "stock_changed", pid)
     await db.commit()
-    db.expire_all()
-    return await _get(db, user, p.id)
+    db.expunge_all()
+    return await _get(db, user, pid)
 
 
 @router.get("/products/{product_id}/inventory")

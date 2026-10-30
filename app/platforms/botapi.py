@@ -11,7 +11,7 @@ from app.core.config import settings
 from app.core.security import decrypt_credentials
 from app.models import Channel, Product, Store
 from app.platforms.base import EDIT_PRODUCT, RECONNECT, CrawledItem, PlatformError, PublishResult
-from app.services.text import MAX_CAPTION_CHARS, build_caption
+from app.services.text import MAX_CAPTION_CHARS, caption_for
 
 MAX_ALBUM = 10
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
@@ -139,9 +139,7 @@ class BotApiAdapter:
         chat_id = channel.config.get("chat_id")
         st = store.settings or {}
         async with ctx.step("build_caption", "آماده‌سازی متن پست") as s:
-            caption = build_caption(title=product.title, description=product.description, price=product.price,
-                                    show_price=st.get("show_price_in_caption", True),
-                                    signature=st.get("caption_signature", ""))
+            caption = caption_for(product, st)
             s.response = {"caption": caption, "length": len(caption)}
 
         images = [img.url for img in product.images][:MAX_ALBUM]

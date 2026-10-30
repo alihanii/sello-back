@@ -1,4 +1,7 @@
-"""Rule engine: "when <trigger>, if <conditions>, then publish to <channels> (auto or approval)"."""
+"""Rule engine: "when <trigger>, if <conditions>, then publish to <channels> (auto or approval)".
+
+`ai_content` rules are different: on the chosen weekdays/hour the AI writes new posts (from the catalog or
+from the seller's references), the owner gets a notification to approve, and approved posts join the queue."""
 
 from datetime import timedelta
 
@@ -86,3 +89,37 @@ async def run_scheduled(db: AsyncSession) -> None:
             if channel_ids - published and matches(p, rule.conditions or {}):
                 await apply_rule(db, rule, p)
                 break
+
+
+def tehran_now():
+    return utcnow() + timedelta(hours=3, minutes=30)
+
+
+def persian_weekday(dt) -> int:
+    """Saturday = 0 … Friday = 6, the order Iranian calendars use."""
+    return (dt.weekday() + 2) % 7
+
+
+async def enqueue_ai_posts(db: AsyncSession, rule: Automation, *, trigger: str, actor: str) -> list[int]:
+    n = max(1, min(int((rule.actions or {}).get("posts_per_run", 1)), 5))
+    ids = []
+    for i in range(n):
+        op = await enqueue(db, store_id=rule.store_id, type="ai_post", ref_type="automation", ref_id=rule.id,
+                           trigger=trigger, actor=actor, title_fa=f"ساخت پست با AI برای «{rule.name}»"
+                           + (f" ({i + 1} از {n})" if n > 1 else ""))
+        ids.append(op.id)
+    rule.last_run_at = utcnow()
+    rule.run_count += 1
+    return ids
+
+
+async def run_ai_content(db: AsyncSession) -> None:
+    now = tehran_now()
+    rules = (await db.execute(select(Automation).where(Automation.trigger == "ai_content", Automation.is_active))).scalars().all()
+    for rule in rules:
+        a = rule.actions or {}
+        if persian_weekday(now) not in a.get("weekdays", []) or int(a.get("hour", 10)) != now.hour:
+            continue
+        if rule.last_run_at and utcnow() - rule.last_run_at.replace(tzinfo=utcnow().tzinfo) < timedelta(hours=20):
+            continue
+        await enqueue_ai_posts(db, rule, trigger="schedule", actor="ai")

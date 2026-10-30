@@ -180,3 +180,19 @@ class PlanIn(BaseModel):
 
 class PlanOut(PlanIn, ORM):
     id: int
+
+
+class PlanPrice(BaseModel):
+    duration_months: int
+    price_toman: int
+    compare_at_toman: int = 0
+    is_active: bool = True
+    plan_id: int | None = None
+
+
+class PlanConfig(BaseModel):
+    name: str
+    description: str = ""
+    features: list[str] = []
+    limits: dict[str, Any] = {}
+    prices: list[PlanPrice]

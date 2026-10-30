@@ -12,13 +12,15 @@ from sqlalchemy.orm import selectinload
 from app.core.db import utcnow
 from app.core.security import encrypt_credentials
 from app.models import (
-    Channel, ChannelListing, CrawlItem, CrawlSource, Operation, Product, ProductImage, ReferenceSet, Store,
-    StoreStyleProfile,
+    Approval, Automation, Channel, ChannelListing, CrawlItem, CrawlSource, Operation, Product, ProductImage, ReferenceSet,
+    Store, StoreStyleProfile,
 )
 from app.platforms.base import CrawledItem, EDIT_PRODUCT, PlatformError
 from app.platforms.registry import get_adapter
 from app.services import ai
 from app.services.media import read_local, save_bytes
+from app.services.automation import queue_publish
+from app.services.notify import notify
 from app.services.ops import OpContext, record_event
 from app.services.text import normalize_fa, parse_caption, parse_number
 
@@ -287,8 +289,12 @@ async def fetch_product_page(url: str) -> dict[str, Any]:
 # ---------- AI: reference-based generation & style profile ----------
 
 async def run_reference(ctx: OpContext) -> None:
+    ref = await ctx.db.get(ReferenceSet, ctx.op.ref_id)
+    await generate_from_reference(ctx, ref)
+
+
+async def generate_from_reference(ctx: OpContext, ref: ReferenceSet) -> Product:
     db, op = ctx.db, ctx.op
-    ref = await db.get(ReferenceSet, op.ref_id)
     store = await db.get(Store, op.store_id)
     pages: list[dict] = []
     fetches = []
@@ -339,6 +345,99 @@ async def run_reference(ctx: OpContext) -> None:
     if any(f["status"] == "failed" for f in fetches):
         op.status = "partial"
         op.error_message_fa = "بعضی لینک‌ها کرال نشدند؛ محصول با بقیهٔ رفرنس‌ها ساخته شد."
+    return product
+
+
+async def _style_context(db, store_id: int) -> tuple[dict | None, list[dict]]:
+    prof = (await db.execute(select(StoreStyleProfile).where(StoreStyleProfile.store_id == store_id))).scalar_one_or_none()
+    q = (select(Product).where(Product.store_id == store_id, Product.source != "ai")
+         .order_by(Product.is_golden_sample.desc(), Product.id.desc()).limit(4))
+    samples = [{"title": p.title, "description": p.description[:500]} for p in (await db.execute(q)).scalars()]
+    return (prof.profile if prof else None), samples
+
+
+async def _pick_catalog_product(db, rule: Automation) -> Product | None:
+    """Oldest product with photos that isn't yet on every target channel and isn't already waiting for approval."""
+    targets = set((rule.actions or {}).get("channel_ids", []))
+    pending = select(Approval.product_id).where(Approval.store_id == rule.store_id, Approval.status == "pending")
+    q = (select(Product).where(Product.store_id == rule.store_id, Product.status.in_(["ready", "draft"]),
+                               Product.id.not_in(pending))
+         .options(selectinload(Product.images), selectinload(Product.listings)).order_by(Product.id))
+    for p in (await db.execute(q)).scalars():
+        done = {l.channel_id for l in p.listings if l.status in ("published", "queued", "publishing")}
+        if p.images and targets - done:
+            return p
+    return None
+
+
+async def run_ai_post(ctx: OpContext) -> None:
+    """Content automation: pick (or build) a product, have AI write the post, then ask the owner to approve."""
+    db, op = ctx.db, ctx.op
+    rule = await db.get(Automation, op.ref_id)
+    if not rule:
+        raise PlatformError("اتوماسیون این کار حذف شده است.", "automation_missing")
+    a = rule.actions or {}
+    source = a.get("source", "catalog")
+
+    if source == "references":
+        queue = list(a.get("queue") or [])
+        if not queue:
+            raise PlatformError("صف رفرنس‌های این اتوماسیون خالی است؛ عکس یا لینک جدید اضافه کنید.", "queue_empty",
+                                {"type": "edit_automation", "label": "افزودن رفرنس"})
+        item, rule.actions = queue[0], {**a, "queue": queue[1:]}
+        ref = ReferenceSet(store_id=rule.store_id, images=item.get("images", []), urls=item.get("urls", []),
+                           note="\n".join(x for x in (a.get("brief", ""), item.get("note", "")) if x),
+                           price=int(item.get("price") or 0), stock_qty=int(item.get("stock_qty") or 0),
+                           use_style_profile=a.get("use_style_profile", True), operation_id=op.id)
+        db.add(ref)
+        await db.flush()
+        product = await generate_from_reference(ctx, ref)
+        await db.refresh(product, ["images"])
+    else:
+        async with ctx.step("pick", "انتخاب محصول بعدی از کاتالوگ") as s:
+            product = await _pick_catalog_product(db, rule)
+            if not product:
+                raise PlatformError("محصول عکس‌داری که هنوز در این کانال‌ها منتشر نشده باشد پیدا نشد.", "nothing_to_post",
+                                    {"type": "edit_product", "label": "افزودن محصول"})
+            s.response = {"product_id": product.id, "title": product.title}
+        op.product_id = product.id
+
+    profile, samples = await _style_context(db, rule.store_id)
+    recent = [r for (r,) in (await db.execute(select(Product.post_caption).where(
+        Product.store_id == rule.store_id, Product.post_caption != "").order_by(Product.updated_at.desc()).limit(5)))]
+    images = [b for b in (read_local(i.url) for i in product.images[:3]) if b]
+    prompt = json.dumps({"product": {"title": product.title, "description": product.description[:1500],
+                                     "attributes": product.attributes, "category": product.category_hint},
+                         "brief": a.get("brief", ""), "tone": a.get("tone", ""), "style_profile": profile,
+                         "example_posts": samples, "recent_ai_posts": [r[:300] for r in recent]}, ensure_ascii=False)
+    async with ctx.step("write", "نوشتن متن پست با هوش مصنوعی", request={"product_id": product.id, "images": len(images)}) as s:
+        result = await ai.generate_json(task="caption_rewrite", system=ai.POST_WRITER_SYSTEM, prompt=prompt,
+                                        images=images, store_id=rule.store_id)
+        s.response = result
+    caption = normalize_fa(result.get("caption", "")).strip()
+    if not caption:
+        raise PlatformError("هوش مصنوعی متن پست را برنگرداند؛ دوباره تلاش کنید.", "empty_caption", {"type": "retry", "label": "تلاش دوباره"})
+    product.post_caption = caption
+    if product.status == "draft":
+        product.status = "ready"
+
+    mode = a.get("mode", "approval")
+    channel_ids = a.get("channel_ids", [])
+    if mode == "auto":
+        for cid in channel_ids:
+            ch = await db.get(Channel, cid)
+            if ch and ch.status == "connected":
+                await queue_publish(db, product, ch, trigger="automation", actor="ai")
+        op.result = {"product_id": product.id, "queued": True}
+        return
+    approval = Approval(store_id=rule.store_id, product_id=product.id, automation_id=rule.id, channel_ids=channel_ids,
+                        kind="ai_post", operation_id=op.id)
+    db.add(approval)
+    await db.flush()
+    await notify(db, rule.store_id, "approval", f"پست جدید آمادهٔ تأیید: {product.title[:80]}", caption[:240],
+                 link=f"/app/s/{rule.store_id}/automations?approval={approval.id}",
+                 image_url=product.images[0].url if product.images else "")
+    op.result = {"product_id": product.id, "approval_id": approval.id}
 
 
 async def run_style_profile(ctx: OpContext) -> None:
@@ -364,6 +463,7 @@ async def run_style_profile(ctx: OpContext) -> None:
 
 
 HANDLERS = {
+    "ai_post": run_ai_post,
     "connect": run_connect,
     "health_check": run_health,
     "publish": run_publish,

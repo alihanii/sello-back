@@ -58,6 +58,7 @@ async def run_operation(op_id: int) -> None:
 async def _sync_failure(db, op: Operation) -> None:
     """The handler's own writes were rolled back; re-apply the visible failure state."""
     from app.models import ChannelListing
+    from app.services.notify import notify
     from app.services.ops import record_event
 
     if op.type == "publish" and op.ref_id:
@@ -65,6 +66,11 @@ async def _sync_failure(db, op: Operation) -> None:
         if listing:
             listing.status, listing.last_error_fa = "failed", op.error_message_fa
         await record_event(db, op.store_id, "publish_failed", operation_id=op.id, channel_id=op.channel_id)
+        await notify(db, op.store_id, "publish_failed", "انتشار ناموفق: " + (op.title_fa or ""), op.error_message_fa or "",
+                     link=f"/app/s/{op.store_id}/activity/{op.id}")
+    elif op.type == "ai_post":
+        await notify(db, op.store_id, "publish_failed", "ساخت پست با AI ناموفق بود", op.error_message_fa or "",
+                     link=f"/app/s/{op.store_id}/activity/{op.id}")
     elif op.type == "crawl":
         await record_event(db, op.store_id, "crawl_failed", operation_id=op.id, channel_id=op.channel_id)
     elif op.type in ("connect", "health_check") and op.channel_id:
@@ -72,6 +78,8 @@ async def _sync_failure(db, op: Operation) -> None:
         if ch:
             ch.status = "expired" if op.error_code in ("expired", "invalid_token", "bot_not_admin") else "error"
             ch.last_error = op.error_message_fa
+            await notify(db, op.store_id, "channel_error", f"مشکل در کانال «{ch.display_name or ch.platform}»",
+                         op.error_message_fa or "", link=f"/app/s/{op.store_id}/channels")
     op.payload = {} if op.type == "connect" else op.payload
 
 
@@ -87,6 +95,7 @@ async def _scheduler_tick() -> None:
                           channel_id=src.channel_id, trigger="schedule", actor="ai", title_fa=f"کرال زمان‌بندی‌شدهٔ «{src.name}»")
             src.next_run_at = now + SCHEDULE_DELTA[src.schedule]
         await automation.run_scheduled(db)
+        await automation.run_ai_content(db)
         await db.commit()
 
 

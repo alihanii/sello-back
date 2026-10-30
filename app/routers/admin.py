@@ -13,7 +13,9 @@ from app.models import (
     AI_TASKS, AdminAuditLog, AiProvider, AiTaskRoute, AiUsageLog, Channel, ChannelListing, FeatureInterest,
     Operation, Plan, PlanRequest, Product, Store, Subscription, User,
 )
-from app.schemas import ChannelOut, PlanIn, PlanOut, StoreOut, UserOut
+from app.services.integrations import INSTAGRAM_SCOPES, instagram_app, save_instagram_app
+from app.services.plans import PLAN_TIER, plan_config
+from app.schemas import ChannelOut, PlanConfig, PlanOut, StoreOut, UserOut
 from app.services.ai import DEFAULT_BASE_URLS, test_provider
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -190,39 +192,52 @@ async def list_plans(admin: AdminUser, db: DB):
     return (await db.execute(select(Plan).order_by(Plan.sort_order, Plan.duration_months))).scalars().all()
 
 
-@router.post("/plans", response_model=PlanOut)
-async def create_plan(body: PlanIn, admin: AdminUser, db: DB):
-    if body.duration_months not in (1, 3, 12):
-        raise HTTPException(422, "مدت پلن باید ۱، ۳ یا ۱۲ ماه باشد.")
-    p = Plan(**body.model_dump())
-    db.add(p)
-    await db.flush()
-    audit(db, admin, "create_plan", "plan", p.id, body.model_dump())
+# Sello sells one plan; only the billing period (1/3/12 months) and its price differ.
+@router.get("/plan-config", response_model=PlanConfig)
+async def get_plan_config(admin: AdminUser, db: DB):
+    return await plan_config(db)
+
+
+@router.put("/plan-config", response_model=PlanConfig)
+async def put_plan_config(body: PlanConfig, admin: AdminUser, db: DB):
+    if sorted(p.duration_months for p in body.prices) != [1, 3, 12]:
+        raise HTTPException(422, "قیمت هر سه مدت ۱، ۳ و ۱۲ ماهه لازم است.")
+    current = {p.duration_months: p for p in (await db.execute(select(Plan).where(Plan.tier == PLAN_TIER))).scalars()}
+    for price in body.prices:
+        p = current.get(price.duration_months) or Plan(tier=PLAN_TIER, duration_months=price.duration_months)
+        p.name, p.description, p.features, p.limits = body.name, body.description, body.features, body.limits
+        p.price_toman, p.compare_at_toman, p.is_active = price.price_toman, price.compare_at_toman, price.is_active
+        p.sort_order, p.is_featured = 0, price.duration_months == 12
+        db.add(p)
+    # Older multi-tier plans stay for existing subscriptions but are no longer sold.
+    for p in (await db.execute(select(Plan).where(Plan.tier != PLAN_TIER, Plan.is_active.is_(True)))).scalars():
+        p.is_active = False
+    audit(db, admin, "update_plan", "plan", None, body.model_dump())
     await db.commit()
-    return p
+    return await plan_config(db)
 
 
-@router.put("/plans/{plan_id}", response_model=PlanOut)
-async def update_plan(plan_id: int, body: PlanIn, admin: AdminUser, db: DB):
-    p = await db.get(Plan, plan_id)
-    if not p:
-        raise HTTPException(404, "پلن پیدا نشد.")
-    for k, v in body.model_dump().items():
-        setattr(p, k, v)
-    audit(db, admin, "update_plan", "plan", p.id, body.model_dump())
+class InstagramAppIn(BaseModel):
+    enabled: bool = False
+    app_id: str = ""
+    app_secret: str | None = None  # None keeps the stored secret
+    proxy: str = ""
+
+
+@router.get("/integrations/instagram")
+async def get_instagram(admin: AdminUser, db: DB):
+    app = await instagram_app(db)
+    return {**{k: app[k] for k in ("enabled", "app_id", "proxy", "oauth_ready", "redirect_uri")},
+            "has_secret": bool(app["app_secret"]), "scopes": INSTAGRAM_SCOPES}
+
+
+@router.put("/integrations/instagram")
+async def put_instagram(body: InstagramAppIn, admin: AdminUser, db: DB):
+    await save_instagram_app(db, enabled=body.enabled, app_id=body.app_id, proxy=body.proxy, app_secret=body.app_secret)
+    audit(db, admin, "update_integration", "instagram", None,
+          {"enabled": body.enabled, "app_id": body.app_id, "proxy": bool(body.proxy), "secret_changed": body.app_secret is not None})
     await db.commit()
-    return p
-
-
-@router.delete("/plans/{plan_id}")
-async def deactivate_plan(plan_id: int, admin: AdminUser, db: DB):
-    p = await db.get(Plan, plan_id)
-    if not p:
-        raise HTTPException(404, "پلن پیدا نشد.")
-    p.is_active = False  # subscriptions keep pointing at it
-    audit(db, admin, "deactivate_plan", "plan", p.id)
-    await db.commit()
-    return {"ok": True}
+    return await get_instagram(admin, db)
 
 
 @router.get("/plan-requests")

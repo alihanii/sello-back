@@ -12,7 +12,8 @@ from fastapi.staticfiles import StaticFiles
 from app.core.config import settings
 from app.core.db import init_db
 from app.routers import (
-    admin, auth, automations, billing, channels, crawl, insights, operations, products, references, stores,
+    admin, auth, automations, billing, channels, crawl, insights, notifications, operations, products, references,
+    stores,
 )
 from app.seed import seed
 from app.services.worker import worker_loop
@@ -49,7 +50,8 @@ async def validation_error(_: Request, exc: RequestValidationError):
     return JSONResponse(status_code=422, content={"detail": {"message": "اطلاعات ارسالی کامل یا معتبر نیست.", "fields": fields}})
 
 
-for r in (auth, stores, channels, products, operations, crawl, references, automations, insights, billing, admin):
+for r in (auth, stores, channels, products, operations, crawl, references, automations, insights, billing, admin,
+          notifications):
     app.include_router(r.router, prefix="/api/v1")
 
 Path(settings.media_dir).mkdir(parents=True, exist_ok=True)

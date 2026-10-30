@@ -1,16 +1,21 @@
+from datetime import timedelta
 from typing import Any
 
+import jwt
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
 
 from app.core.config import settings
+from app.core.db import utcnow
 from app.deps import DB, CurrentUser, get_store_for
 from app.models import Channel, Operation
 from app.platforms.base import PlatformError
 from app.platforms.digikala import digikala
+from app.platforms.instagram import authorize_url
 from app.platforms.registry import PLATFORM_INFO
 from app.schemas import ChannelOut, OperationOut
+from app.services.integrations import instagram_app
 from app.services.ops import OpContext, enqueue, fail_operation
 from app.services.plans import check_limit
 
@@ -18,8 +23,43 @@ router = APIRouter(tags=["channels"])
 
 
 @router.get("/platforms")
-async def platforms():
-    return [{"platform": k, **v, "enabled": not v.get("flag") or settings.instagram_enabled} for k, v in PLATFORM_INFO.items()]
+async def platforms(db: DB):
+    ig = await instagram_app(db)
+    out = []
+    for k, v in PLATFORM_INFO.items():
+        row = {"platform": k, **v, "enabled": not v.get("flag") or ig["enabled"]}
+        if k == "instagram":
+            row["oauth"] = ig["oauth_ready"]
+        out.append(row)
+    return out
+
+
+@router.get("/stores/{store_id}/channels/instagram/oauth-url")
+async def instagram_oauth_url(store_id: int, user: CurrentUser, db: DB, channel_id: int | None = None):
+    await get_store_for(db, user, store_id)
+    app = await instagram_app(db)
+    if not (app["enabled"] and app["oauth_ready"]):
+        raise HTTPException(400, "ورود با اینستاگرام هنوز توسط ادمین تنظیم نشده است.")
+    state = jwt.encode({"sid": store_id, "uid": user.id, "cid": channel_id, "purpose": "ig_oauth",
+                        "exp": utcnow() + timedelta(minutes=15)}, settings.jwt_secret, algorithm="HS256")
+    return {"url": authorize_url(app, state)}
+
+
+class OAuthIn(BaseModel):
+    code: str
+    state: str
+
+
+@router.post("/channels/instagram/oauth-callback", response_model=OperationOut, status_code=202)
+async def instagram_oauth_callback(body: OAuthIn, user: CurrentUser, db: DB):
+    try:
+        st = jwt.decode(body.state, settings.jwt_secret, algorithms=["HS256"])
+    except jwt.PyJWTError:
+        raise HTTPException(400, "لینک ورود منقضی شده؛ دوباره از صفحهٔ کانال‌ها تلاش کنید.")
+    if st.get("purpose") != "ig_oauth" or st.get("uid") != user.id:
+        raise HTTPException(403, "این ورود متعلق به حساب شما نیست.")
+    return await connect(st["sid"], ConnectIn(platform="instagram", channel_id=st.get("cid"), data={"code": body.code}),
+                         user, db)
 
 
 @router.get("/stores/{store_id}/channels", response_model=list[ChannelOut])

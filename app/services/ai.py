@@ -230,6 +230,13 @@ Respond ONLY with JSON:
  "field_sources":{"title":"image|link|style|note|guess","description":"...","attributes":"...","price":"..."}}
 Do not invent prices or technical specs you cannot see or read; leave price 0 and omit unknown attributes."""
 
+POST_WRITER_SYSTEM = """You write social media posts (Telegram, Bale, Instagram) for an Iranian online shop, in Persian.
+You get the product's data, optional photos, the shop's STYLE PROFILE and recent example posts, the seller's
+brief (tone, goals, campaign) and the captions of the shop's last AI posts (do not repeat their openings).
+Write ONE ready-to-publish post in the shop's own voice: a hook line, the key features, sizes/colours if known,
+a call to action, and the shop's usual hashtags/emojis. Do not invent specs, discounts or prices; do not write the
+price (the app appends it). Respond ONLY with JSON: {"caption":"...","hook":"<first line>","hashtags":["#..."]}"""
+
 STYLE_PROFILE_SYSTEM = """Analyse how this Iranian shop writes its product posts. Respond ONLY with JSON:
 {"title_pattern":"...","tone":"friendly|formal","description_length":"short|medium|long",
  "caption_structure":["title","features","price","sizes","shipping","cta"],

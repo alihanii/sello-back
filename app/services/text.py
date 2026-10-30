@@ -107,3 +107,12 @@ def build_caption(
     else:
         parts = [head] if head else []
     return ("\n\n".join(p for p in parts if p) + tail).strip()[:MAX_CAPTION_CHARS]
+
+
+def caption_for(product, store_settings: dict | None) -> str:
+    """The text a channel posts: the AI-written post caption when there is one, else title + description."""
+    st = store_settings or {}
+    opts = {"price": product.price, "show_price": st.get("show_price_in_caption", True), "signature": st.get("caption_signature", "")}
+    if (product.post_caption or "").strip():
+        return build_caption(title="", description=product.post_caption, **opts)
+    return build_caption(title=product.title, description=product.description, **opts)
