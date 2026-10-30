@@ -1,0 +1,28 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sello
+      POSTGRES_PASSWORD: sello
+      POSTGRES_DB: sello
+    volumes: [pgdata:/var/lib/postgresql/data]
+  backend:
+    build: .
+    environment:
+      SELLO_DATABASE_URL: postgresql+asyncpg://sello:sello@db:5432/sello
+      SELLO_JWT_SECRET: ${SELLO_JWT_SECRET:-change-me}
+      SELLO_OTP_DEV_MODE: ${SELLO_OTP_DEV_MODE:-true}
+      SELLO_CORS_ORIGINS: '["http://localhost:3000"]'
+    volumes: [media:/app/media]
+    ports: ["8000:8000"]
+    depends_on: [db]
+  frontend:
+    build:
+      context: ../sello-front
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports: ["3000:3000"]
+    depends_on: [backend]
+volumes:
+  pgdata:
+  media:
