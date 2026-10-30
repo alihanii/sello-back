@@ -323,7 +323,10 @@ async def generate_from_reference(ctx: OpContext, ref: ReferenceSet) -> Product:
             s.response = {"has_profile": bool(profile), "samples": len(samples)}
 
     images = [b for b in (read_local(u) for u in ref.images) if b][:4]
-    prompt = json.dumps({"seller_note": ref.note, "price": ref.price, "style_profile": profile,
+    photo_role = ("The attached photo is a DESIGN/artwork the seller prints on the product, not the product itself; "
+                  "describe the product from the seller's note, with this design on it."
+                  if (op.payload or {}).get("photo_kind") == "design" else "")
+    prompt = json.dumps({"seller_note": ref.note, "photo_role": photo_role, "price": ref.price, "style_profile": profile,
                          "shop_examples": samples, "reference_pages": pages}, ensure_ascii=False)
     async with ctx.step("generate", "ساخت محصول با هوش مصنوعی", request={"images": len(images), "links": len(pages)}) as s:
         result = await ai.generate_json(task="product_generate", system=ai.PRODUCT_FROM_REFERENCE_SYSTEM,
@@ -331,7 +334,7 @@ async def generate_from_reference(ctx: OpContext, ref: ReferenceSet) -> Product:
         s.response = result
     product = Product(store_id=store.id, title=normalize_fa(result.get("title") or "محصول جدید")[:300],
                       description=normalize_fa(result.get("description", "")), price=ref.price or int(result.get("price") or 0),
-                      stock_qty=ref.stock_qty, brand=result.get("brand", ""), category_hint=result.get("category_hint", ""),
+                      stock_qty=ref.stock_qty or parse_number(str(result.get("quantity") or 0)), brand=result.get("brand", ""), category_hint=result.get("category_hint", ""),
                       attributes=result.get("attributes") or {}, tags=(result.get("tags") or [])[:8], source="ai",
                       created_by="ai", status="draft",
                       source_ref={"reference_set_id": ref.id, "urls": ref.urls, "field_sources": result.get("field_sources", {})})
@@ -354,7 +357,8 @@ async def generate_from_reference(ctx: OpContext, ref: ReferenceSet) -> Product:
                                    note=ref.note or product.description[:400], product_id=product.id,
                                    category=str(result.get("image_category") or "general"),
                                    style_urls=op.payload.get("style_images") or [],
-                                   style_product_ids=op.payload.get("style_product_ids") or [])
+                                   style_product_ids=op.payload.get("style_product_ids") or [],
+                                   design=op.payload.get("photo_kind") == "design")
             await _set_main_image(db, product.id, url, origin=source or "")
             op.result = {**op.result, "clean_image": url}
         except (ai.AIError, ValueError) as exc:

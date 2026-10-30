@@ -6,6 +6,7 @@ from app.deps import DB, CurrentUser, get_store_for
 from app.models import ReferenceSet, StoreStyleProfile
 from app.schemas import OperationOut
 from app.services.ai import route_problem
+from app.services.product_images import photo_kind
 from app.services.ops import enqueue
 
 router = APIRouter(tags=["ai"])
@@ -26,6 +27,7 @@ class ReferenceIn(BaseModel):
     # Style samples for that photo (uploaded photos / existing products); empty = the shop's earlier products.
     style_images: list[str] = []
     style_product_ids: list[int] = []
+    photo_kind: str = "product"  # product: clean the photo · design: artwork to put on the product
 
 
 @router.post("/stores/{store_id}/reference-sets", response_model=list[OperationOut], status_code=202)
@@ -47,7 +49,8 @@ async def create(store_id: int, body: ReferenceIn, user: CurrentUser, db: DB):
         op = await enqueue(db, store_id=store_id, type="reference", ref_type="reference_set", ref_id=ref.id, actor="ai",
                            title_fa="ساخت محصول با AI از رفرنس",
                            payload={"clean_image": body.clean_image, "style_images": body.style_images[:3],
-                                    "style_product_ids": body.style_product_ids[:3]})
+                                    "style_product_ids": body.style_product_ids[:3],
+                                    "photo_kind": "design" if body.photo_kind == "design" else "product"})
         ref.operation_id = op.id
         ops.append(op)
     await db.commit()
@@ -84,3 +87,14 @@ async def rebuild(store_id: int, user: CurrentUser, db: DB):
     op = await enqueue(db, store_id=store_id, type="style_profile", actor="ai", title_fa="ساخت پروفایل سبک فروشگاه")
     await db.commit()
     return op
+
+
+class PhotoKindIn(BaseModel):
+    url: str
+
+
+@router.post("/stores/{store_id}/photo-kind")
+async def guess_photo_kind(store_id: int, body: PhotoKindIn, user: CurrentUser, db: DB):
+    """First guess for the AI form's photo choice; the seller can change it."""
+    await get_store_for(db, user, store_id)
+    return {"kind": await photo_kind(store_id, body.url)}

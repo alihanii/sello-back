@@ -447,6 +447,7 @@ image_category: how the main photo should be staged: "flat_clothing" (garment wi
 (garment that must be shown worn: chador, abaya, manteau, dress), "footwear", or "general" (everything else).
 Respond ONLY with JSON:
 {"title":"...","description":"...","category_hint":"<Persian product type, e.g. ماگ سرامیکی>","brand":"","price":<int or 0>,
+ "quantity":<int stock count the seller stated, else 0>,
  "attributes":{"<Persian name>":"value"},"tags":["..."],"image_category":"general",
  "field_sources":{"title":"image|link|style|note|guess","description":"...","attributes":"...","price":"..."}}
 Do not invent prices or technical specs you cannot see or read; leave price 0 and omit unknown attributes."""

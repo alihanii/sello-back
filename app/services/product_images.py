@@ -190,11 +190,30 @@ async def style_references(db, store_id: int, exclude_product_id: int | None = N
     return refs
 
 
-def _builder_input(*, title: str, note: str, category: str, has_photo: bool, styles: int) -> str:
+DESIGN_IMAGE_SYSTEM = (
+    "You are generating a clean marketplace main product image. The first attached image is a DESIGN (artwork, logo, "
+    "pattern or print), not a photo of the product: show the product described in the prompt with that design applied "
+    "to it exactly, keeping the design's shapes, proportions and line work. Never add props, text overlays, watermarks, "
+    "people or extra objects unless the prompt requires them."
+)
+
+PHOTO_KIND_SYSTEM = """Look at the attached image from an online seller. Decide what it is.
+"product": a photo of a real, physical product (even a raw, badly lit phone photo, on a person, a hanger or a table).
+"design": a flat artwork, logo, drawing, pattern or print file the seller wants printed on a product (no physical product visible).
+Respond ONLY with JSON: {"kind":"product"} or {"kind":"design"}"""
+
+
+def _builder_input(*, title: str, note: str, category: str, has_photo: bool, styles: int, design: bool = False) -> str:
     num, label = IMAGE_CATEGORIES.get(category, IMAGE_CATEGORIES["general"])
     lines = [f"PRODUCT NAME: {title}", f"user description: {note or title}",
              f"Selected category (prompt_type {num}): {label}", ""]
-    if has_photo:
+    if has_photo and design:
+        lines.append("Attached image 1 is NOT the product: it is the DESIGN (artwork/print) the seller puts on the product. "
+                     "Write a text-to-image prompt that depicts the product exactly as the name and description say, with "
+                     "this design applied to it (for clothing: printed on the chest, centred, at a natural print size, in a "
+                     "colour that contrasts with the garment unless the description says otherwise). The design must be "
+                     "reproduced exactly: same shapes, proportions and line work. Do not invent other logos or text.")
+    elif has_photo:
         lines.append("Attached image 1 is the product photo (the ATTACHED IMAGE).")
     else:
         lines.append("There is NO product photo: write a text-to-image prompt that depicts the product exactly as the "
@@ -206,7 +225,7 @@ def _builder_input(*, title: str, note: str, category: str, has_photo: bool, sty
                      "camera angle, framing and layout. These style references override the default pure-white background "
                      "rule when they use a different background. Never copy the products shown in them.")
     lines += ["", "Analyze the attached e-commerce image and return exactly one raw English paragraph."
-              if has_photo else "Return exactly one raw English paragraph."]
+              if has_photo and not design else "Return exactly one raw English paragraph."]
     return "\n".join(lines)
 
 
@@ -228,9 +247,10 @@ async def chosen_styles(db, store_id: int, urls: list[str], product_ids: list[in
 
 async def make_photo(ctx, *, store_id: int, title: str, note: str, category: str = "general",
                      image_url: str | None = None, product_id: int | None = None,
-                     style_urls: list[str] | None = None, style_product_ids: list[int] | None = None) -> str:
+                     style_urls: list[str] | None = None, style_product_ids: list[int] | None = None,
+                     design: bool = False) -> str:
     """Cleans `image_url`, or generates a photo from the text when there is none, in the style of the samples the
-    seller picked, else of the shop's earlier product photos. Returns the /media URL. Raises AIError/ValueError with a Persian message."""
+    seller picked, else of the shop's earlier product photos. `design`: the photo is artwork to put on the product. Returns the /media URL. Raises AIError/ValueError with a Persian message."""
     loaded = read_local(image_url) if image_url else None
     if image_url and not loaded:
         raise ValueError("عکس اصلی روی سرور پیدا نشد.")
@@ -239,16 +259,19 @@ async def make_photo(ctx, *, store_id: int, title: str, note: str, category: str
         styles = await chosen_styles(ctx.db, store_id, style_urls or [], style_product_ids or [])
         styles = styles or await style_references(ctx.db, store_id, product_id)
     images = ([loaded] if loaded else []) + styles
-    async with ctx.step("image_prompt", "نوشتن دستور ساخت عکس" if not loaded else "تحلیل عکس و نوشتن دستور ویرایش",
-                        request={"category": category, "has_photo": bool(loaded), "style_refs": len(styles)}) as s:
+    design = design and bool(loaded)
+    async with ctx.step("image_prompt", "تحلیل عکس و نوشتن دستور ویرایش" if loaded and not design else "نوشتن دستور ساخت عکس",
+                        request={"category": category, "has_photo": bool(loaded), "design": design,
+                                 "style_refs": len(styles)}) as s:
         raw = await ai.generate_text(
             task="vision", system=PROMPT_BUILDER_SYSTEM, images=images, store_id=store_id,
-            prompt=_builder_input(title=title, note=note, category=category, has_photo=bool(loaded), styles=len(styles)))
+            prompt=_builder_input(title=title, note=note, category=category, has_photo=bool(loaded), styles=len(styles),
+                                  design=design))
         prompt = _sanitize(raw)
         s.response = {"prompt": prompt}
-    label = "تمیز کردن عکس" if loaded else "ساخت عکس محصول"
+    label = "تمیز کردن عکس" if loaded and not design else "ساخت عکس محصول"
     async with ctx.step("image_edit", f"{label} (به سبک عکس‌های قبلی فروشگاه)" if styles else label) as s:
-        system = IMAGE_SYSTEM if loaded else (
+        system = DESIGN_IMAGE_SYSTEM if design else IMAGE_SYSTEM if loaded else (
             "You are generating a clean marketplace main product image from a text prompt. Depict only the described "
             "product, accurately; never add props, text overlays, watermarks, people or extra objects unless the prompt "
             "requires them.")
@@ -259,3 +282,16 @@ async def make_photo(ctx, *, store_id: int, title: str, note: str, category: str
         url = save_bytes(store_id, data, content_type=mime)
         s.response = {"url": url, "bytes": len(data), "mime": mime}
     return url
+
+
+async def photo_kind(store_id: int, url: str) -> str:
+    """Cheap first guess for the form: is this a product photo or a design to print? Falls back to 'product'."""
+    loaded = read_local(url)
+    if not loaded or not url.startswith(f"/media/{store_id}/"):
+        return "product"
+    try:
+        res = await ai.generate_json(task="vision", system=PHOTO_KIND_SYSTEM, prompt="Classify this image.",
+                                     images=[loaded], store_id=store_id)
+    except ai.AIError:
+        return "product"
+    return "design" if res.get("kind") == "design" else "product"

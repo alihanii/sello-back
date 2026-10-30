@@ -154,3 +154,14 @@ async def test_raw_photo_becomes_product_with_clean_main_image(client, monkeypat
     assert (await client.put("/admin/ai/routes/image_edit", headers=admin,
                              json={"provider_id": prov["id"], "model": "gemini-3.1-flash-image"})).status_code == 200
     assert (await client.get("/ai/status", headers=h)).json()["image_edit"] is True
+
+
+def test_design_photo_builds_product_around_the_artwork():
+    from app.services.product_images import _builder_input
+
+    text = _builder_input(title="هودی مشکی", note="هودی مشکی با طرح، سایز XXL", category="flat_clothing",
+                          has_photo=True, styles=0, design=True)
+    assert "NOT the product" in text and "printed on the chest" in text
+    assert "Analyze the attached e-commerce image" not in text
+    plain = _builder_input(title="هودی", note="", category="general", has_photo=True, styles=0)
+    assert "is the product photo" in plain
