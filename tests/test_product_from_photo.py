@@ -158,3 +158,37 @@ def test_design_photo_builds_product_around_the_artwork():
     assert "Analyze the attached e-commerce image" not in text
     plain = _builder_input(title="هودی", note="", category="general", has_photo=True)
     assert "is the product photo" in plain
+
+
+async def test_design_flow_reaches_the_image_model(monkeypatch):
+    """The design path builds its own system prompt; run make_photo end to end with fakes."""
+    from app.services import product_images
+    from app.services.media import save_bytes
+
+    url = save_bytes(1, PNG, content_type="image/png")
+    seen = {}
+
+    async def fake_text(**kw):
+        return "A black hoodie with the design on the chest."
+
+    async def fake_image(*, system, prompt, images, store_id, task="image_edit"):
+        seen.update(system=system, images=len(images))
+        return PNG, "image/png"
+
+    class Ctx:
+        db = None
+
+        def step(self, *a, **kw):
+            from contextlib import asynccontextmanager
+
+            @asynccontextmanager
+            async def cm():
+                class S:
+                    response = {}
+                yield S()
+            return cm()
+
+    monkeypatch.setattr(product_images.ai, "generate_text", fake_text)
+    monkeypatch.setattr(product_images.ai, "generate_image", fake_image)
+    out = await product_images.make_photo(Ctx(), store_id=1, title="هودی", note="هودی مشکی", image_url=url, design=True)
+    assert out.startswith("/media/1/") and seen["images"] == 1 and "DESIGN" in seen["system"]

@@ -162,6 +162,18 @@ IMAGE_SYSTEM = (
     "result must look like a clean marketplace main product image, not a lifestyle photo."
 )
 
+DESIGN_IMAGE_SYSTEM = (
+    "You are generating a clean marketplace main product image. The first attached image is a DESIGN (artwork, logo, "
+    "pattern or print), not a photo of the product: show the product described in the prompt with that design applied "
+    "to it exactly, keeping the design's shapes, proportions and line work. Never add props, text overlays, watermarks, "
+    "people or extra objects unless the prompt requires them."
+)
+
+PHOTO_KIND_SYSTEM = """Look at the attached image from an online seller. Decide what it is.
+"product": a photo of a real, physical product (even a raw, badly lit phone photo, on a person, a hanger or a table).
+"design": a flat artwork, logo, drawing, pattern or print file the seller wants printed on a product (no physical product visible).
+Respond ONLY with JSON: {"kind":"product"} or {"kind":"design"}"""
+
 _TAIL = "1:1 aspect ratio, 2048x2048 pixels resolution, clean e-commerce cutout style."
 
 

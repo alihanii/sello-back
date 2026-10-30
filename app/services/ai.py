@@ -450,6 +450,7 @@ Respond ONLY with JSON:
  "quantity":<int stock count the seller stated, else 0>,
  "attributes":{"<Persian name>":"value"},"tags":["..."],"image_category":"general",
  "field_sources":{"title":"image|link|style|note|guess","description":"...","attributes":"...","price":"..."}}
+Price and quantity are plain integers in Toman: «۴ میلیون تومان» = 4000000, «۲۵۰ هزار» = 250000, «۲۰ تا» = 20.
 Do not invent prices or technical specs you cannot see or read; leave price 0 and omit unknown attributes."""
 
 POST_WRITER_SYSTEM = """You write social media posts (Telegram, Bale, Instagram) for an Iranian online shop, in Persian.
