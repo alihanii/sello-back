@@ -1,8 +1,9 @@
 """LLM layer. Keys, models and per-task routing come from the admin panel (ai_providers,
 ai_task_routes); every call is written to ai_usage_logs for the monitoring page.
 
-Wire formats: `gemini` (Google, or the MetisAI gateway platform-wrappers used), `openai`
-(OpenAI and compatible gateways), `anthropic`."""
+Wire formats: `gemini` (a key straight from Google AI Studio), `metis` (the same Gemini format through
+the MetisAI gateway), `openai` (OpenAI and compatible gateways), `anthropic`. Each key may carry its own
+proxy, stored with the key in the encrypted blob, because Google and OpenAI refuse requests from Iran."""
 
 import base64
 import json
@@ -19,6 +20,7 @@ from app.models import AiProvider, AiTaskRoute, AiUsageLog
 
 DEFAULT_BASE_URLS = {
     "gemini": "https://generativelanguage.googleapis.com",
+    "metis": "https://api.metisai.ir",
     "openai": "https://api.openai.com/v1",
     "anthropic": "https://api.anthropic.com",
 }
@@ -41,14 +43,18 @@ def _api_key(provider: AiProvider) -> str:
     return decrypt_credentials(provider.api_key_encrypted).get("api_key", "")
 
 
+def provider_proxy(provider: AiProvider) -> str:
+    return decrypt_credentials(provider.api_key_encrypted).get("proxy", "")
+
+
 async def _call(
     provider: AiProvider, model: str, system: str, prompt: str, images: list[tuple[bytes, str]], temperature: float
 ) -> tuple[str, int, int]:
     """Returns (text, input_tokens, output_tokens)."""
     key = _api_key(provider)
     base = (provider.base_url or DEFAULT_BASE_URLS[provider.kind]).rstrip("/")
-    async with httpx.AsyncClient(timeout=120) as client:
-        if provider.kind == "gemini":
+    async with httpx.AsyncClient(timeout=120, proxy=provider_proxy(provider) or None) as client:
+        if provider.kind in ("gemini", "metis"):
             parts: list[dict[str, Any]] = [{"text": prompt}]
             parts += [{"inlineData": {"mimeType": m, "data": base64.b64encode(d).decode()}} for d, m in images]
             resp = await client.post(
@@ -122,6 +128,10 @@ async def _call(
 
 
 def _raise_for(resp: httpx.Response) -> None:
+    low = resp.text[:2000].lower()
+    if "location is not supported" in low or "unsupported_country" in low or "not available in your country" in low:
+        raise AIError("این سرویس درخواست‌های ایران را قبول نمی‌کند؛ برای این کلید پروکسی خارج از ایران تنظیم کنید.",
+                      code="ai_region_blocked", detail=resp.text[:500])
     if resp.status_code in (401, 403):
         raise AIError("کلید API نامعتبر است یا دسترسی ندارد.", code=f"ai_http_{resp.status_code}", detail=resp.text[:500])
     if resp.status_code == 429:

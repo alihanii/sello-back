@@ -11,3 +11,4 @@ python-multipart==0.0.32
 beautifulsoup4==4.15.0
 python-dateutil==2.9.0.post0
 Pillow==13.0.0
+socksio==1.0.0  # SOCKS proxies for Instagram and AI keys

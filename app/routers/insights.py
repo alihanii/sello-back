@@ -9,9 +9,16 @@ from app.core.db import utcnow
 from app.deps import DB, CurrentUser, get_store_for
 from app.models import ActivityEvent, Approval, Automation, Channel, ChannelListing, CrawlSource, Operation, Plan, Product
 from app.schemas import OperationOut
+from app.services.ai import ai_available
 from app.services.plans import active_subscription, limits_for
 
 router = APIRouter(tags=["insights"])
+
+
+@router.get("/ai/status")
+async def ai_status(user: CurrentUser):
+    """Whether any AI key is configured, so the UI can explain why AI features are off."""
+    return {"available": await ai_available("product_from_reference") or await ai_available("caption_rewrite")}
 EVENT_TYPES = ["crawl_run", "crawl_item", "crawl_failed", "product_created", "publish_ok", "publish_failed"]
 
 

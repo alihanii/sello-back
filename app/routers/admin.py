@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from sqlalchemy import case, func, select
 
 from app.core.db import utcnow
-from app.core.security import encrypt_credentials
+from app.core.security import decrypt_credentials, encrypt_credentials
 from app.deps import DB, AdminUser
 from app.models import (
     AI_TASKS, AdminAuditLog, AiProvider, AiTaskRoute, AiUsageLog, Channel, ChannelListing, FeatureInterest,
@@ -16,7 +16,7 @@ from app.models import (
 from app.services.integrations import INSTAGRAM_SCOPES, instagram_app, save_instagram_app
 from app.services.plans import PLAN_TIER, plan_config
 from app.schemas import ChannelOut, PlanConfig, PlanOut, StoreOut, UserOut
-from app.services.ai import DEFAULT_BASE_URLS, test_provider
+from app.services.ai import DEFAULT_BASE_URLS, provider_proxy, test_provider
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -282,6 +282,7 @@ class ProviderIn(BaseModel):
     kind: str
     base_url: str = ""
     api_key: str = ""  # empty on update = keep the stored key
+    proxy: str = ""  # optional http(s)/socks proxy for this key
     default_model: str = ""
     input_price_per_m: int = 0
     output_price_per_m: int = 0
@@ -290,19 +291,22 @@ class ProviderIn(BaseModel):
 
 
 def _provider_out(p: AiProvider) -> dict[str, Any]:
-    return {c: getattr(p, c) for c in ("id", "name", "kind", "base_url", "key_hint", "default_model", "input_price_per_m",
+    return {"proxy": provider_proxy(p), **{c: getattr(p, c) for c in ("id", "name", "kind", "base_url", "key_hint", "default_model", "input_price_per_m",
                                          "output_price_per_m", "monthly_budget_toman", "is_active", "last_test_at",
-                                         "last_test_ok", "last_test_message", "created_at")}
+                                         "last_test_ok", "last_test_message", "created_at")}}
 
 
 @router.get("/ai/providers")
 async def providers(admin: AdminUser, db: DB):
     return {"providers": [_provider_out(p) for p in (await db.execute(select(AiProvider).order_by(AiProvider.id))).scalars()],
-            "kinds": [{"kind": "gemini", "label": "Gemini (گوگل یا متیس)", "base_url": DEFAULT_BASE_URLS["gemini"],
-                       "hint": "برای متیس: https://api.metisai.ir"},
+            "kinds": [{"kind": "gemini", "label": "Google Gemini (کلید مستقیم AI Studio)", "base_url": DEFAULT_BASE_URLS["gemini"],
+                       "hint": "کلید را از aistudio.google.com/apikey بگیر. گوگل ایران را تحریم کرده؛ روی سرور داخل ایران پروکسی لازم است.",
+                       "model": "gemini-2.5-flash"},
+                      {"kind": "metis", "label": "Gemini از طریق متیس", "base_url": DEFAULT_BASE_URLS["metis"],
+                       "hint": "کلید متیس؛ از داخل ایران بدون پروکسی کار می‌کند.", "model": "gemini-2.5-flash"},
                       {"kind": "openai", "label": "OpenAI یا سرویس سازگار", "base_url": DEFAULT_BASE_URLS["openai"],
-                       "hint": "هر سرویس سازگار با OpenAI (مثلاً واسط‌های ایرانی)"},
-                      {"kind": "anthropic", "label": "Claude (Anthropic)", "base_url": DEFAULT_BASE_URLS["anthropic"], "hint": ""}],
+                       "hint": "هر سرویس سازگار با OpenAI (مثلاً واسط‌های ایرانی)", "model": "gpt-4.1-mini"},
+                      {"kind": "anthropic", "label": "Claude (Anthropic)", "base_url": DEFAULT_BASE_URLS["anthropic"], "hint": "", "model": "claude-sonnet-5-5"}],
             "tasks": AI_TASKS}
 
 
@@ -312,7 +316,8 @@ async def add_provider(body: ProviderIn, admin: AdminUser, db: DB):
         raise HTTPException(422, "نوع سرویس نامعتبر است.")
     if not body.api_key.strip():
         raise HTTPException(422, "کلید API را وارد کنید.")
-    p = AiProvider(**body.model_dump(exclude={"api_key"}), api_key_encrypted=encrypt_credentials({"api_key": body.api_key.strip()}),
+    p = AiProvider(**body.model_dump(exclude={"api_key", "proxy"}),
+                   api_key_encrypted=encrypt_credentials({"api_key": body.api_key.strip(), "proxy": body.proxy.strip()}),
                    key_hint=body.api_key.strip()[-4:])
     db.add(p)
     await db.flush()
@@ -326,11 +331,16 @@ async def update_provider(pid: int, body: ProviderIn, admin: AdminUser, db: DB):
     p = await db.get(AiProvider, pid)
     if not p:
         raise HTTPException(404, "کلید پیدا نشد.")
-    for k, v in body.model_dump(exclude={"api_key"}).items():
+    if body.kind not in DEFAULT_BASE_URLS:
+        raise HTTPException(422, "نوع سرویس نامعتبر است.")
+    for k, v in body.model_dump(exclude={"api_key", "proxy"}).items():
         setattr(p, k, v)
+    creds = decrypt_credentials(p.api_key_encrypted)
     if body.api_key.strip():
-        p.api_key_encrypted = encrypt_credentials({"api_key": body.api_key.strip()})
+        creds["api_key"] = body.api_key.strip()
         p.key_hint = body.api_key.strip()[-4:]
+    creds["proxy"] = body.proxy.strip()
+    p.api_key_encrypted = encrypt_credentials(creds)
     audit(db, admin, "update_ai_key", "ai_provider", p.id, {"name": p.name, "key_changed": bool(body.api_key.strip())})
     await db.commit()
     return _provider_out(p)
