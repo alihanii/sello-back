@@ -132,6 +132,12 @@ def _raise_for(resp: httpx.Response) -> None:
     if "location is not supported" in low or "unsupported_country" in low or "not available in your country" in low:
         raise AIError("این سرویس درخواست‌های ایران را قبول نمی‌کند؛ برای این کلید پروکسی خارج از ایران تنظیم کنید.",
                       code="ai_region_blocked", detail=resp.text[:500])
+    if "api_key_invalid" in low or "api key not valid" in low or "incorrect api key" in low:
+        raise AIError("کلید API نامعتبر است؛ کلید را دوباره کپی کنید یا یک کلید تازه بسازید.", code="ai_bad_key",
+                      detail=resp.text[:500])
+    if resp.status_code == 404 and ("model" in low or "not found" in low or "no longer available" in low):
+        raise AIError("این مدل برای کلید شما در دسترس نیست؛ در ویرایش کلید، مدل پیش‌فرض را عوض کنید (مثلاً gemini-3.8-flash).",
+                      code="ai_bad_model", detail=resp.text[:500])
     if resp.status_code in (401, 403):
         raise AIError("کلید API نامعتبر است یا دسترسی ندارد.", code=f"ai_http_{resp.status_code}", detail=resp.text[:500])
     if resp.status_code == 429:
@@ -202,6 +208,27 @@ async def generate_json(
                        error_code=err.code, error_message=f"{err.message_fa} {err.detail or ''}"[:1000])
             last = err
     raise last  # type: ignore[misc]
+
+
+async def list_models(provider: AiProvider) -> list[str]:
+    """Model ids the key can use for text generation, newest first as the provider lists them."""
+    key = _api_key(provider)
+    base = (provider.base_url or DEFAULT_BASE_URLS[provider.kind]).rstrip("/")
+    async with httpx.AsyncClient(timeout=30, proxy=provider_proxy(provider) or None) as client:
+        if provider.kind in ("gemini", "metis"):
+            resp = await client.get(f"{base}/v1beta/models", params={"pageSize": 200}, headers={"x-goog-api-key": key})
+            _raise_for(resp)
+            return [m["name"].removeprefix("models/") for m in resp.json().get("models", [])
+                    if "generateContent" in m.get("supportedGenerationMethods", [])]
+        if provider.kind == "openai":
+            resp = await client.get(f"{base}/models", headers={"Authorization": f"Bearer {key}"})
+            _raise_for(resp)
+            return sorted((m["id"] for m in resp.json().get("data", [])), reverse=True)
+        if provider.kind == "anthropic":
+            resp = await client.get(f"{base}/v1/models", headers={"x-api-key": key, "anthropic-version": "2023-06-01"})
+            _raise_for(resp)
+            return [m["id"] for m in resp.json().get("data", [])]
+    return []
 
 
 async def test_provider(provider: AiProvider, model: str | None = None) -> tuple[bool, str, int]:

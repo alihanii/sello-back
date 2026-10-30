@@ -1,22 +1,25 @@
 from datetime import datetime, time, timedelta, timezone
 from typing import Any
 
-from dateutil.relativedelta import relativedelta
+import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import case, func, select
+from sqlalchemy.orm import selectinload
 
+from app.core.config import settings
 from app.core.db import utcnow
 from app.core.security import decrypt_credentials, encrypt_credentials
 from app.deps import DB, AdminUser
 from app.models import (
     AI_TASKS, AdminAuditLog, AiProvider, AiTaskRoute, AiUsageLog, Channel, ChannelListing, FeatureInterest,
-    Operation, Plan, PlanRequest, Product, Store, Subscription, User,
+    Operation, Payment, Plan, PlanRequest, Product, Store, Subscription, User,
 )
-from app.services.integrations import INSTAGRAM_SCOPES, instagram_app, save_instagram_app
-from app.services.plans import PLAN_TIER, plan_config
+from app.services.bank import BANKS
+from app.services.integrations import INSTAGRAM_SCOPES, instagram_app, payment_config, save_instagram_app, save_payment_config
+from app.services.plans import PLAN_TIER, create_subscription, plan_config
 from app.schemas import ChannelOut, PlanConfig, PlanOut, StoreOut, UserOut
-from app.services.ai import DEFAULT_BASE_URLS, provider_proxy, test_provider
+from app.services.ai import DEFAULT_BASE_URLS, AIError, list_models, provider_proxy, test_provider
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -105,15 +108,8 @@ async def _activate(db, admin: User, user_id: int, plan_id: int, starts_at: date
     plan = await db.get(Plan, plan_id)
     if not plan:
         raise HTTPException(404, "پلن پیدا نشد.")
-    now = utcnow()
-    current = (await db.execute(select(Subscription).where(Subscription.user_id == user_id, Subscription.status == "active",
-                                                           Subscription.ends_at > now).order_by(Subscription.ends_at.desc()))).scalars().first()
-    # Renewals stack after the current period instead of overlapping it.
-    start = starts_at or (current.ends_at.replace(tzinfo=timezone.utc) if current else now)
-    sub = Subscription(user_id=user_id, plan_id=plan.id, status="active", starts_at=start,
-                       ends_at=start + relativedelta(months=plan.duration_months), activated_by=f"admin:{admin.id}", note=note)
-    db.add(sub)
-    audit(db, admin, "activate_plan", "user", user_id, {"plan_id": plan.id, "starts_at": start.isoformat()})
+    sub = await create_subscription(db, user_id, plan, activated_by=f"admin:{admin.id}", note=note, starts_at=starts_at)
+    audit(db, admin, "activate_plan", "user", user_id, {"plan_id": plan.id, "starts_at": sub.starts_at.isoformat()})
     return sub
 
 
@@ -240,6 +236,54 @@ async def put_instagram(body: InstagramAppIn, admin: AdminUser, db: DB):
     return await get_instagram(admin, db)
 
 
+class PaymentConfigIn(BaseModel):
+    enabled: bool = False
+    bank: str = "ZARINPAL"
+    gateways: dict[str, dict[str, Any]] = {}
+
+
+@router.get("/integrations/payment")
+async def get_payment(admin: AdminUser, db: DB):
+    cfg = await payment_config(db)
+    # Secrets are write-only: the panel sees which fields are set and only their last 4 characters.
+    masked = {code: {f: (f"••••{str(v)[-4:]}" if v and f != "SANDBOX" else v) for f, v in vals.items()}
+              for code, vals in cfg["gateways"].items()}
+    return {"enabled": cfg["enabled"], "bank": cfg["bank"], "gateways": masked, "banks": BANKS,
+            "callback_url": f"{settings.public_base_url.rstrip('/')}/api/v1/payments/callback/"}
+
+
+@router.put("/integrations/payment")
+async def put_payment(body: PaymentConfigIn, admin: AdminUser, db: DB):
+    if body.bank not in BANKS:
+        raise HTTPException(422, "درگاه نامعتبر است.")
+    current = (await payment_config(db))["gateways"]
+    merged: dict[str, dict[str, Any]] = {}
+    for code in BANKS:
+        old, new = current.get(code, {}), body.gateways.get(code, {})
+        vals = {f: (old.get(f, "") if str(new.get(f, "")).startswith("••••") or f not in new else str(new[f]).strip())
+                for f in BANKS[code]["fields"]}
+        if BANKS[code].get("sandbox"):
+            vals["SANDBOX"] = bool(new.get("SANDBOX", old.get("SANDBOX", False)))
+        if any(vals.get(f) for f in BANKS[code]["fields"]):
+            merged[code] = vals
+    if body.enabled and not merged.get(body.bank):
+        raise HTTPException(422, "اطلاعات درگاه انتخاب‌شده را کامل کنید.")
+    await save_payment_config(db, enabled=body.enabled, bank=body.bank, gateways=merged)
+    audit(db, admin, "update_integration", "payment", None, {"enabled": body.enabled, "bank": body.bank})
+    await db.commit()
+    return await get_payment(admin, db)
+
+
+@router.get("/payments")
+async def payments(admin: AdminUser, db: DB):
+    rows = (await db.execute(select(Payment).options(selectinload(Payment.user), selectinload(Payment.plan))
+                             .order_by(Payment.id.desc()).limit(200))).scalars()
+    return [{"id": p.id, "user": {"id": p.user.id, "phone": p.user.phone, "name": p.user.name},
+             "plan": f"{p.plan.name} {p.plan.duration_months} ماهه", "amount_toman": p.amount_toman, "bank_type": p.bank_type,
+             "status": p.status, "tracking_code": p.tracking_code, "message": p.message, "created_at": p.created_at,
+             "paid_at": p.paid_at} for p in rows]
+
+
 @router.get("/plan-requests")
 async def plan_requests(admin: AdminUser, db: DB, status: str = "pending"):
     rows = (await db.execute(select(PlanRequest, User, Plan).join(User, User.id == PlanRequest.user_id)
@@ -301,9 +345,9 @@ async def providers(admin: AdminUser, db: DB):
     return {"providers": [_provider_out(p) for p in (await db.execute(select(AiProvider).order_by(AiProvider.id))).scalars()],
             "kinds": [{"kind": "gemini", "label": "Google Gemini (کلید مستقیم AI Studio)", "base_url": DEFAULT_BASE_URLS["gemini"],
                        "hint": "کلید را از aistudio.google.com/apikey بگیر. گوگل ایران را تحریم کرده؛ روی سرور داخل ایران پروکسی لازم است.",
-                       "model": "gemini-2.5-flash"},
+                       "model": "gemini-3.8-flash"},
                       {"kind": "metis", "label": "Gemini از طریق متیس", "base_url": DEFAULT_BASE_URLS["metis"],
-                       "hint": "کلید متیس؛ از داخل ایران بدون پروکسی کار می‌کند.", "model": "gemini-2.5-flash"},
+                       "hint": "کلید متیس؛ از داخل ایران بدون پروکسی کار می‌کند.", "model": "gemini-3.8-flash"},
                       {"kind": "openai", "label": "OpenAI یا سرویس سازگار", "base_url": DEFAULT_BASE_URLS["openai"],
                        "hint": "هر سرویس سازگار با OpenAI (مثلاً واسط‌های ایرانی)", "model": "gpt-4.1-mini"},
                       {"kind": "anthropic", "label": "Claude (Anthropic)", "base_url": DEFAULT_BASE_URLS["anthropic"], "hint": "", "model": "claude-sonnet-5-5"}],
@@ -356,6 +400,33 @@ async def delete_provider(pid: int, admin: AdminUser, db: DB):
     audit(db, admin, "delete_ai_key", "ai_provider", p.id)
     await db.commit()
     return {"ok": True}
+
+
+class ModelsIn(BaseModel):
+    kind: str
+    base_url: str = ""
+    api_key: str = ""
+    proxy: str = ""
+
+
+@router.post("/ai/models")
+async def available_models(body: ModelsIn, admin: AdminUser, db: DB, provider_id: int | None = None):
+    """Lists models for a key being typed in the form, or for a stored key (provider_id) when api_key is empty."""
+    if body.kind not in DEFAULT_BASE_URLS:
+        raise HTTPException(422, "نوع سرویس نامعتبر است.")
+    stored = await db.get(AiProvider, provider_id) if provider_id else None
+    creds = decrypt_credentials(stored.api_key_encrypted) if stored else {}
+    key = body.api_key.strip() or creds.get("api_key", "")
+    if not key:
+        raise HTTPException(422, "اول کلید API را وارد کنید.")
+    probe = AiProvider(name="probe", kind=body.kind, base_url=body.base_url,
+                       api_key_encrypted=encrypt_credentials({"api_key": key, "proxy": body.proxy.strip()}))
+    try:
+        return {"models": await list_models(probe)}
+    except AIError as exc:
+        raise HTTPException(400, exc.message_fa)
+    except httpx.HTTPError:
+        raise HTTPException(400, "ارتباط با سرویس برقرار نشد؛ پروکسی یا VPN را بررسی کنید.")
 
 
 @router.post("/ai/providers/{pid}/test")

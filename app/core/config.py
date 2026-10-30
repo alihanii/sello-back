@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     # Where the seller app runs; OAuth redirects (Instagram) come back here.
     frontend_base_url: str = "http://localhost:3000"
     media_dir: str = "./media"
+    # SQLite file for az-iranian-bank-gateways' own table (the library runs on a headless Django).
+    bank_db_path: str = "./bank.db"
 
     # OTP: in dev the code is returned in the response and logged instead of sent by SMS.
     otp_dev_mode: bool = True

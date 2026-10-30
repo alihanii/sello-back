@@ -1,3 +1,6 @@
+from datetime import datetime, timezone
+
+from dateutil.relativedelta import relativedelta
 from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,6 +13,19 @@ PLAN_TIER = "sello"  # the single plan; its 1/3/12-month variants share this tie
 # Limits for users without a subscription (trial / free).
 FREE_LIMITS = {"max_stores": 1, "max_channels": 2, "max_products": 30, "monthly_ai_credits": 20,
                "monthly_publishes": 50, "crawl_frequency": "daily"}
+
+
+async def create_subscription(db: AsyncSession, user_id: int, plan: Plan, *, activated_by: str, note: str = "",
+                              starts_at: datetime | None = None) -> Subscription:
+    """Renewals stack after the current period instead of overlapping it."""
+    now = utcnow()
+    current = (await db.execute(select(Subscription).where(Subscription.user_id == user_id, Subscription.status == "active",
+                                                           Subscription.ends_at > now).order_by(Subscription.ends_at.desc()))).scalars().first()
+    start = starts_at or (current.ends_at.replace(tzinfo=timezone.utc) if current else now)
+    s = Subscription(user_id=user_id, plan_id=plan.id, status="active", starts_at=start,
+                     ends_at=start + relativedelta(months=plan.duration_months), activated_by=activated_by, note=note)
+    db.add(s)
+    return s
 
 
 async def active_subscription(db: AsyncSession, user_id: int) -> Subscription | None:

@@ -37,3 +37,23 @@ async def save_instagram_app(db: AsyncSession, *, enabled: bool, app_id: str, pr
     row.value = {"enabled": enabled, "app_id": app_id.strip(), "proxy": proxy.strip()}
     if app_secret is not None:
         row.secret_encrypted = encrypt_credentials({"app_secret": app_secret.strip()}) if app_secret.strip() else None
+
+
+PAYMENT = "payment"
+
+
+async def payment_config(db: AsyncSession) -> dict[str, Any]:
+    """{enabled, bank, gateways: {BANK: {FIELD: value}}}; gateway credentials are stored encrypted."""
+    row = await db.get(AppSetting, PAYMENT)
+    value = row.value if row else {}
+    gateways = decrypt_credentials(row.secret_encrypted).get("gateways", {}) if row and row.secret_encrypted else {}
+    return {"enabled": bool(value.get("enabled")), "bank": value.get("bank") or "ZARINPAL", "gateways": gateways}
+
+
+async def save_payment_config(db: AsyncSession, *, enabled: bool, bank: str, gateways: dict[str, dict[str, Any]]) -> None:
+    row = await db.get(AppSetting, PAYMENT)
+    if not row:
+        row = AppSetting(key=PAYMENT, value={})
+        db.add(row)
+    row.value = {"enabled": enabled, "bank": bank}
+    row.secret_encrypted = encrypt_credentials({"gateways": gateways})

@@ -5,6 +5,7 @@ _tmp = tempfile.mkdtemp()
 os.environ["SELLO_DATABASE_URL"] = f"sqlite+aiosqlite:///{_tmp}/test.db"
 os.environ["SELLO_MEDIA_DIR"] = f"{_tmp}/media"
 os.environ["SELLO_WORKER_ENABLED"] = "false"
+os.environ["SELLO_BANK_DB_PATH"] = f"{_tmp}/bank.db"
 os.environ["SELLO_ADMIN_PHONES"] = '["09120000000"]'
 
 import httpx  # noqa: E402

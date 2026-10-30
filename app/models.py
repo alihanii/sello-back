@@ -463,3 +463,24 @@ class AppSetting(TimestampMixin, Base):
     key: Mapped[str] = mapped_column(String(60), primary_key=True)
     value: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     secret_encrypted: Mapped[str | None] = mapped_column(Text)
+
+
+class Payment(TimestampMixin, Base):
+    """One online purchase of a plan. The gateway round-trip itself is recorded by az-iranian-bank-gateways
+    (its own `azbankgateways_bank` table); `tracking_code` links the two."""
+
+    __tablename__ = "payments"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    plan_id: Mapped[int] = mapped_column(ForeignKey("plans.id"))
+    amount_toman: Mapped[int] = mapped_column(BigInteger)
+    bank_type: Mapped[str] = mapped_column(String(30))
+    tracking_code: Mapped[str] = mapped_column(String(64), index=True, default="")
+    reference_number: Mapped[str] = mapped_column(String(255), default="")
+    status: Mapped[str] = mapped_column(String(12), default="pending")  # pending | paid | failed
+    message: Mapped[str] = mapped_column(Text, default="")
+    subscription_id: Mapped[int | None] = mapped_column(ForeignKey("subscriptions.id"))
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    user: Mapped[User] = relationship()
+    plan: Mapped[Plan] = relationship()
