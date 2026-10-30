@@ -127,6 +127,15 @@ async def test_raw_photo_becomes_product_with_clean_main_image(client, monkeypat
     prod3 = (await client.get(f"/products/{op3['result']['product_id']}", headers=h)).json()
     assert prod3["images"][0]["url"] == op3["result"]["clean_image"]
 
+    # seller-picked style samples replace the automatic ones
+    r = await client.post(f"/products/{prod3['id']}/clean-image", headers=h,
+                          json={"style_product_ids": [prod["id"]], "style_images": ["/media/999/x.png"]})
+    await drain()
+    op5 = (await client.get(f"/operations/{r.json()['id']}", headers=h)).json()
+    assert op5["status"] == "succeeded", op5
+    step = next(s for s in op5["steps"] if s["name"] == "image_prompt")
+    assert step["request"]["style_refs"] == 1  # the chosen product's photo; the other store's path is ignored
+
     # free tier with no image quota: after Google says so once, the app stops calling until the admin re-saves
     def free(req):
         return httpx.Response(429, json={"error": {"message": "Quota exceeded for metric: generate_content_free_tier_requests, limit: 0"}})

@@ -210,14 +210,34 @@ def _builder_input(*, title: str, note: str, category: str, has_photo: bool, sty
     return "\n".join(lines)
 
 
+async def chosen_styles(db, store_id: int, urls: list[str], product_ids: list[int], limit: int = 3):
+    """Style samples the seller picked: uploaded photos and/or the main photo of chosen products."""
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+
+    from app.models import Product
+
+    picked = [u for u in urls if u.startswith(f"/media/{store_id}/")]
+    if product_ids:
+        q = (select(Product).where(Product.store_id == store_id, Product.id.in_(product_ids))
+             .options(selectinload(Product.images)))
+        for prod in (await db.execute(q)).scalars():
+            picked += [i.url for i in sorted(prod.images, key=lambda i: i.position)[:1]]
+    return [b for b in (read_local(u) for u in picked) if b][:limit]
+
+
 async def make_photo(ctx, *, store_id: int, title: str, note: str, category: str = "general",
-                     image_url: str | None = None, product_id: int | None = None) -> str:
-    """Cleans `image_url`, or generates a photo from the text when there is none, in the style of the shop's
-    earlier product photos. Returns the /media URL. Raises AIError/ValueError with a Persian message."""
+                     image_url: str | None = None, product_id: int | None = None,
+                     style_urls: list[str] | None = None, style_product_ids: list[int] | None = None) -> str:
+    """Cleans `image_url`, or generates a photo from the text when there is none, in the style of the samples the
+    seller picked, else of the shop's earlier product photos. Returns the /media URL. Raises AIError/ValueError with a Persian message."""
     loaded = read_local(image_url) if image_url else None
     if image_url and not loaded:
         raise ValueError("عکس اصلی روی سرور پیدا نشد.")
-    styles = await style_references(ctx.db, store_id, product_id) if ctx.db is not None else []
+    styles = []
+    if ctx.db is not None:
+        styles = await chosen_styles(ctx.db, store_id, style_urls or [], style_product_ids or [])
+        styles = styles or await style_references(ctx.db, store_id, product_id)
     images = ([loaded] if loaded else []) + styles
     async with ctx.step("image_prompt", "نوشتن دستور ساخت عکس" if not loaded else "تحلیل عکس و نوشتن دستور ویرایش",
                         request={"category": category, "has_photo": bool(loaded), "style_refs": len(styles)}) as s:

@@ -23,6 +23,9 @@ class ReferenceIn(BaseModel):
     bulk: bool = False
     # Clean the first photo, or generate one from the text when there is none, in the shop's photo style.
     clean_image: bool = False
+    # Style samples for that photo (uploaded photos / existing products); empty = the shop's earlier products.
+    style_images: list[str] = []
+    style_product_ids: list[int] = []
 
 
 @router.post("/stores/{store_id}/reference-sets", response_model=list[OperationOut], status_code=202)
@@ -43,7 +46,8 @@ async def create(store_id: int, body: ReferenceIn, user: CurrentUser, db: DB):
         await db.flush()
         op = await enqueue(db, store_id=store_id, type="reference", ref_type="reference_set", ref_id=ref.id, actor="ai",
                            title_fa="ساخت محصول با AI از رفرنس",
-                           payload={"clean_image": body.clean_image})
+                           payload={"clean_image": body.clean_image, "style_images": body.style_images[:3],
+                                    "style_product_ids": body.style_product_ids[:3]})
         ref.operation_id = op.id
         ops.append(op)
     await db.commit()
