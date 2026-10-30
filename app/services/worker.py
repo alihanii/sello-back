@@ -1,6 +1,6 @@
 """In-process worker. Claims queued operations with a conditional UPDATE so several replicas
 never run the same one (pattern from platform-wrappers' messenger_queue), plus a scheduler
-for crawl sources and scheduled automations."""
+for crawl sources."""
 
 import asyncio
 import logging
@@ -12,7 +12,6 @@ from sqlalchemy.orm import selectinload
 from app.core.config import settings
 from app.core.db import SessionLocal, utcnow
 from app.models import Channel, CrawlSource, Operation
-from app.services import automation
 from app.services.jobs import HANDLERS
 from app.services.ops import OpContext, enqueue, fail_operation
 
@@ -68,9 +67,6 @@ async def _sync_failure(db, op: Operation) -> None:
         await record_event(db, op.store_id, "publish_failed", operation_id=op.id, channel_id=op.channel_id)
         await notify(db, op.store_id, "publish_failed", "انتشار ناموفق: " + (op.title_fa or ""), op.error_message_fa or "",
                      link=f"/app/s/{op.store_id}/activity/{op.id}")
-    elif op.type == "ai_post":
-        await notify(db, op.store_id, "publish_failed", "ساخت پست با AI ناموفق بود", op.error_message_fa or "",
-                     link=f"/app/s/{op.store_id}/activity/{op.id}")
     elif op.type == "crawl":
         await record_event(db, op.store_id, "crawl_failed", operation_id=op.id, channel_id=op.channel_id)
     elif op.type in ("connect", "health_check") and op.channel_id:
@@ -94,8 +90,6 @@ async def _scheduler_tick() -> None:
             await enqueue(db, store_id=src.store_id, type="crawl", ref_type="crawl_source", ref_id=src.id,
                           channel_id=src.channel_id, trigger="schedule", actor="ai", title_fa=f"کرال زمان‌بندی‌شدهٔ «{src.name}»")
             src.next_run_at = now + SCHEDULE_DELTA[src.schedule]
-        await automation.run_scheduled(db)
-        await automation.run_ai_content(db)
         await db.commit()
 
 

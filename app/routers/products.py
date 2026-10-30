@@ -10,8 +10,7 @@ from sqlalchemy.orm import selectinload
 from app.deps import DB, CurrentUser, get_store_for
 from app.models import Channel, ChannelListing, InventoryMovement, Operation, Product, ProductImage
 from app.schemas import OperationOut, ProductIn, ProductOut, ProductPatch
-from app.services import automation
-from app.services.automation import queue_publish
+from app.services.ops import queue_publish
 from app.services.media import ALLOWED, save_bytes
 from app.services.ai import route_problem
 from app.services.ops import enqueue, record_event
@@ -78,7 +77,6 @@ async def create_product(store_id: int, body: ProductIn, user: CurrentUser, db: 
         db.add(InventoryMovement(product_id=p.id, delta=p.stock_qty, qty_after=p.stock_qty, reason="manual", note="موجودی اولیه"))
     await record_event(db, store_id, "product_created")
     await db.commit()
-    await automation.fire(db, store_id, "product_created", p.id)
     await db.commit()
     return await _get(db, user, p.id)
 
@@ -107,10 +105,7 @@ async def update_product(product_id: int, body: ProductPatch, user: CurrentUser,
         if l.status == "published":
             l.status = "out_of_sync"
     await db.commit()
-    trigger = "stock_changed" if set(data) == {"stock_qty"} else "product_updated"
-    pid, store_id = p.id, p.store_id  # read before expire_all: lazy loads aren't allowed in async sessions
-    await automation.fire(db, store_id, trigger, pid)
-    await db.commit()
+    pid = p.id
     db.expunge_all()  # reload relationships fresh; expire_all would force lazy loads on `user`
     return await _get(db, user, pid)
 
@@ -135,8 +130,6 @@ async def set_stock(product_id: int, body: StockIn, user: CurrentUser, db: DB):
     p.stock_qty = body.qty
     await db.commit()
     pid = p.id
-    await automation.fire(db, p.store_id, "stock_changed", pid)
-    await db.commit()
     db.expunge_all()
     return await _get(db, user, pid)
 

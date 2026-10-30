@@ -6,11 +6,12 @@ from contextlib import asynccontextmanager
 from datetime import date
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import utcnow
 from app.core.security import redact
-from app.models import ActivityEvent, Operation, OperationStep
+from app.models import ActivityEvent, Channel, ChannelListing, Operation, OperationStep, Product
 from app.platforms.base import PlatformError
 from app.services.ai import AIError
 
@@ -100,3 +101,19 @@ def fail_operation(op: Operation, exc: Exception) -> None:
         op.error_code = "internal"
         op.error_message_fa = "خطای داخلی سیستم؛ تیم پشتیبانی مطلع شد."
         op.suggested_action = {"type": "retry", "label": "تلاش دوباره"}
+
+
+async def queue_publish(db: AsyncSession, product: Product, channel: Channel, *, trigger: str, actor: str) -> int | None:
+    listing = (await db.execute(select(ChannelListing).where(
+        ChannelListing.product_id == product.id, ChannelListing.channel_id == channel.id))).scalar_one_or_none()
+    if not listing:
+        listing = ChannelListing(product_id=product.id, channel_id=channel.id)
+        db.add(listing)
+        await db.flush()
+    if listing.status in ("queued", "publishing"):
+        return None  # never run two publishes of the same product × channel at once
+    listing.status = "queued"
+    op = await enqueue(db, store_id=product.store_id, type="publish", channel_id=channel.id, product_id=product.id,
+                       ref_type="listing", ref_id=listing.id, trigger=trigger, actor=actor,
+                       title_fa=f"انتشار «{product.title[:60]}» در {channel.display_name or channel.platform}")
+    return op.id

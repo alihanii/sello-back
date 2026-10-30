@@ -99,7 +99,7 @@ class Product(TimestampMixin, Base):
     created_by: Mapped[str] = mapped_column(String(10), default="user")  # user | ai | crawler
     tags: Mapped[list[str]] = mapped_column(JSON, default=list)
     is_golden_sample: Mapped[bool] = mapped_column(Boolean, default=False)
-    # Ready-to-post text written by AI (content automations); channels use it instead of title + description.
+    # Ready-to-post text written by AI; channels use it instead of title + description.
     post_caption: Mapped[str] = mapped_column(Text, default="")
 
     images: Mapped[list["ProductImage"]] = relationship(
@@ -142,7 +142,7 @@ class ChannelListing(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(16), default="not_published")
     remote_id: Mapped[str] = mapped_column(String(200), default="")
     remote_url: Mapped[str] = mapped_column(String(1000), default="")
-    published_by: Mapped[str] = mapped_column(String(12), default="")  # user | ai | automation
+    published_by: Mapped[str] = mapped_column(String(12), default="")  # user | ai
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error_fa: Mapped[str] = mapped_column(Text, default="")
@@ -160,14 +160,14 @@ class Operation(TimestampMixin, Base):
     __tablename__ = "operations"
     id: Mapped[int] = mapped_column(primary_key=True)
     store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), index=True)
-    # connect | publish | crawl | health_check | automation | reference
+    # connect | publish | crawl | health_check | reference | image_clean
     type: Mapped[str] = mapped_column(String(20), index=True)
     title_fa: Mapped[str] = mapped_column(String(300), default="")
     channel_id: Mapped[int | None] = mapped_column(ForeignKey("channels.id"))
     product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id"))
     ref_type: Mapped[str] = mapped_column(String(30), default="")
     ref_id: Mapped[int | None] = mapped_column(Integer)
-    trigger: Mapped[str] = mapped_column(String(20), default="user")  # user | automation | schedule | retry
+    trigger: Mapped[str] = mapped_column(String(20), default="user")  # user | schedule | retry
     actor: Mapped[str] = mapped_column(String(12), default="user")  # user | ai
     # queued | running | succeeded | failed | partial
     status: Mapped[str] = mapped_column(String(12), default="queued", index=True)
@@ -267,37 +267,6 @@ class StoreStyleProfile(TimestampMixin, Base):
     store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), unique=True)
     profile: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     sample_product_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
-
-
-# ---------- automations ----------
-
-
-class Automation(TimestampMixin, Base):
-    __tablename__ = "automations"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), index=True)
-    name: Mapped[str] = mapped_column(String(160))
-    # product_created | product_updated | stock_changed | schedule | ai_content
-    trigger: Mapped[str] = mapped_column(String(20))
-    conditions: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    # {"channel_ids": [...], "mode": "auto"|"approval", "schedule_hour": 10}
-    actions: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    run_count: Mapped[int] = mapped_column(Integer, default=0)
-
-
-class Approval(TimestampMixin, Base):
-    __tablename__ = "approvals"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), index=True)
-    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"))
-    automation_id: Mapped[int | None] = mapped_column(ForeignKey("automations.id"))
-    channel_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
-    status: Mapped[str] = mapped_column(String(12), default="pending")  # pending | approved | rejected
-    kind: Mapped[str] = mapped_column(String(12), default="publish")  # publish | ai_post
-    operation_id: Mapped[int | None] = mapped_column(ForeignKey("operations.id"))
-    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Notification(TimestampMixin, Base):

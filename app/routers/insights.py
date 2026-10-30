@@ -7,7 +7,7 @@ from sqlalchemy import func, select
 
 from app.core.db import utcnow
 from app.deps import DB, CurrentUser, get_store_for
-from app.models import ActivityEvent, Approval, Automation, Channel, ChannelListing, CrawlSource, Operation, Plan, Product
+from app.models import ActivityEvent, Channel, ChannelListing, CrawlSource, Operation, Plan, Product
 from app.schemas import OperationOut
 from app.services.ai import ai_available, route_problem
 from app.services.plans import active_subscription, limits_for
@@ -61,11 +61,6 @@ async def calendar(store_id: int, user: CurrentUser, db: DB, start: date, end: d
     for s in sources:
         if s.next_run_at:
             upcoming.append({"type": "crawl", "title_fa": f"کرال «{s.name}»", "at": s.next_run_at, "schedule": s.schedule})
-    rules = (await db.execute(select(Automation).where(Automation.store_id == store_id, Automation.trigger == "schedule",
-                                                       Automation.is_active))).scalars()
-    for r in rules:
-        upcoming.append({"type": "publish", "title_fa": f"انتشار زمان‌بندی‌شده «{r.name}»",
-                         "hour": (r.actions or {}).get("schedule_hour", 10), "schedule": "daily"})
     # 7-day average of incoming data for "today vs average".
     week = await _daily(db, store_id, today - timedelta(days=7), today - timedelta(days=1))
     avg_items = sum(v.get("crawl_item", 0) for v in week.values()) / 7
@@ -103,10 +98,6 @@ async def dashboard(store_id: int, user: CurrentUser, db: DB):
         Operation.store_id == store_id, Operation.status == "failed", ~Operation.seen))
     if failed:
         attention.append({"type": "operations", "text": f"{failed} عملیات ناموفق دیده‌نشده"})
-    pending = await db.scalar(select(func.count()).select_from(Approval).where(
-        Approval.store_id == store_id, Approval.status == "pending"))
-    if pending:
-        attention.append({"type": "approvals", "text": f"{pending} محصول منتظر تأیید انتشار"})
     out_of_stock = await db.scalar(select(func.count()).select_from(Product).where(
         Product.store_id == store_id, Product.status == "ready", Product.stock_qty <= 0))
     if out_of_stock:

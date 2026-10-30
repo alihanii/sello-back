@@ -9,7 +9,6 @@ from app.core.db import utcnow
 from app.deps import DB, CurrentUser, get_store_for
 from app.models import Channel, CrawlSource, Product
 from app.schemas import OperationOut, ProductOut
-from app.services import automation
 from app.services.ops import enqueue
 
 router = APIRouter(tags=["crawl"])
@@ -115,8 +114,4 @@ async def inbox_action(store_id: int, body: InboxAction, user: CurrentUser, db: 
     for p in rows:
         p.status = "ready" if body.approve else "archived"
     await db.commit()
-    if body.approve:
-        for p in rows:
-            await automation.fire(db, store_id, "product_created", p.id)
-        await db.commit()
     return {"ok": True, "count": len(rows)}
