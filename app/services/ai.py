@@ -195,6 +195,9 @@ def _raise_for(resp: httpx.Response) -> None:
                       code="ai_bad_model", detail=resp.text[:500])
     if resp.status_code in (401, 403):
         raise AIError("کلید API نامعتبر است یا دسترسی ندارد.", code=f"ai_http_{resp.status_code}", detail=resp.text[:500])
+    if resp.status_code == 429 and "free_tier" in low and "limit: 0" in low:
+        raise AIError("این مدل روی پلن رایگان گوگل سهمیه ندارد (limit 0)؛ برای استفاده باید Billing را روی پروژهٔ گوگلِ این کلید "
+                      "فعال کنی یا کلید دیگری (پولی یا متیس) برای این کار بگذاری.", code="ai_free_tier", detail=resp.text[:500])
     if resp.status_code == 429:
         raise AIError("سقف استفاده از کلید API پر شده است.", code="ai_rate_limited", detail=resp.text[:500])
     if resp.status_code in (500, 502, 503, 504):
