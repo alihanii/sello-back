@@ -4,7 +4,10 @@ Two calls, like the original: a text model that can see images writes a precise 
 photo (prompt builder), then a Gemini image model redraws the same photo with that prompt: same product, pure
 white background, centred, square 2K. Prompts are copied verbatim from platform-wrappers (V0.2.0)."""
 
+import io
 import re
+
+from PIL import Image, ImageDraw
 
 from app.services import ai
 from app.services.media import read_local, save_bytes
@@ -174,6 +177,13 @@ PHOTO_KIND_SYSTEM = """Look at the attached image from an online seller. Decide 
 "design": a flat artwork, logo, drawing, pattern or print file the seller wants printed on a product (no physical product visible).
 Respond ONLY with JSON: {"kind":"product"} or {"kind":"design"}"""
 
+PEOPLE_SYSTEM = """Look at the attached product photo from an online seller.
+Find the product being sold, and any real person in the photo.
+Boxes are [ymin, xmin, ymax, xmax] on a 0-1000 scale.
+"product_box": the tightest box around the product only (for worn clothing: the garment, from its top edge, e.g. the
+collar or hood, to its bottom edge). "faces": a box around each visible human head and face (with hair and sunglasses).
+Respond ONLY with JSON: {"people": true|false, "product_box": [..], "faces": [[..], ..]}"""
+
 _TAIL = "1:1 aspect ratio, 2048x2048 pixels resolution, clean e-commerce cutout style."
 
 
@@ -183,7 +193,8 @@ def _sanitize(text: str) -> str:
     return text if text.endswith(_TAIL) else f"{text.rstrip('.')}. {_TAIL}"
 
 
-def _builder_input(*, title: str, note: str, category: str, has_photo: bool, design: bool = False) -> str:
+def _builder_input(*, title: str, note: str, category: str, has_photo: bool, design: bool = False,
+                   no_people: bool = False) -> str:
     num, label = IMAGE_CATEGORIES.get(category, IMAGE_CATEGORIES["general"])
     lines = [f"PRODUCT NAME: {title}", f"user description: {note or title}",
              f"Selected category (prompt_type {num}): {label}", ""]
@@ -195,6 +206,10 @@ def _builder_input(*, title: str, note: str, category: str, has_photo: bool, des
                      "reproduced exactly: same shapes, proportions and line work. Do not invent other logos or text.")
     elif has_photo:
         lines.append("Attached image 1 is the product photo (the ATTACHED IMAGE).")
+        if no_people:
+            lines.append("The product was worn or held by a person whose face has been cut out or blanked. Show the "
+                         "product ALONE: no person, no body, no skin, no hands, no face (clothing: invisible ghost "
+                         "mannequin or flat lay). Do not mention the person or any identity in the prompt.")
     else:
         lines.append("There is NO product photo: write a text-to-image prompt that depicts the product exactly as the "
                      "name and description say. Do not invent logos, brand names, printed text or details not stated.")
@@ -211,13 +226,20 @@ async def make_photo(ctx, *, store_id: int, title: str, note: str, category: str
     loaded = read_local(image_url) if image_url else None
     if image_url and not loaded:
         raise ValueError("عکس اصلی روی سرور پیدا نشد.")
-    images = [loaded] if loaded else []
     design = design and bool(loaded)
+    no_people = False
+    if loaded and not design and category == "modeled_clothing":
+        # Image models refuse photos of real, identifiable people (IMAGE_OTHER), so the face goes before any call.
+        hidden = await _hide_people(ctx, store_id, loaded)
+        if hidden:
+            loaded, no_people, category = hidden, True, "flat_clothing"
+    images = [loaded] if loaded else []
     async with ctx.step("image_prompt", "تحلیل عکس و نوشتن دستور ویرایش" if loaded and not design else "نوشتن دستور ساخت عکس",
                         request={"category": category, "has_photo": bool(loaded), "design": design}) as s:
         raw = await ai.generate_text(
             task="vision", system=PROMPT_BUILDER_SYSTEM, images=images, store_id=store_id,
-            prompt=_builder_input(title=title, note=note, category=category, has_photo=bool(loaded), design=design))
+            prompt=_builder_input(title=title, note=note, category=category, has_photo=bool(loaded), design=design,
+                                  no_people=no_people))
         prompt = _sanitize(raw)
         s.response = {"prompt": prompt}
     label = "تمیز کردن عکس" if loaded and not design else "ساخت عکس محصول"
@@ -232,8 +254,12 @@ async def make_photo(ctx, *, store_id: int, title: str, note: str, category: str
     except ai.AIError as exc:
         if exc.code != "ai_no_image":
             raise
-        # The model sometimes returns no picture (IMAGE_OTHER) for a long or conflicting prompt.
-        # One retry with a short, plain instruction.
+        # The model returns no picture (IMAGE_OTHER) for a real person's face or a long, conflicting prompt.
+        # One retry with a short, plain instruction, on the photo without its faces.
+        if loaded and not design and not no_people:
+            hidden = await _hide_people(ctx, store_id, loaded)
+            if hidden:
+                images, no_people = [hidden], True
         simple = _simple_prompt(title=title, note=note, has_photo=bool(loaded), design=design)
         async with ctx.step("image_retry", "تلاش دوباره با دستور ساده‌تر",
                             request={"prompt": simple, "images": 1 if loaded else 0, "design": design}) as s:
@@ -252,6 +278,53 @@ def _simple_prompt(*, title: str, note: str, has_photo: bool, design: bool) -> s
     else:
         head = f"Clean product photo of: {what}."
     return f"{head} Centred, fully visible, plain white background, soft even light, no text, no people, no props. {_TAIL}"
+
+
+async def _hide_people(ctx, store_id: int, loaded: tuple[bytes, str]) -> tuple[bytes, str] | None:
+    """Crops the photo to the product and blanks every face. None when there is no person (or the check fails)."""
+    try:
+        async with ctx.step("image_people", "حذف آدم از عکس", request={"images": 1}) as s:
+            res = await ai.generate_json(task="vision", system=PEOPLE_SYSTEM, prompt="Find the product and the people.",
+                                         images=[loaded], store_id=store_id)
+            s.response = res
+    except ai.AIError:
+        return None
+    if not res.get("people"):
+        return None
+    return crop_without_faces(loaded[0], res.get("product_box"), res.get("faces") or [])
+
+
+def _box(raw, w: int, h: int) -> tuple[int, int, int, int] | None:
+    try:
+        y0, x0, y1, x1 = (min(max(float(v), 0), 1000) for v in raw)
+    except (TypeError, ValueError):
+        return None
+    box = (round(x0 * w / 1000), round(y0 * h / 1000), round(x1 * w / 1000), round(y1 * h / 1000))
+    return box if box[2] > box[0] and box[3] > box[1] else None
+
+
+def crop_without_faces(data: bytes, product_box, faces: list) -> tuple[bytes, str] | None:
+    """Paints the faces white, then crops to the product (with a small margin). Returns PNG bytes."""
+    try:
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+    except Exception:  # noqa: BLE001
+        return None
+    w, h = img.size
+    draw = ImageDraw.Draw(img)
+    face_boxes = [b for b in (_box(f, w, h) for f in faces if isinstance(f, list | tuple)) if b]
+    for x0, y0, x1, y1 in face_boxes:
+        pad = round(0.1 * max(x1 - x0, y1 - y0))
+        draw.rectangle((x0 - pad, y0 - pad, x1 + pad, y1 + pad), fill="white")
+    crop = _box(product_box, w, h) if isinstance(product_box, list | tuple) else None
+    if crop:
+        m = round(0.03 * max(w, h))
+        x0, y0, x1, y1 = max(crop[0] - m, 0), max(crop[1] - m, 0), min(crop[2] + m, w), min(crop[3] + m, h)
+        img = img.crop((x0, y0, x1, y1))
+    elif not face_boxes:
+        return None
+    out = io.BytesIO()
+    img.save(out, "PNG")
+    return out.getvalue(), "image/png"
 
 
 async def photo_kind(store_id: int, url: str) -> str:

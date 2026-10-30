@@ -104,8 +104,8 @@ async def test_raw_photo_becomes_product_with_clean_main_image(client, monkeypat
     await drain()
     op2 = (await client.get(f"/operations/{r.json()['id']}", headers=h)).json()
     assert op2["status"] == "failed" and "عکس دیگر" in op2["error_message_fa"]
-    assert [x["name"] for x in op2["steps"]][-2:] == ["image_edit", "image_retry"]  # one simpler retry
-    assert "IMAGE_SAFETY" in str(op2["steps"][-2]["response"])  # the reason stays in the log
+    assert [x["name"] for x in op2["steps"]][-3:] == ["image_edit", "image_people", "image_retry"]  # one simpler retry
+    assert "IMAGE_SAFETY" in str(op2["steps"][-3]["response"])  # the reason stays in the log
 
     # no photo: a product with only text gets a photo generated from the text; other products' photos are never sent
     calls.clear()
@@ -192,3 +192,64 @@ async def test_design_flow_reaches_the_image_model(monkeypatch):
     monkeypatch.setattr(product_images.ai, "generate_image", fake_image)
     out = await product_images.make_photo(Ctx(), store_id=1, title="هودی", note="هودی مشکی", image_url=url, design=True)
     assert out.startswith("/media/1/") and seen["images"] == 1 and "DESIGN" in seen["system"]
+
+
+def test_faces_are_blanked_and_photo_cropped_to_the_product():
+    import io
+
+    from PIL import Image
+
+    from app.services.product_images import crop_without_faces
+
+    img = Image.new("RGB", (100, 200), (0, 0, 0))
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    out, mime = crop_without_faces(buf.getvalue(), [250, 0, 1000, 1000], [[0, 300, 200, 700]])
+    res = Image.open(io.BytesIO(out))
+    assert mime == "image/png" and res.size[1] < 200  # cropped below the top
+    assert crop_without_faces(buf.getvalue(), None, []) is None  # nothing to hide
+    blank, _ = crop_without_faces(buf.getvalue(), None, [[0, 300, 200, 700]])
+    assert Image.open(io.BytesIO(blank)).getpixel((50, 20)) == (255, 255, 255)
+
+
+async def test_worn_clothing_hides_the_person_before_the_image_model(monkeypatch):
+    import io
+
+    from PIL import Image
+
+    from app.services import product_images
+    from app.services.media import save_bytes
+
+    buf = io.BytesIO()
+    Image.new("RGB", (100, 200), (0, 0, 0)).save(buf, "PNG")
+    url = save_bytes(1, buf.getvalue(), content_type="image/png")
+    seen = {}
+
+    async def fake_json(**kw):
+        return {"people": True, "product_box": [250, 0, 1000, 1000], "faces": [[0, 300, 200, 700]]}
+
+    async def fake_text(**kw):
+        seen["builder"] = kw["prompt"]
+        return "The olive hoodie alone as a ghost mannequin."
+
+    async def fake_image(*, system, prompt, images, store_id, task="image_edit"):
+        seen["sent"] = images[0][0]
+        return PNG, "image/png"
+
+    class Ctx:
+        def step(self, *a, **kw):
+            from contextlib import asynccontextmanager
+
+            @asynccontextmanager
+            async def cm():
+                class S:
+                    response = {}
+                yield S()
+            return cm()
+
+    monkeypatch.setattr(product_images.ai, "generate_json", fake_json)
+    monkeypatch.setattr(product_images.ai, "generate_text", fake_text)
+    monkeypatch.setattr(product_images.ai, "generate_image", fake_image)
+    await product_images.make_photo(Ctx(), store_id=1, title="هودی", note="", category="modeled_clothing", image_url=url)
+    assert "ghost mannequin" in seen["builder"] and "Flat Lay" in seen["builder"]
+    assert Image.open(io.BytesIO(seen["sent"])).size[1] < 200  # the cropped photo, not the original
