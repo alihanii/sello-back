@@ -212,8 +212,7 @@ def test_faces_are_blanked_and_photo_cropped_to_the_product():
     assert Image.open(io.BytesIO(blank)).getpixel((50, 20)) == (255, 255, 255)
 
 
-async def test_refused_photo_is_retried_without_the_person(monkeypatch):
-    """First attempt exactly like platform-wrappers; only when the image model refuses, faces go and it retries."""
+async def test_worn_clothing_hides_the_person_before_the_image_model(monkeypatch):
     import io
 
     from PIL import Image
@@ -224,19 +223,17 @@ async def test_refused_photo_is_retried_without_the_person(monkeypatch):
     buf = io.BytesIO()
     Image.new("RGB", (100, 200), (0, 0, 0)).save(buf, "PNG")
     url = save_bytes(1, buf.getvalue(), content_type="image/png")
-    seen = {"sent": []}
+    seen = {}
 
     async def fake_json(**kw):
         return {"people": True, "product_box": [250, 0, 1000, 1000], "faces": [[0, 300, 200, 700]]}
 
     async def fake_text(**kw):
-        seen["builder"], seen["task"] = kw["prompt"], kw["task"]
-        return "The olive hoodie on a model."
+        seen["builder"] = kw["prompt"]
+        return "The olive hoodie alone as a ghost mannequin."
 
     async def fake_image(*, system, prompt, images, store_id, task="image_edit"):
-        seen["sent"].append(images[0][0])
-        if len(seen["sent"]) == 1:
-            raise ai.AIError("x", code="ai_no_image")
+        seen["sent"] = images[0][0]
         return PNG, "image/png"
 
     async def no_route(task):
@@ -257,11 +254,12 @@ async def test_refused_photo_is_retried_without_the_person(monkeypatch):
     monkeypatch.setattr(product_images.ai, "generate_text", fake_text)
     monkeypatch.setattr(product_images.ai, "generate_image", fake_image)
     monkeypatch.setattr(product_images.ai, "has_route", no_route)
-    await product_images.make_photo(Ctx(), store_id=1, title="هودی", note="هودی سبز", category="modeled_clothing",
-                                    image_url=url)
-    assert seen["builder"] == ("PRODUCT NAME: هودی سبز\nuser description: هودی سبز\nSelected category (prompt_type 2): "
-                               "Modeled Clothing (Chador / Abaya / General Apparel on Model)\n\n"
+    await product_images.make_photo(Ctx(), store_id=1, title="هودی", note="", category="modeled_clothing", image_url=url)
+    assert "ghost mannequin" in seen["builder"] and "Flat Lay" in seen["builder"]
+    assert Image.open(io.BytesIO(seen["sent"])).size[1] < 200  # the cropped photo, not the original
+    # any other photo goes to the builder exactly as platform-wrappers sends it
+    await product_images.make_photo(Ctx(), store_id=1, title="هودی", note="هودی سبز", category="flat_clothing", image_url=url)
+    assert seen["builder"] == ("PRODUCT NAME: هودی سبز\nuser description: هودی سبز\nSelected category (prompt_type 1): "
+                               "General Clothing (Apparel - Flat Lay)\n\n"
                                "Analyze the attached e-commerce image and return exactly one raw English paragraph.")
-    assert seen["task"] == "vision"
-    assert seen["sent"][0] == buf.getvalue()  # the original photo first
-    assert Image.open(io.BytesIO(seen["sent"][1])).size[1] < 200  # then the cropped one
+    assert seen["sent"] == buf.getvalue()

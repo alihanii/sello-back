@@ -195,9 +195,10 @@ def _sanitize(text: str) -> str:
     return cleaned.strip().strip('"')
 
 
-def _builder_input(*, title: str, note: str, category: str, has_photo: bool, design: bool = False) -> str:
+def _builder_input(*, title: str, note: str, category: str, has_photo: bool, design: bool = False,
+                   no_people: bool = False) -> str:
     num, label = IMAGE_CATEGORIES.get(category, IMAGE_CATEGORIES["general"])
-    if has_photo and not design:
+    if has_photo and not design and not no_people:
         # platform-wrappers build_prompt_builder_user_input, verbatim: the seller's text is the instruction.
         instruction = note or title
         return (f"PRODUCT NAME: {instruction}\n"
@@ -206,6 +207,13 @@ def _builder_input(*, title: str, note: str, category: str, has_photo: bool, des
                 "Analyze the attached e-commerce image and return exactly one raw English paragraph.")
     lines = [f"PRODUCT NAME: {title}", f"user description: {note or title}",
              f"Selected category (prompt_type {num}): {label}", ""]
+    if no_people:
+        lines += ["Attached image 1 is the product photo (the ATTACHED IMAGE).",
+                  "The product was worn or held by a person whose face has been blanked. Show the product ALONE: no "
+                  "person, no body, no skin, no hands, no face (clothing: invisible ghost mannequin or flat lay). Keep "
+                  "the product's own prints and text. Do not mention the person or any identity in the prompt.",
+                  "", "Analyze the attached e-commerce image and return exactly one raw English paragraph."]
+        return "\n".join(lines)
     if has_photo and design:
         lines.append("Attached image 1 is NOT the product: it is the DESIGN (artwork/print) the seller puts on the product. "
                      "Write a text-to-image prompt that depicts the product exactly as the name and description say, with "
@@ -228,13 +236,20 @@ async def make_photo(ctx, *, store_id: int, title: str, note: str, category: str
     if image_url and not loaded:
         raise ValueError("عکس اصلی روی سرور پیدا نشد.")
     design = design and bool(loaded)
+    no_people = False
+    if loaded and not design and category == "modeled_clothing":
+        # platform-wrappers asks for a new model here, and image models refuse to swap a real person (IMAGE_OTHER).
+        # So for worn clothing the face goes first and the garment is shown alone.
+        if hidden := await _hide_people(ctx, store_id, loaded):
+            loaded, no_people, category = hidden, True, "flat_clothing"
     images = [loaded] if loaded else []
     async with ctx.step("image_prompt", "تحلیل عکس و نوشتن دستور ویرایش" if loaded and not design else "نوشتن دستور ساخت عکس",
                         request={"category": category, "has_photo": bool(loaded), "design": design}) as s:
         raw = await ai.generate_text(
             task="image_prompt" if await ai.has_route("image_prompt") else "vision",
             system=PROMPT_BUILDER_SYSTEM, images=images, store_id=store_id,
-            prompt=_builder_input(title=title, note=note, category=category, has_photo=bool(loaded), design=design))
+            prompt=_builder_input(title=title, note=note, category=category, has_photo=bool(loaded), design=design,
+                                  no_people=no_people))
         prompt = _sanitize(raw)
         s.response = {"prompt": prompt}
     label = "تمیز کردن عکس" if loaded and not design else "ساخت عکس محصول"
@@ -251,9 +266,9 @@ async def make_photo(ctx, *, store_id: int, title: str, note: str, category: str
             raise
         # The model returns no picture (IMAGE_OTHER) for a real person's face or a long, conflicting prompt.
         # One retry with a short, plain instruction, on the photo without its faces.
-        if loaded and not design and (hidden := await _hide_people(ctx, store_id, loaded)):
-            images = [hidden]
-        simple = _simple_prompt(title=title, note=note, has_photo=bool(loaded), design=design)
+        if loaded and not design and not no_people and (hidden := await _hide_people(ctx, store_id, loaded)):
+            images, no_people = [hidden], True
+        simple = _simple_prompt(title=title, note=note, has_photo=bool(loaded), design=design, no_people=no_people)
         async with ctx.step("image_retry", "تلاش دوباره با دستور ساده‌تر",
                             request={"prompt": simple, "images": 1 if loaded else 0, "design": design}) as s:
             data, mime = await ai.generate_image(system=system, prompt=simple, images=images, store_id=store_id)
@@ -262,15 +277,16 @@ async def make_photo(ctx, *, store_id: int, title: str, note: str, category: str
     return url
 
 
-def _simple_prompt(*, title: str, note: str, has_photo: bool, design: bool) -> str:
+def _simple_prompt(*, title: str, note: str, has_photo: bool, design: bool, no_people: bool = False) -> str:
     what = f"{title}. {note}".strip(". ")
     if has_photo and design:
         head = f"Product photo of: {what}. Apply the attached design to the product exactly as drawn."
     elif has_photo:
-        head = "Clean product photo of the exact product in the attached image, unchanged."
+        head = ("Clean product photo of the product in the attached image, keeping its colours, prints and details."
+                + (" Show it alone, as an invisible ghost mannequin or flat lay; remove the person." if no_people else ""))
     else:
         head = f"Clean product photo of: {what}."
-    return f"{head} Centred, fully visible, plain white background, soft even light, no text, no people, no props. {_TAIL}"
+    return f"{head} Centred, fully visible, plain white background, soft even light, no added text or props. {_TAIL}"
 
 
 async def _hide_people(ctx, store_id: int, loaded: tuple[bytes, str]) -> tuple[bytes, str] | None:
