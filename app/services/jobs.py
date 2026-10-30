@@ -19,7 +19,7 @@ from app.platforms.base import CrawledItem, EDIT_PRODUCT, PlatformError
 from app.platforms.registry import get_adapter
 from app.services import ai
 from app.services.media import read_local, save_bytes
-from app.services.product_images import clean_photo
+from app.services.product_images import make_photo
 from app.services.automation import queue_publish
 from app.services.notify import notify
 from app.services.ops import OpContext, record_event
@@ -346,15 +346,18 @@ async def generate_from_reference(ctx: OpContext, ref: ReferenceSet) -> Product:
     problems = []
     if any(f["status"] == "failed" for f in fetches):
         problems.append("بعضی لینک‌ها کرال نشدند؛ محصول با بقیهٔ رفرنس‌ها ساخته شد.")
-    if (op.payload or {}).get("clean_image") and ref.images:
+    if (op.payload or {}).get("clean_image"):
         await db.commit()  # keep the product even if the image step fails
+        source = ref.images[0] if ref.images else None
         try:
-            url = await clean_photo(ctx, store_id=store.id, image_url=ref.images[0], title=product.title, note=ref.note,
-                                    category=str(result.get("image_category") or "general"))
-            await _set_main_image(db, product.id, url, origin=ref.images[0])
+            url = await make_photo(ctx, store_id=store.id, image_url=source, title=product.title,
+                                   note=ref.note or product.description[:400], product_id=product.id,
+                                   category=str(result.get("image_category") or "general"))
+            await _set_main_image(db, product.id, url, origin=source or "")
             op.result = {**op.result, "clean_image": url}
         except (ai.AIError, ValueError) as exc:
-            problems.append(f"محصول ساخته شد ولی عکس تمیز نشد: {getattr(exc, 'message_fa', None) or exc}")
+            what = "تمیز" if source else "ساخته"
+            problems.append(f"محصول ساخته شد ولی عکس {what} نشد: {getattr(exc, 'message_fa', None) or exc}")
     if problems:
         op.status = "partial"
         op.error_message_fa = " ".join(problems)
@@ -373,16 +376,17 @@ async def run_image_clean(ctx: OpContext) -> None:
     """Cleans one existing product photo (product page button)."""
     db, op = ctx.db, ctx.op
     product = await _load_product(db, op.product_id)
-    image = await db.get(ProductImage, int(op.payload["image_id"]))
-    if not image or image.product_id != product.id:
+    image = await db.get(ProductImage, int(op.payload["image_id"])) if op.payload.get("image_id") else None
+    if op.payload.get("image_id") and (not image or image.product_id != product.id):
         raise PlatformError("عکس پیدا نشد.", "image_not_found")
     try:
-        url = await clean_photo(ctx, store_id=product.store_id, image_url=image.url, title=product.title,
-                                note=product.description[:500], category=str(op.payload.get("category") or "general"))
+        url = await make_photo(ctx, store_id=product.store_id, image_url=image.url if image else None, title=product.title,
+                               note=product.description[:500], product_id=product.id,
+                               category=str(op.payload.get("category") or "general"))
     except ValueError as exc:
         raise PlatformError(str(exc), "image_not_found")
-    await _set_main_image(db, product.id, url, origin=image.url)
-    op.result = {"clean_image": url, "source_image_id": image.id}
+    await _set_main_image(db, product.id, url, origin=image.url if image else "")
+    op.result = {"clean_image": url, "source_image_id": image.id if image else None}
 
 
 async def _style_context(db, store_id: int) -> tuple[dict | None, list[dict]]:

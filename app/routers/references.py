@@ -21,7 +21,7 @@ class ReferenceIn(BaseModel):
     use_style_profile: bool = True
     # One product per image/link instead of one product from all references.
     bulk: bool = False
-    # Redraw the first photo as a clean white-background main image (platform-wrappers image pipeline).
+    # Clean the first photo, or generate one from the text when there is none, in the shop's photo style.
     clean_image: bool = False
 
 
@@ -30,7 +30,7 @@ async def create(store_id: int, body: ReferenceIn, user: CurrentUser, db: DB):
     await get_store_for(db, user, store_id)
     if not (body.images or body.urls or body.note.strip()):
         raise HTTPException(422, "حداقل یک عکس، لینک یا توضیح بدهید.")
-    if body.clean_image and body.images and (problem := await route_problem("image_edit")):
+    if body.clean_image and (problem := await route_problem("image_edit")):
         raise HTTPException(422, problem)
     groups = ([{"images": [i], "urls": []} for i in body.images] + [{"images": [], "urls": [u]} for u in body.urls]
               if body.bulk else [{"images": body.images, "urls": body.urls}])
@@ -43,7 +43,7 @@ async def create(store_id: int, body: ReferenceIn, user: CurrentUser, db: DB):
         await db.flush()
         op = await enqueue(db, store_id=store_id, type="reference", ref_type="reference_set", ref_id=ref.id, actor="ai",
                            title_fa="ساخت محصول با AI از رفرنس",
-                           payload={"clean_image": bool(body.clean_image and g["images"])})
+                           payload={"clean_image": body.clean_image})
         ref.operation_id = op.id
         ops.append(op)
     await db.commit()

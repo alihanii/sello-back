@@ -389,6 +389,7 @@ async def update_provider(pid: int, body: ProviderIn, admin: AdminUser, db: DB):
         p.key_hint = body.api_key.strip()[-4:]
     creds["proxy"] = body.proxy.strip()
     p.api_key_encrypted = encrypt_credentials(creds)
+    p.updated_at = utcnow()
     audit(db, admin, "update_ai_key", "ai_provider", p.id, {"name": p.name, "key_changed": bool(body.api_key.strip())})
     await db.commit()
     return _provider_out(p)
@@ -482,6 +483,7 @@ async def set_route(task: str, body: RouteIn, admin: AdminUser, db: DB):
         db.add(r)
     for k, v in body.model_dump().items():
         setattr(r, k, v)
+    r.updated_at = utcnow()  # a re-save re-enables an image route that was paused for quota
     audit(db, admin, "set_ai_route", "ai_route", None, {"task": task, **body.model_dump()})
     await db.commit()
     return {"ok": True}

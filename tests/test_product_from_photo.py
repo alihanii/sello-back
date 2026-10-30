@@ -104,3 +104,43 @@ async def test_raw_photo_becomes_product_with_clean_main_image(client, monkeypat
     await drain()
     op2 = (await client.get(f"/operations/{r.json()['id']}", headers=h)).json()
     assert op2["status"] == "failed" and "IMAGE_SAFETY" in op2["error_message_fa"]
+
+    # no photo: a product with only text gets a generated photo, styled after the shop's earlier product photos
+    calls.clear()
+
+    def ok(req):
+        sent["url"], sent["body"] = str(req.url), req.content
+        return httpx.Response(200, json={"candidates": [{"content": {"parts": [
+            {"inlineData": {"mimeType": "image/png", "data": base64.b64encode(PNG).decode()}}]}}]})
+
+    monkeypatch.setattr(ai.httpx, "AsyncClient", lambda *a, **kw: real(*a, transport=httpx.MockTransport(ok),
+                                                                      **{k: v for k, v in kw.items() if k != "proxy"}))
+    ops = (await client.post(f"/stores/{sid}/reference-sets", headers=h,
+                             json={"note": "ماگ سرامیکی مشکی", "clean_image": True})).json()
+    await drain()
+    op3 = (await client.get(f"/operations/{ops[0]['id']}", headers=h)).json()
+    assert op3["status"] == "succeeded", op3
+    builder = next(s for s in op3["steps"] if s["name"] == "image_prompt")
+    assert builder["request"]["has_photo"] is False and builder["request"]["style_refs"] >= 1
+    assert calls[-1][1] is False and calls[-1][2] == builder["request"]["style_refs"]  # only style photos were sent
+    assert b"style references" in sent["body"]
+    prod3 = (await client.get(f"/products/{op3['result']['product_id']}", headers=h)).json()
+    assert prod3["images"][0]["url"] == op3["result"]["clean_image"]
+
+    # free tier with no image quota: after Google says so once, the app stops calling until the admin re-saves
+    def free(req):
+        return httpx.Response(429, json={"error": {"message": "Quota exceeded for metric: generate_content_free_tier_requests, limit: 0"}})
+
+    monkeypatch.setattr(ai.httpx, "AsyncClient", lambda *a, **kw: real(*a, transport=httpx.MockTransport(free),
+                                                                      **{k: v for k, v in kw.items() if k != "proxy"}))
+    r = await client.post(f"/products/{prod3['id']}/clean-image", headers=h, json={})
+    await drain()
+    op4 = (await client.get(f"/operations/{r.json()['id']}", headers=h)).json()
+    assert op4["status"] == "failed" and "Billing" in op4["error_message_fa"]
+    status = (await client.get("/ai/status", headers=h)).json()
+    assert status["image_edit"] is False and "رایگان" in status["image_edit_problem"]
+    r = await client.post(f"/products/{prod3['id']}/clean-image", headers=h, json={})
+    assert r.status_code == 422
+    assert (await client.put("/admin/ai/routes/image_edit", headers=admin,
+                             json={"provider_id": prov["id"], "model": "gemini-3.1-flash-image"})).status_code == 200
+    assert (await client.get("/ai/status", headers=h)).json()["image_edit"] is True

@@ -241,17 +241,35 @@ async def _route(task: str) -> list[tuple[AiProvider, str, float, bool]]:
 
 async def route_problem(task: str) -> str:
     """Why `task` can't run with the current admin settings, in Persian; empty when it can."""
-    if await _route(task):
-        return ""
     async with SessionLocal() as db:
         route = (await db.execute(select(AiTaskRoute).where(AiTaskRoute.task == task))).scalar_one_or_none()
+        if await _route(task):
+            if task not in IMAGE_TASKS or not route:
+                return ""
+            # Don't keep calling an image model the provider already said has no quota on this key, until the admin
+            # changes the route or the key (e.g. after enabling billing).
+            last = (await db.execute(select(AiUsageLog).where(AiUsageLog.task == task)
+                                     .order_by(AiUsageLog.id.desc()).limit(1))).scalar_one_or_none()
+            provider = await db.get(AiProvider, route.provider_id) if route.provider_id else None
+            changed = max(route.updated_at, provider.updated_at if provider else route.updated_at)
+            if last and last.error_code == "ai_free_tier" and _aware(last.created_at) > _aware(changed):
+                return ("کلید فعلی گوگل روی پلن رایگان است و گوگل برای مدل‌های تصویری سهمیهٔ صفر می‌دهد. برای ساخت عکس، "
+                        "Billing را روی پروژهٔ گوگلِ این کلید فعال کن یا در پنل ادمین کلید دیگری برای «تمیز کردن عکس» بگذار؛ "
+                        "بعد از ذخیرهٔ دوبارهٔ کلید یا مسیر، دوباره امتحان می‌شود.")
+            return ""
     if task in IMAGE_TASKS:
         if not route or not route.provider_id:
-            return "برای «تمیز کردن عکس» هنوز مدل تصویری تعیین نشده؛ ادمین در پنل ادمین ← هوش مصنوعی ← مسیر کارها یک کلید Gemini و یک مدل image انتخاب کند."
+            return "برای «ساخت/تمیز کردن عکس» هنوز مدل تصویری تعیین نشده؛ ادمین در پنل ادمین ← هوش مصنوعی ← مسیر کارها یک کلید Gemini و یک مدل image انتخاب کند."
         return check_model(task, route.model) or "این کار فقط با کلید Gemini (مستقیم یا متیس) انجام می‌شود."
     if route and route.model and check_model(task, route.model):
         return check_model(task, route.model)
     return "هوش مصنوعی تنظیم نشده است؛ ادمین باید یک کلید API در پنل ادمین اضافه کند."
+
+
+def _aware(dt):
+    from datetime import timezone
+
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 async def ai_available(task: str = "caption_extract") -> bool:

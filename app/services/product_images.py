@@ -1,4 +1,4 @@
-"""Raw seller photo -> clean marketplace main image, ported from platform-wrappers (digikala.api image pipeline).
+"""Raw seller photo (or just the product text) -> marketplace main image, ported from platform-wrappers (digikala.api image pipeline).
 
 Two calls, like the original: a text model that can see images writes a precise English img2img prompt from the
 photo (prompt builder), then a Gemini image model redraws the same photo with that prompt: same product, pure
@@ -171,22 +171,71 @@ def _sanitize(text: str) -> str:
     return text if text.endswith(_TAIL) else f"{text.rstrip('.')}. {_TAIL}"
 
 
-async def clean_photo(ctx, *, store_id: int, image_url: str, title: str, note: str, category: str = "general") -> str:
-    """Returns the /media URL of the cleaned image. Raises AIError/ValueError with a Persian message on failure."""
-    loaded = read_local(image_url)
-    if not loaded:
-        raise ValueError("عکس اصلی روی سرور پیدا نشد.")
+async def style_references(db, store_id: int, exclude_product_id: int | None = None, limit: int = 2):
+    """Main photos of the shop's earlier products, so a new photo matches the catalogue's look."""
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+
+    from app.models import Product
+
+    q = (select(Product).where(Product.store_id == store_id, Product.id != (exclude_product_id or 0))
+         .options(selectinload(Product.images)).order_by(Product.is_golden_sample.desc(), Product.id.desc()).limit(30))
+    refs = []
+    for prod in (await db.execute(q)).scalars():
+        for img in sorted(prod.images, key=lambda i: i.position)[:1]:
+            if loaded := read_local(img.url):
+                refs.append(loaded)
+        if len(refs) >= limit:
+            break
+    return refs
+
+
+def _builder_input(*, title: str, note: str, category: str, has_photo: bool, styles: int) -> str:
     num, label = IMAGE_CATEGORIES.get(category, IMAGE_CATEGORIES["general"])
-    async with ctx.step("image_prompt", "تحلیل عکس و نوشتن دستور ویرایش", request={"category": label}) as s:
+    lines = [f"PRODUCT NAME: {title}", f"user description: {note or title}",
+             f"Selected category (prompt_type {num}): {label}", ""]
+    if has_photo:
+        lines.append("Attached image 1 is the product photo (the ATTACHED IMAGE).")
+    else:
+        lines.append("There is NO product photo: write a text-to-image prompt that depicts the product exactly as the "
+                     "name and description say. Do not invent logos, brand names, printed text or details not stated.")
+    if styles:
+        first = 2 if has_photo else 1
+        lines.append(f"Attached images {first}-{first + styles - 1} are STYLE REFERENCES: photos of this shop's other products. "
+                     "The new photo must look like it belongs to the same catalogue: match their background, lighting, "
+                     "camera angle, framing and layout. These style references override the default pure-white background "
+                     "rule when they use a different background. Never copy the products shown in them.")
+    lines += ["", "Analyze the attached e-commerce image and return exactly one raw English paragraph."
+              if has_photo else "Return exactly one raw English paragraph."]
+    return "\n".join(lines)
+
+
+async def make_photo(ctx, *, store_id: int, title: str, note: str, category: str = "general",
+                     image_url: str | None = None, product_id: int | None = None) -> str:
+    """Cleans `image_url`, or generates a photo from the text when there is none, in the style of the shop's
+    earlier product photos. Returns the /media URL. Raises AIError/ValueError with a Persian message."""
+    loaded = read_local(image_url) if image_url else None
+    if image_url and not loaded:
+        raise ValueError("عکس اصلی روی سرور پیدا نشد.")
+    styles = await style_references(ctx.db, store_id, product_id) if ctx.db is not None else []
+    images = ([loaded] if loaded else []) + styles
+    async with ctx.step("image_prompt", "نوشتن دستور ساخت عکس" if not loaded else "تحلیل عکس و نوشتن دستور ویرایش",
+                        request={"category": category, "has_photo": bool(loaded), "style_refs": len(styles)}) as s:
         raw = await ai.generate_text(
-            task="vision", system=PROMPT_BUILDER_SYSTEM, images=[loaded], store_id=store_id,
-            prompt=(f"PRODUCT NAME: {title}\nuser description: {note or title}\n"
-                    f"Selected category (prompt_type {num}): {label}\n\n"
-                    "Analyze the attached e-commerce image and return exactly one raw English paragraph."))
+            task="vision", system=PROMPT_BUILDER_SYSTEM, images=images, store_id=store_id,
+            prompt=_builder_input(title=title, note=note, category=category, has_photo=bool(loaded), styles=len(styles)))
         prompt = _sanitize(raw)
         s.response = {"prompt": prompt}
-    async with ctx.step("image_edit", "تمیز کردن عکس (پس‌زمینهٔ سفید، وسط کادر)") as s:
-        data, mime = await ai.generate_image(system=IMAGE_SYSTEM, prompt=prompt, images=[loaded], store_id=store_id)
+    label = "تمیز کردن عکس" if loaded else "ساخت عکس محصول"
+    async with ctx.step("image_edit", f"{label} (به سبک عکس‌های قبلی فروشگاه)" if styles else label) as s:
+        system = IMAGE_SYSTEM if loaded else (
+            "You are generating a clean marketplace main product image from a text prompt. Depict only the described "
+            "product, accurately; never add props, text overlays, watermarks, people or extra objects unless the prompt "
+            "requires them.")
+        if styles:
+            system += (" The last attached images are style references from the same shop: match their background, "
+                       "lighting, angle and framing, but never copy their products.")
+        data, mime = await ai.generate_image(system=system, prompt=prompt, images=images, store_id=store_id)
         url = save_bytes(store_id, data, content_type=mime)
         s.response = {"url": url, "bytes": len(data), "mime": mime}
     return url

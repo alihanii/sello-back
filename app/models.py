@@ -424,7 +424,7 @@ AI_TASKS: dict[str, str] = {
     "style_profile": "ساخت پروفایل سبک فروشگاه",
     "field_fill": "پر کردن فیلدهای اجباری پلتفرم‌ها",
     "caption_rewrite": "بازنویسی کپشن برای هر کانال",
-    "image_edit": "تمیز کردن عکس محصول (پس‌زمینهٔ سفید) — فقط مدل تصویری",
+    "image_edit": "ساخت و تمیز کردن عکس محصول — فقط مدل تصویری",
 }
 # Tasks that need a model which returns an image; every other task needs a text (JSON) model.
 IMAGE_TASKS = {"image_edit"}

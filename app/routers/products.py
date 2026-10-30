@@ -230,7 +230,7 @@ async def export_csv(store_id: int, user: CurrentUser, db: DB):
 
 
 class CleanImageIn(BaseModel):
-    image_id: int
+    image_id: int | None = None  # empty: generate a photo from the product text
     category: str = "general"  # flat_clothing | modeled_clothing | footwear | general
 
 
@@ -238,12 +238,12 @@ class CleanImageIn(BaseModel):
 async def clean_image(product_id: int, body: CleanImageIn, user: CurrentUser, db: DB):
     """Redraws a product photo as a clean white-background main image with AI."""
     p = await _get(db, user, product_id)
-    if not any(i.id == body.image_id for i in p.images):
+    if body.image_id and not any(i.id == body.image_id for i in p.images):
         raise HTTPException(404, "عکس پیدا نشد.")
     if problem := await route_problem("image_edit"):
         raise HTTPException(422, problem)
     op = await enqueue(db, store_id=p.store_id, type="image_clean", product_id=p.id, actor="ai",
-                       title_fa=f"تمیز کردن عکس «{p.title[:60]}»",
+                       title_fa=f"{'تمیز کردن' if body.image_id else 'ساخت'} عکس «{p.title[:60]}»",
                        payload={"image_id": body.image_id, "category": body.category})
     await db.commit()
     return op
