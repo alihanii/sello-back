@@ -366,7 +366,7 @@ async def generate_image(
                          if isinstance(p.get("inlineData"), dict) and p["inlineData"].get("data")), None)
             if not blob:
                 reason = (data.get("candidates") or [{}])[0].get("finishReason") or data.get("promptFeedback", {}).get("blockReason", "")
-                raise AIError("مدل عکسی برنگرداند" + (f" ({reason})." if reason else "."), code="ai_no_image",
+                raise AIError("عکس ساخته نشد؛ با یک عکس دیگر دوباره امتحان کن.", code="ai_no_image",
                               detail=json.dumps(data, ensure_ascii=False)[:500])
             usage = data.get("usageMetadata", {})
             await _log(provider, task, model, store_id, ok=True, is_fallback=is_fallback,

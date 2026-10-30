@@ -103,7 +103,9 @@ async def test_raw_photo_becomes_product_with_clean_main_image(client, monkeypat
     assert r.status_code == 202
     await drain()
     op2 = (await client.get(f"/operations/{r.json()['id']}", headers=h)).json()
-    assert op2["status"] == "failed" and "IMAGE_SAFETY" in op2["error_message_fa"]
+    assert op2["status"] == "failed" and "عکس دیگر" in op2["error_message_fa"]
+    assert [x["name"] for x in op2["steps"]][-2:] == ["image_edit", "image_retry"]  # one simpler retry
+    assert "IMAGE_SAFETY" in str(op2["steps"][-2]["response"])  # the reason stays in the log
 
     # no photo: a product with only text gets a generated photo, styled after the shop's earlier product photos
     calls.clear()

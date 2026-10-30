@@ -362,8 +362,10 @@ async def generate_from_reference(ctx: OpContext, ref: ReferenceSet) -> Product:
             await _set_main_image(db, product.id, url, origin=source or "")
             op.result = {**op.result, "clean_image": url}
         except (ai.AIError, ValueError) as exc:
-            what = "تمیز" if source else "ساخته"
-            problems.append(f"محصول ساخته شد ولی عکس {what} نشد: {getattr(exc, 'message_fa', None) or exc}")
+            # Sellers get a plain sentence; the technical reason stays in the step log.
+            problems.append("محصول ساخته شد ولی عکس ساخته نشد؛ با یک عکس دیگر دوباره امتحان کن."
+                            if isinstance(exc, ai.AIError) and exc.code == "ai_no_image"
+                            else f"محصول ساخته شد ولی عکس ساخته نشد: {getattr(exc, 'message_fa', None) or exc}")
     if problems:
         op.status = "partial"
         op.error_message_fa = " ".join(problems)

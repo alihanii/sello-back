@@ -270,18 +270,41 @@ async def make_photo(ctx, *, store_id: int, title: str, note: str, category: str
         prompt = _sanitize(raw)
         s.response = {"prompt": prompt}
     label = "تمیز کردن عکس" if loaded and not design else "ساخت عکس محصول"
-    async with ctx.step("image_edit", f"{label} (به سبک عکس‌های قبلی فروشگاه)" if styles else label) as s:
-        system = DESIGN_IMAGE_SYSTEM if design else IMAGE_SYSTEM if loaded else (
-            "You are generating a clean marketplace main product image from a text prompt. Depict only the described "
-            "product, accurately; never add props, text overlays, watermarks, people or extra objects unless the prompt "
-            "requires them.")
-        if styles:
-            system += (" The last attached images are style references from the same shop: match their background, "
-                       "lighting, angle and framing, but never copy their products.")
-        data, mime = await ai.generate_image(system=system, prompt=prompt, images=images, store_id=store_id)
-        url = save_bytes(store_id, data, content_type=mime)
-        s.response = {"url": url, "bytes": len(data), "mime": mime}
+    system = DESIGN_IMAGE_SYSTEM if design else IMAGE_SYSTEM if loaded else (
+        "You are generating a clean marketplace main product image from a text prompt. Depict only the described "
+        "product, accurately; never add props, text overlays, watermarks, people or extra objects unless the prompt "
+        "requires them.")
+    style_note = (" The last attached images are style references from the same shop: match their background, "
+                  "lighting, angle and framing, but never copy their products.") if styles else ""
+    try:
+        async with ctx.step("image_edit", f"{label} (به سبک عکس‌های قبلی فروشگاه)" if styles else label,
+                            request={"prompt": prompt, "images": len(images), "design": design, "style_refs": len(styles)}) as s:
+            data, mime = await ai.generate_image(system=system + style_note, prompt=prompt, images=images, store_id=store_id)
+            s.response = {"bytes": len(data), "mime": mime}
+    except ai.AIError as exc:
+        if exc.code != "ai_no_image":
+            raise
+        # The model sometimes returns no picture (IMAGE_OTHER) for long prompts with several reference images.
+        # One retry with only the seller's photo and a short, plain instruction.
+        simple = _simple_prompt(title=title, note=note, has_photo=bool(loaded), design=design)
+        async with ctx.step("image_retry", "تلاش دوباره با دستور ساده‌تر",
+                            request={"prompt": simple, "images": 1 if loaded else 0, "design": design}) as s:
+            data, mime = await ai.generate_image(system=system, prompt=simple, images=[loaded] if loaded else [],
+                                                 store_id=store_id)
+            s.response = {"bytes": len(data), "mime": mime}
+    url = save_bytes(store_id, data, content_type=mime)
     return url
+
+
+def _simple_prompt(*, title: str, note: str, has_photo: bool, design: bool) -> str:
+    what = f"{title}. {note}".strip(". ")
+    if has_photo and design:
+        head = f"Product photo of: {what}. Apply the attached design to the product exactly as drawn."
+    elif has_photo:
+        head = "Clean product photo of the exact product in the attached image, unchanged."
+    else:
+        head = f"Clean product photo of: {what}."
+    return f"{head} Centred, fully visible, plain white background, soft even light, no text, no people, no props. {_TAIL}"
 
 
 async def photo_kind(store_id: int, url: str) -> str:
