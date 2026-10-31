@@ -143,6 +143,7 @@ async def upload_images(store_id: int, user: CurrentUser, db: DB, files: list[Up
 
 class PublishIn(BaseModel):
     channel_ids: list[int]
+    show_price: bool | None = None  # write the price in the post; None = the store setting
 
 
 @router.post("/products/{product_id}/publish", response_model=list[OperationOut], status_code=202)
@@ -153,7 +154,7 @@ async def publish(product_id: int, body: PublishIn, user: CurrentUser, db: DB):
         ch = await db.get(Channel, cid)
         if not ch or ch.store_id != p.store_id:
             raise HTTPException(404, "کانال پیدا نشد.")
-        op_id = await queue_publish(db, p, ch, trigger="user", actor="user")
+        op_id = await queue_publish(db, p, ch, trigger="user", actor="user", show_price=body.show_price)
         if op_id:
             op_ids.append(op_id)
     await db.commit()
@@ -166,6 +167,7 @@ class BulkIn(BaseModel):
     channel_ids: list[int] = []
     tag: str = ""
     status: str = ""
+    show_price: bool | None = None
 
 
 @router.post("/stores/{store_id}/products/bulk")
@@ -178,7 +180,8 @@ async def bulk(store_id: int, body: BulkIn, user: CurrentUser, db: DB):
         if body.action == "publish":
             for cid in body.channel_ids:
                 ch = await db.get(Channel, cid)
-                if ch and ch.store_id == store_id and await queue_publish(db, p, ch, trigger="user", actor="user"):
+                if ch and ch.store_id == store_id and await queue_publish(db, p, ch, trigger="user", actor="user",
+                                                                        show_price=body.show_price):
                     queued += 1
         elif body.action == "tag" and body.tag:
             p.tags = sorted(set(p.tags or []) | {body.tag})

@@ -97,7 +97,8 @@ def fail_operation(op: Operation, exc: Exception) -> None:
         op.suggested_action = {"type": "retry", "label": "تلاش دوباره"}
 
 
-async def queue_publish(db: AsyncSession, product: Product, channel: Channel, *, trigger: str, actor: str) -> int | None:
+async def queue_publish(db: AsyncSession, product: Product, channel: Channel, *, trigger: str, actor: str,
+                        show_price: bool | None = None) -> int | None:
     listing = (await db.execute(select(ChannelListing).where(
         ChannelListing.product_id == product.id, ChannelListing.channel_id == channel.id))).scalar_one_or_none()
     if not listing:
@@ -109,5 +110,6 @@ async def queue_publish(db: AsyncSession, product: Product, channel: Channel, *,
     listing.status = "queued"
     op = await enqueue(db, store_id=product.store_id, type="publish", channel_id=channel.id, product_id=product.id,
                        ref_type="listing", ref_id=listing.id, trigger=trigger, actor=actor,
+                       payload={"show_price": show_price} if show_price is not None else None,
                        title_fa=f"انتشار «{product.title[:60]}» در {channel.display_name or channel.platform}")
     return op.id

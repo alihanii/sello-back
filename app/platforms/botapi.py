@@ -139,7 +139,7 @@ class BotApiAdapter:
         chat_id = channel.config.get("chat_id")
         st = store.settings or {}
         async with ctx.step("build_caption", "آماده‌سازی متن پست") as s:
-            caption = caption_for(product, st)
+            caption = caption_for(product, st, show_price=(getattr(getattr(ctx, "op", None), "payload", None) or {}).get("show_price"))
             s.response = {"caption": caption, "length": len(caption)}
 
         images = [img.url for img in product.images][:MAX_ALBUM]

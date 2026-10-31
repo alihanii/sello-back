@@ -180,7 +180,7 @@ class InstagramAdapter:
         app = await self._app(ctx)
         token = await self._token(ctx, app, channel)
         ig = channel.config["ig_user_id"]
-        caption = caption_for(product, store.settings or {})[:CAPTION_LIMIT]
+        caption = caption_for(product, store.settings or {}, show_price=(getattr(getattr(ctx, "op", None), "payload", None) or {}).get("show_price"))[:CAPTION_LIMIT]
         if not product.images:
             raise PlatformError("اینستاگرام حداقل یک عکس لازم دارد.", "no_image", EDIT_PRODUCT)
 

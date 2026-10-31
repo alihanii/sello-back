@@ -55,6 +55,7 @@ async def test_full_seller_flow(client, monkeypatch):
     log = (await client.get(f"/operations/{ops[0]["id"]}", headers=h)).json()
     assert [s["name"] for s in log["steps"]] == ["validate", "build_caption", "send"]
     assert "123:abc" not in str(log)  # token never reaches the visible log
+    assert "قیمت" in log["steps"][1]["response"]["caption"]
 
     # filters: published / not published in channel
     r = (await client.get(f"/stores/{sid}/products?published_in={cid}", headers=h)).json()
@@ -149,3 +150,28 @@ async def test_admin_plans_and_ai_keys(client, monkeypatch):
     row = next(r for r in usage["providers"] if r["provider"]["id"] == prov["id"])
     assert row["calls"] == 1 and row["input_tokens"] == 1000 and row["cost_toman"] == 2000
     assert "product_generate" in {t["task"] for t in usage["by_task"]}
+
+
+async def test_publish_can_leave_the_price_out(client, monkeypatch):
+    monkeypatch.setattr(BotApiAdapter, "_call", fake_call)
+    h = await login(client, "09128888888")
+    sid = (await client.post("/stores", json={"name": "قیمت"}, headers=h)).json()["id"]
+    await client.post(f"/stores/{sid}/channels/connect", headers=h,
+                      json={"platform": "telegram", "data": {"bot_token": "123:abc", "chat_id": "@testshop"}})
+    await drain()
+    cid = (await client.get(f"/stores/{sid}/channels", headers=h)).json()[0]["id"]
+
+    async def caption_of(title, **extra):
+        p = (await client.post(f"/stores/{sid}/products", headers=h, json={"title": title, "price": 300000})).json()
+        ops = (await client.post(f"/products/{p['id']}/publish", headers=h, json={"channel_ids": [cid], **extra})).json()
+        await drain()
+        log = (await client.get(f"/operations/{ops[0]['id']}", headers=h)).json()
+        assert log["status"] == "succeeded", log
+        return next(s for s in log["steps"] if s["name"] == "build_caption")["response"]["caption"]
+
+    assert "قیمت" in await caption_of("شال")  # store default: show the price
+    assert "قیمت" not in await caption_of("کلاه", show_price=False)
+    r = (await client.post(f"/stores/{sid}/products/bulk", headers=h, json={
+        "product_ids": [(await client.post(f"/stores/{sid}/products", headers=h, json={"title": "کیف", "price": 5})).json()["id"]],
+        "action": "publish", "channel_ids": [cid], "show_price": False})).json()
+    assert r["queued"] == 1
