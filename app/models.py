@@ -457,6 +457,8 @@ class ChatAgent(TimestampMixin, Base):
     # {"enabled", "days": {"0".."6": [["09:00","21:00"]]}, "away_mode": "ai|message", "away_message"}
     business_hours: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     handoff_minutes: Mapped[int] = mapped_column(Integer, default=60)
+    # How answers must look: {"stock": "exact" | "available", "rules": ["never ...", ...]} (see chat_engine.policy)
+    answer_policy: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict, nullable=True)
 
 
 class ChatBot(TimestampMixin, Base):

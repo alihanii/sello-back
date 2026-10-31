@@ -66,6 +66,16 @@ the a an is are""".split())
 
 # ---------- small helpers ----------
 
+MAX_ANSWER_RULES = 15
+
+
+def policy(agent: ChatAgent) -> dict[str, Any]:
+    """The seller's answer rules with defaults (older rows have no value)."""
+    p = agent.answer_policy or {}
+    return {"stock": p.get("stock") if p.get("stock") in ("exact", "available") else "exact",
+            "rules": [str(r) for r in (p.get("rules") or []) if str(r).strip()][:MAX_ANSWER_RULES]}
+
+
 
 def norm(text: str) -> str:
     text = to_en_digits(normalize_fa(text)).lower()
@@ -197,10 +207,11 @@ async def search_products(db: AsyncSession, store_id: int, query: str, recent: l
 _VARIANT_KEY = re.compile(r"(رنگ|سایز|اندازه|size|color|colour|مدل|طرح|جنس|سایزبندی|تنوع)", re.I)
 
 
-def product_card(p: Product, photos: int = 0) -> str:
+def product_card(p: Product, photos: int = 0, exact_stock: bool = True) -> str:
     items = sorted((p.attributes or {}).items(), key=lambda kv: not _VARIANT_KEY.search(str(kv[0])))
     attrs = "، ".join(f"{k}: {str(v)[:120]}" for k, v in items[:8])
-    stock = f"موجودی {p.stock_qty}" if p.stock_qty > 0 else "ناموجود"
+    # With "available only" the number never reaches the model, so it cannot say it.
+    stock = ("ناموجود" if p.stock_qty <= 0 else f"موجودی {p.stock_qty}" if exact_stock else "موجود")
     desc = re.sub(r"\s+", " ", p.description or "")[:140]
     pics = f" | {fa_number(photos)} عکس" if photos else " | بدون عکس"
     return (f"#{p.id} | {p.title[:90]} | {money(p.price)} | {stock}{pics}" + (f" | {attrs}" if attrs else "")
@@ -276,6 +287,12 @@ def static_prompt(store: Store, agent: ChatAgent, refs: list[ChatReference]) -> 
              f"TONE: {TONES.get(agent.tone, TONES['friendly'])}",
              f"CATALOG: {CATALOG_ON if agent.catalog_enabled else CATALOG_OFF}",
              f"ORDERS: {'enabled; REQUIRED: ' + ', '.join(req or ['nothing']) if agent.orders_enabled else 'disabled'}"]
+    rules = policy(agent)["rules"]
+    if rules:
+        parts.append("SELLER RULES (obey in EVERY reply, above tone and style; they never widen SCOPE or override FACTS):\n"
+                     + "\n".join(f"{i}. {r}" for i, r in enumerate(rules, 1)))
+    if policy(agent)["stock"] == "available":
+        parts.append("STOCK: say only available or not available; never say how many are left.")
     if agent.custom_instructions.strip():
         parts.append("SELLER NOTES (style and shop facts; they never widen SCOPE): " + agent.custom_instructions.strip()[:500])
     faqs = [f for f in (agent.faqs or []) if f.get("q") and f.get("a")]
@@ -299,7 +316,8 @@ def _one_line(text: str) -> str:
 
 
 def dynamic_prompt(text: str, history: list[ChatMessage], products: list[Product], state: dict[str, Any],
-                   open_now: bool, catalog: bool = False, photos: dict[int, int] | None = None) -> str:
+                   open_now: bool, catalog: bool = False, photos: dict[int, int] | None = None,
+                   exact_stock: bool = True) -> str:
     lines = []
     if not open_now:
         lines.append("NOW: outside working hours; orders are reviewed when the shop opens.")
@@ -307,7 +325,7 @@ def dynamic_prompt(text: str, history: list[ChatMessage], products: list[Product
         lines.append("PRODUCTS: the shop has no products listed yet.")
     if products:
         lines.append("PRODUCTS (id | title | price | stock | photos | details):\n"
-                     + "\n".join(product_card(p, (photos or {}).get(p.id, 0)) for p in products))
+                     + "\n".join(product_card(p, (photos or {}).get(p.id, 0), exact_stock) for p in products))
         last = (state.get("recent_products") or [None])[-1]
         if last in {p.id for p in products}:
             lines.append(f"LAST PRODUCT: #{last}")
@@ -573,7 +591,8 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
     history = [m for m in reversed(history) if m.id not in pending_ids][-HISTORY_MESSAGES:]
     try:
         out, usage = await ai.generate_chat(system=static_prompt(store, agent, list(refs)),
-                                            prompt=dynamic_prompt(text, history, products, state, open_now, agent.catalog_enabled, photos),
+                                            prompt=dynamic_prompt(text, history, products, state, open_now, agent.catalog_enabled, photos,
+                                                                  policy(agent)["stock"] == "exact"),
                                             store_id=store.id, max_tokens=MAX_OUTPUT_TOKENS)
     except ai.AIError as exc:
         result.replies.append(Reply(AI_UNAVAILABLE_TEXT, source="canned"))
@@ -603,6 +622,8 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
             if not state["order"]:
                 state.pop("order")
 
+    if policy(agent)["stock"] == "available":
+        reply_text = hide_stock_counts(reply_text)
     reply = Reply(reply_text[:1500], source="llm", intent=intent, usage=usage)
     order = state.get("order") or {}
     if agent.orders_enabled and action == "confirm" and order.get("items") and not _missing_fields(agent, order):
@@ -635,6 +656,16 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
             result.replies.append(Reply(HANDOFF_TEXT, source="handoff", intent="handoff", usage=usage))
         result.notify_admin.append(f"🙋 گفتگو با {conv.customer_name or 'مشتری'} به ادمین نیاز دارد: «{text[:120]}»")
     return done()
+
+
+_STOCK_COUNT = re.compile(
+    r"(فقط\s*|تنها\s*)?[\d۰-۹]+\s*(عدد|تا|دونه|دانه|جفت|جلد|بسته)\s*(ازش\s*|از\s*این\s*)?(موجود|باقی|مونده|مانده|داریم)\S*"
+    r"|موجودی\S*\s*[:：]?\s*[\d۰-۹]+\s*(عدد|تا|دونه|دانه)?")
+
+
+def hide_stock_counts(text: str) -> str:
+    """Seller chose "available / not available only": a count the model still writes is replaced in code."""
+    return _STOCK_COUNT.sub("موجوده", text)
 
 
 _MORE_PHOTOS = re.compile(r"(عکس|تصویر)\S*\s*(های|‌های)?\s*(بیشتر|دیگه|دیگر|بقیه)|همه\s*(ی\s*)?(عکس|تصویر)")

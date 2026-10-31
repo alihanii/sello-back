@@ -1,5 +1,6 @@
 """Sales chat assistant API (spec §11): settings, connections, test chat, conversations, AI orders, usage."""
 
+import re
 import secrets
 from datetime import datetime, time, timedelta, timezone
 from typing import Any
@@ -20,6 +21,7 @@ from app.services import chat_runtime as rt
 from app.services import chat_faq
 from app.services.ai import AIError, route_problem
 from app.services.chat_engine import (
+    MAX_ANSWER_RULES, policy,
     DEFAULT_AWAY, DEFAULT_OFF_TOPIC, DEFAULT_WELCOME, chat_limit, get_agent, month_ai_messages,
 )
 
@@ -51,6 +53,7 @@ class AgentIn(BaseModel):
     rules: str | None = Field(None, max_length=3000)
     business_hours: dict[str, Any] | None = None
     handoff_minutes: int | None = Field(None, ge=5, le=1440)
+    answer_policy: dict[str, Any] | None = None
 
 
 def _agent_out(agent: ChatAgent, store: Store) -> dict[str, Any]:
@@ -63,6 +66,7 @@ def _agent_out(agent: ChatAgent, store: Store) -> dict[str, Any]:
         "faqs": agent.faqs or [], "rules": agent.rules,
         "business_hours": {"enabled": False, "days": {}, "away_mode": "ai", "away_message": "", **(agent.business_hours or {})},
         "handoff_minutes": agent.handoff_minutes,
+        "answer_policy": policy(agent),
         "defaults": {"welcome_message": DEFAULT_WELCOME.replace("{store}", store.name),
                      "off_topic_message": DEFAULT_OFF_TOPIC.replace("{store}", store.name),
                      "away_message": DEFAULT_AWAY},
@@ -101,6 +105,11 @@ async def save_agent_settings(store_id: int, body: AgentIn, user: CurrentUser, d
             "away_mode": "message" if bh.get("away_mode") == "message" else "ai",
             "away_message": str(bh.get("away_message") or "")[:500],
         }
+    if "answer_policy" in data:
+        ap = data["answer_policy"]
+        rules = [re.sub(r"\s+", " ", str(r)).strip()[:200] for r in (ap.get("rules") or []) if str(r).strip()]
+        data["answer_policy"] = {"stock": "available" if ap.get("stock") == "available" else "exact",
+                                 "rules": rules[:MAX_ANSWER_RULES]}
     if data.get("enabled") and (problem := await route_problem("chat")):
         raise HTTPException(422, {"message": "دستیار بدون هوش مصنوعی روشن نمی‌شود: " + problem})
     if ("orders_enabled" in data or "payment" in data) and data.get("orders_enabled", agent.orders_enabled):

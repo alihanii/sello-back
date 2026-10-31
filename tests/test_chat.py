@@ -489,3 +489,21 @@ async def test_photos_variants_and_clarify(client, monkeypatch):
     llm.answers = [{"reply": "بفرما", "intent": "product", "images": [99999]}]
     r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "عکسشو ببینم"})).json()
     assert not r["messages"][-1]["image_url"]
+
+
+async def test_answer_rules_and_stock_only_available(client, monkeypatch):
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550013")
+    r = await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"answer_policy": {
+        "stock": "available", "rules": ["  تخفیف نده  ", "", "به رقبا اشاره نکن"]}})
+    assert r.json()["answer_policy"] == {"stock": "available", "rules": ["تخفیف نده", "به رقبا اشاره نکن"]}
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
+    llm.answers = [{"reply": "بله، فقط ۳ تا ازش مونده 🌸", "intent": "product"}]
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "مانتو لینن موجوده؟"})).json()
+    call = llm.calls[-1]
+    assert "1. تخفیف نده" in call["system"] and "2. به رقبا اشاره نکن" in call["system"]
+    assert "مانتو لینن کرم" in call["prompt"] and "موجودی" not in call["prompt"].split("RECENT CHAT")[0] and "| موجود |" in call["prompt"]
+    assert r["messages"][-1]["text"] == "بله، موجوده 🌸"
+    # default: exact numbers
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"answer_policy": {"stock": "exact", "rules": []}})
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "مانتو لینن موجوده؟"})
+    assert "موجودی 3" in llm.calls[-1]["prompt"] and "SELLER RULES" not in llm.calls[-1]["system"]
