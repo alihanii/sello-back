@@ -73,6 +73,11 @@ def words(text: str) -> set[str]:
     return {w for w in norm(text).replace("‌", " ").split() if len(w) > 1 and w not in _STOPWORDS}
 
 
+def ltr(text: str) -> str:
+    """Keeps a card number, IBAN, link or phone in its own order inside a right-to-left message."""
+    return f"\u2066{text}\u2069" if text else text
+
+
 def money(n: int) -> str:
     return f"{fa_number(n)} تومان" if n else "قیمت نامشخص"
 
@@ -304,7 +309,7 @@ def order_summary(order: dict[str, Any], lines: list[dict[str, Any]], total: int
     get = order.get
     items = "\n".join(f"▫️ {i['title']}" + (f" ({i['variant']})" if i.get("variant") else "")
                       + f" × {fa_number(i['qty'])} = {money(i['unit_price'] * i['qty'])}" for i in lines)
-    who = "\n".join(x for x in (get("name", "") and f"👤 {get('name', '')}", get("phone", "") and f"📞 {get('phone', '')}",
+    who = "\n".join(x for x in (get("name", "") and f"👤 {get('name', '')}", get("phone", "") and f"📞 {ltr(get('phone', ''))}",
                                  get("address", "") and f"📍 {get('address', '')}") if x)
     return f"{items}\n💰 جمع: {money(total)}" + (f"\n{who}" if who else "")
 
@@ -313,13 +318,13 @@ def payment_text(agent: ChatAgent, order: AiOrder) -> str:
     pay = agent.payment or {}
     rows = [f"✅ سفارش #{fa_number(order.id)} ثبت شد.", f"مبلغ قابل پرداخت: {money(order.total_toman)}"]
     if pay.get("card_number"):
-        rows.append(f"💳 شماره کارت: {pay['card_number']}")
+        rows.append(f"💳 شماره کارت: {ltr(pay['card_number'])}")
     if pay.get("holder"):
         rows.append(f"به نام: {pay['holder']}")
     if pay.get("sheba"):
-        rows.append(f"شبا: {pay['sheba']}")
+        rows.append(f"شبا: {ltr(pay['sheba'])}")
     if pay.get("link"):
-        rows.append(f"🔗 لینک پرداخت: {pay['link']}")
+        rows.append(f"🔗 لینک پرداخت: {ltr(pay['link'])}")
     if pay.get("note"):
         rows.append(pay["note"])
     if pay.get("require_receipt", True):
