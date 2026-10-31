@@ -718,3 +718,55 @@ async def test_swapped_product_keeps_size_and_ok_is_not_a_photo_request(client, 
         conv = (await db.execute(select(chat_engine.ChatConversation).where(
             chat_engine.ChatConversation.store_id == sid, chat_engine.ChatConversation.is_test))).scalars().first()
         assert conv.state["order"]["items"] == [{"product_id": p2["id"], "qty": 1, "variant": "XL"}]
+
+
+async def _order_ready(client, h, sid, llm, p1, extra_items=None):
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        "orders_enabled": True, "payment": {"card_number": "6037991234567890"}})
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"reset": True})
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
+    items = [{"product_id": p1["id"], "qty": 1, "variant": "L"}] + (extra_items or [])
+    llm.answers = [{"reply": "", "intent": "order", "order_action": "confirm", "order": {
+        "items": items, "name": "سارا کریمی", "phone": "09171234567", "address": "شیراز، معالی آباد"}}]
+    return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "همین رو ثبت کن"})).json()
+
+
+async def test_order_yes_variants_payment_ref_and_duplicates(client, monkeypatch):
+    """From two long buyer chats: "بله تایید"/"تایید" re-showed the summary, a payment reference sent before
+    the yes was lost, and the model listed one item twice."""
+    h, sid, llm, p1, p2 = await _setup(client, monkeypatch, "09125550019")
+    r = await _order_ready(client, h, sid, llm, p1, [{"product_id": p1["id"], "qty": 1, "variant": "L"}])
+    assert "× ۱ " in r["messages"][-1]["text"] and r["messages"][-1]["text"].count("مانتو لینن کرم") == 1
+    before = len(llm.calls)
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "بله تایید"})).json()
+    assert r["messages"][-1]["source"] == "order" and len(llm.calls) == before
+
+    await _order_ready(client, h, sid, llm, p1)
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "کارت به کارت کردم، شماره پیگیری ۵۵۱۲۰۹۸۸"})).json()
+    assert r["messages"][-1]["source"] == "receipt"
+    orders = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
+    rows = orders.get("items", orders) if isinstance(orders, dict) else orders
+    assert any(o.get("payment_ref") == "55120988" and o["status"] == "payment_submitted" for o in rows)
+
+
+async def test_declined_chart_is_not_sent_later(client, monkeypatch):
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550020")
+    from app.core.db import SessionLocal
+    from app.models import ChatReference
+    async with SessionLocal() as db:
+        ref = ChatReference(store_id=sid, title="جدول سایز بندی", text="جدول: M L XL")
+        db.add(ref)
+        await db.commit()
+        rid = ref.id
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
+    llm.answers = [{"reply": "برای شما M مناسبه. جدول سایز رو بفرستم؟", "intent": "product", "refs": [rid]}]
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "چه سایزی بگیرم؟"})
+    llm.answers = [{"reply": "باشه، M براتون مناسبه.", "intent": "product", "refs": [rid]}]
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "نه جدول نمیخوام، خودت بگو"})).json()
+    assert "جدول: M L XL" not in [m["text"] for m in r["messages"]]
+    llm.answers = [{"reply": "ثبت شد", "intent": "order", "refs": [rid]}]
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سایز M مشکی برای من"})).json()
+    assert "جدول: M L XL" not in [m["text"] for m in r["messages"]]
+    llm.answers = [{"reply": "بفرمایید", "intent": "faq", "refs": [rid]}]
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "راستی جدول سایز رو بفرست"})).json()
+    assert r["messages"][-1]["text"] == "جدول: M L XL"
