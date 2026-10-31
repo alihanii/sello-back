@@ -83,6 +83,13 @@ def _api_key(provider: AiProvider) -> str:
     return decrypt_credentials(provider.api_key_encrypted).get("api_key", "")
 
 
+def _base(provider: AiProvider) -> str:
+    base = (provider.base_url or DEFAULT_BASE_URLS[provider.kind]).strip().rstrip("/")
+    if provider.kind == "openrouter" and not base.endswith("/api/v1"):
+        base = base.removesuffix("/api") + "/api/v1"  # "https://openrouter.ai" as typed from the site
+    return base
+
+
 def provider_proxy(provider: AiProvider) -> str:
     return decrypt_credentials(provider.api_key_encrypted).get("proxy", "")
 
@@ -93,7 +100,7 @@ async def _call(
 ) -> tuple[str, int, int]:
     """Returns (text, input_tokens, output_tokens)."""
     key = _api_key(provider)
-    base = (provider.base_url or DEFAULT_BASE_URLS[provider.kind]).rstrip("/")
+    base = _base(provider)
     async with httpx.AsyncClient(timeout=120, proxy=provider_proxy(provider) or None) as client:
         if provider.kind in ("gemini", "metis"):
             parts: list[dict[str, Any]] = [{"text": prompt}]
@@ -120,7 +127,8 @@ async def _call(
             return text, usage.get("promptTokenCount", 0), usage.get("candidatesTokenCount", 0)
 
         if provider.kind in ("openai", "openrouter"):
-            content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+            text = prompt + ("\n\nRespond with JSON only." if json_mode and provider.kind == "openrouter" else "")
+            content: list[dict[str, Any]] = [{"type": "text", "text": text}]
             content += [
                 {"type": "image_url", "image_url": {"url": f"data:{m};base64,{base64.b64encode(d).decode()}"}}
                 for d, m in images
@@ -131,7 +139,8 @@ async def _call(
                 json={
                     "model": model,
                     "temperature": temperature,
-                    **({"response_format": {"type": "json_object"}} if json_mode else {}),
+                    # OpenRouter drops every provider that lacks response_format (404); the prompt asks for JSON there.
+                    **({"response_format": {"type": "json_object"}} if json_mode and provider.kind == "openai" else {}),
                     "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}],
                 },
             )
@@ -184,16 +193,33 @@ async def _retry_busy(fn):
             await asyncio.sleep(delay)
 
 
+def _provider_message(resp: httpx.Response) -> str:
+    """The provider's own error text (OpenAI/OpenRouter/Gemini put it in error.message), for the admin logs."""
+    try:
+        err = resp.json().get("error")
+    except ValueError:
+        return ""
+    msg = err.get("message", "") if isinstance(err, dict) else str(err or "")
+    return " ".join(str(msg).split())[:300]
+
+
 def _raise_for(resp: httpx.Response) -> None:
     low = resp.text[:2000].lower()
+    said = _provider_message(resp)
+    if resp.status_code == 404 and "data policy" in low:
+        raise AIError("OpenRouter این مدل را به‌خاطر تنظیمات حریم خصوصی حسابت اجرا نمی‌کند؛ در openrouter.ai/settings/privacy "
+                      "گزینه‌های مدل‌های رایگان/آموزش را روشن کن یا یک مدل پولی انتخاب کن." + (f" ({said})" if said else ""),
+                      code="ai_data_policy", detail=resp.text[:500])
+    if resp.status_code == 404 and "no endpoints" in low:
+        raise AIError("هیچ سرویس‌دهنده‌ای در OpenRouter این مدل را با این درخواست اجرا نمی‌کند؛ مدل را عوض کن."
+                      + (f" ({said})" if said else ""), code="ai_bad_model", detail=resp.text[:500])
     if "location is not supported" in low or "unsupported_country" in low or "not available in your country" in low:
         raise AIError("این سرویس درخواست‌های ایران را قبول نمی‌کند؛ برای این کلید پروکسی خارج از ایران تنظیم کنید.",
                       code="ai_region_blocked", detail=resp.text[:500])
     if "api_key_invalid" in low or "api key not valid" in low or "incorrect api key" in low:
         raise AIError("کلید API نامعتبر است؛ کلید را دوباره کپی کنید یا یک کلید تازه بسازید.", code="ai_bad_key",
                       detail=resp.text[:500])
-    if resp.status_code == 404 and ("model" in low or "not found" in low or "no longer available" in low
-                                    or "no endpoints" in low):
+    if resp.status_code == 404 and ("model" in low or "not found" in low or "no longer available" in low):
         raise AIError("این مدل برای کلید شما در دسترس نیست؛ در ویرایش کلید، مدل پیش‌فرض را عوض کنید (مثلاً gemini-3.6-flash، یا در OpenRouter: google/gemini-3.6-flash).",
                       code="ai_bad_model", detail=resp.text[:500])
     if resp.status_code in (401, 403):
@@ -207,7 +233,8 @@ def _raise_for(resp: httpx.Response) -> None:
         raise AIError("سرویس هوش مصنوعی الان شلوغ است (خطای سمت گوگل/سرویس‌دهنده)؛ چند دقیقه بعد دوباره امتحان کن.",
                       code=f"ai_http_{resp.status_code}", detail=resp.text[:500])
     if resp.status_code >= 400:
-        raise AIError("سرویس هوش مصنوعی خطا داد.", code=f"ai_http_{resp.status_code}", detail=resp.text[:500])
+        raise AIError("سرویس هوش مصنوعی خطا داد." + (f" ({said})" if said else ""), code=f"ai_http_{resp.status_code}",
+                      detail=resp.text[:500])
 
 
 async def _log(provider: AiProvider, task: str, model: str, store_id: int | None, **fields: Any) -> None:
@@ -354,7 +381,7 @@ async def generate_image(
     last: AIError | None = None
     for provider, model, temp, is_fallback in candidates:
         started = time.monotonic()
-        base = (provider.base_url or DEFAULT_BASE_URLS[provider.kind]).rstrip("/")
+        base = _base(provider)
         if provider.kind == "openrouter":
             try:
                 data, mime, tin, tout = await _retry_busy(
@@ -436,7 +463,7 @@ async def _openrouter_image(provider: AiProvider, model: str, base: str, system:
 async def list_models(provider: AiProvider) -> list[str]:
     """Model ids the key can use for text generation, newest first as the provider lists them."""
     key = _api_key(provider)
-    base = (provider.base_url or DEFAULT_BASE_URLS[provider.kind]).rstrip("/")
+    base = _base(provider)
     async with httpx.AsyncClient(timeout=30, proxy=provider_proxy(provider) or None) as client:
         if provider.kind in ("gemini", "metis"):
             resp = await client.get(f"{base}/v1beta/models", params={"pageSize": 200}, headers={"x-goog-api-key": key})

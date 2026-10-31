@@ -291,3 +291,20 @@ async def test_openrouter_key_makes_images(client, monkeypatch):
     assert sent["url"] == "https://openrouter.ai/api/v1/chat/completions"
     assert b'"modalities":["image","text"]' in sent["body"] and b"google/gemini-3.1-flash-lite-image" in sent["body"]
     assert b"data:image/png;base64," in sent["body"]  # the seller's photo goes along
+
+
+def test_openrouter_errors_say_what_happened():
+    from app.models import AiProvider
+
+    assert ai._base(AiProvider(kind="openrouter", base_url="https://openrouter.ai/")) == "https://openrouter.ai/api/v1"
+    assert ai._base(AiProvider(kind="openrouter", base_url="")) == "https://openrouter.ai/api/v1"
+    policy = httpx.Response(404, json={"error": {"message": "No endpoints found matching your data policy (Free model publication)"}})
+    try:
+        ai._raise_for(policy)
+    except ai.AIError as exc:
+        assert exc.code == "ai_data_policy" and "settings/privacy" in exc.message_fa
+    other = httpx.Response(418, json={"error": {"message": "I'm a teapot"}})
+    try:
+        ai._raise_for(other)
+    except ai.AIError as exc:
+        assert "teapot" in exc.message_fa  # the provider's own words reach the admin
