@@ -39,6 +39,12 @@ class Settings(BaseSettings):
     instagram_app_secret: str = ""
     instagram_proxy: str = ""
 
+    # Sales chat: "polling" (default; works without a public address) or "webhook" (needs public_base_url over
+    # https; required when more than one backend instance runs).
+    chat_transport: str = "polling"
+    # Customer messages sent within this many seconds are answered together, in one model call.
+    chat_debounce_seconds: float = 3.0
+
     worker_enabled: bool = True
     worker_concurrency: int = 4
     worker_poll_seconds: float = 1.0
