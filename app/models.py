@@ -385,8 +385,7 @@ AI_TASKS: dict[str, str] = {
     "product_generate": "ساخت محصول با AI (از عکس و توضیح)",
     "vision": "تحلیل عکس محصول",
     "field_fill": "پر کردن فیلدهای اجباری پلتفرم‌ها",
-    "caption_rewrite": "بازنویسی کپشن برای هر کانال",
-    "image_prompt": "نوشتن دستور عکس محصول (platform-wrappers: gemini-2.5-flash)",
+    "image_prompt": "نوشتن دستور عکس محصول (مثل platform-wrappers؛ اگر خالی باشد از «تحلیل عکس» استفاده می‌شود)",
     "image_edit": "ساخت و تمیز کردن عکس محصول — فقط مدل تصویری",
 }
 # Tasks that need a model which returns an image; every other task needs a text (JSON) model.

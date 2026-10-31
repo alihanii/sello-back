@@ -20,7 +20,7 @@ async def ai_status(user: CurrentUser):
     """Whether any AI key is configured, so the UI can explain why AI features are off."""
     image_problem = await route_problem("image_edit")
     # The technical reason (keys, quota, billing) is for the admin only; sellers just don't see the feature.
-    return {"available": await ai_available("product_generate") or await ai_available("caption_rewrite"),
+    return {"available": await ai_available("product_generate"),
             "image_edit": not image_problem, "image_edit_problem": image_problem if user.role == "admin" else ""}
 EVENT_TYPES = ["crawl_run", "crawl_item", "crawl_failed", "product_created", "publish_ok", "publish_failed"]
 
