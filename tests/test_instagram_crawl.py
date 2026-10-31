@@ -112,3 +112,14 @@ async def test_instagram_page_crawl(client, monkeypatch):
     reel = next(p for p in items if p["title"] == "کفش رسمی")
     assert len(reel["images"]) == 1
     assert not any(u.endswith(".mp4") for u in calls)
+
+    # editing a source: page, schedule, mode and name; bad values are refused
+    r = await client.patch(f"/crawl-sources/{src['id']}", headers=h, json={**src, "url": "@new.page", "schedule": "daily",
+                                                                           "extraction_mode": "llm", "name": ""})
+    edited = r.json()
+    assert edited["url"] == "new.page" and edited["schedule"] == "daily" and edited["extraction_mode"] == "llm"
+    assert edited["name"] == "اینستاگرام ‎@new.page" and edited["next_run_at"]
+    assert (await client.patch(f"/crawl-sources/{src['id']}", headers=h, json={**edited, "schedule": "yearly"})).status_code == 422
+    assert (await client.patch(f"/crawl-sources/{src['id']}", headers=h, json={**edited, "url": "bad name"})).status_code == 422
+    r = await client.patch(f"/crawl-sources/{src['id']}", headers=h, json={**edited, "name": "پیج دوم", "is_active": False})
+    assert r.json()["name"] == "پیج دوم" and r.json()["is_active"] is False

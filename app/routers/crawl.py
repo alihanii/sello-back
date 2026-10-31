@@ -15,6 +15,7 @@ from app.services.ops import enqueue
 
 router = APIRouter(tags=["crawl"])
 SCHEDULES = {"manual", "hourly", "daily", "weekly"}
+MODES = {"auto", "regex", "llm"}
 
 
 class SourceIn(BaseModel):
@@ -61,6 +62,8 @@ async def create_source(store_id: int, body: SourceIn, user: CurrentUser, db: DB
     await get_store_for(db, user, store_id)
     if body.schedule not in SCHEDULES:
         raise HTTPException(422, "زمان‌بندی نامعتبر است.")
+    if body.extraction_mode not in MODES:
+        raise HTTPException(422, "روش استخراج نامعتبر است.")
     if body.type in ("channel_posts", "marketplace_listing"):
         ch = await db.get(Channel, body.channel_id or 0)
         if not ch or ch.store_id != store_id:
@@ -93,9 +96,35 @@ async def update_source(source_id: int, body: SourceIn, user: CurrentUser, db: D
     if not s:
         raise HTTPException(404, "منبع پیدا نشد.")
     await get_store_for(db, user, s.store_id)
-    s.name, s.schedule, s.extraction_mode, s.is_active = body.name or s.name, body.schedule, body.extraction_mode, body.is_active
+    if body.schedule not in SCHEDULES:
+        raise HTTPException(422, "زمان‌بندی نامعتبر است.")
+    if body.extraction_mode not in MODES:
+        raise HTTPException(422, "روش استخراج نامعتبر است.")
+    # The source type stays; what it points at (channel or page) can change.
+    if s.type in ("channel_posts", "marketplace_listing") and body.channel_id and body.channel_id != s.channel_id:
+        ch = await db.get(Channel, body.channel_id)
+        if not ch or ch.store_id != s.store_id:
+            raise HTTPException(422, "کانال منبع را انتخاب کنید.")
+        ok = ch.platform == "digikala" if s.type == "marketplace_listing" else ch.platform in ("telegram", "bale")
+        if not ok:
+            raise HTTPException(422, "این کانال برای این نوع منبع مناسب نیست.")
+        if body.name.strip() in ("", s.name):
+            body.name = ch.display_name or ch.platform
+        s.channel_id = ch.id
     if s.type == "instagram_profile":
+        if body.url.strip():
+            username = normalize_username(body.url)
+            if not username:
+                raise HTTPException(422, "آیدی اینستاگرام معتبر وارد کنید؛ مثلاً mystore یا ‎@mystore")
+            if username != s.url:
+                if body.name.strip() in ("", s.name) and s.name == f"اینستاگرام ‎@{s.url}":
+                    body.name = f"اینستاگرام ‎@{username}"
+                s.url = username
         s.options = {**(s.options or {}), "include_reels": body.include_reels}
+    if body.schedule != s.schedule or body.is_active != s.is_active:
+        s.next_run_at = utcnow() + timedelta(minutes=1) if body.schedule != "manual" and body.is_active else None
+    s.name = body.name.strip() or s.name
+    s.schedule, s.extraction_mode, s.is_active = body.schedule, body.extraction_mode, body.is_active
     await db.commit()
     return _out(s)
 
