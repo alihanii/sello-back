@@ -12,3 +12,4 @@ python-dateutil==2.9.0.post0
 Pillow==13.0.0
 socksio==1.0.0  # SOCKS proxies for Instagram and AI keys
 az-iranian-bank-gateways>=2.3.0  # bank gateways (runs on a headless Django; see app/services/bank.py)
+pypdf==6.17.0  # text from PDF files for the chat FAQ import

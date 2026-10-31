@@ -4,7 +4,7 @@ import secrets
 from datetime import datetime, time, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import case, func, select
 
@@ -17,7 +17,8 @@ from app.models import (
 from app.platforms.base import PlatformError
 from app.services import chat_messenger as tg
 from app.services import chat_runtime as rt
-from app.services.ai import route_problem
+from app.services import chat_faq
+from app.services.ai import AIError, route_problem
 from app.services.chat_engine import (
     DEFAULT_AWAY, DEFAULT_OFF_TOPIC, DEFAULT_WELCOME, chat_limit, get_agent, month_ai_messages,
 )
@@ -279,6 +280,30 @@ async def webhook(bot_id: int, secret: str, request: Request, db: DB, background
     update = await request.json()
     background.add_task(rt.handle_update, bot_id, update)
     return {"ok": True}
+
+
+# ---------- knowledge: FAQ from pasted text or a file ----------
+
+
+@router.post("/stores/{store_id}/chat/faq/extract")
+async def extract_faq(store_id: int, user: CurrentUser, db: DB, text: str = Form(""),
+                      file: UploadFile | None = File(None)):
+    """AI reads the seller's text/file and suggests Q&A pairs; the page shows them for review before saving."""
+    await get_store_for(db, user, store_id)
+    body = text.strip()
+    if file is not None and file.filename:
+        try:
+            body = (body + "\n\n" + chat_faq.file_text(file.filename, await file.read())).strip()
+        except chat_faq.FaqFileError as exc:
+            raise HTTPException(422, str(exc))
+    if len(body) < 20:
+        raise HTTPException(422, "متن خیلی کوتاه است؛ متن سؤالات یا قوانین فروشگاه را بگذار.")
+    agent = await get_agent(db, store_id)
+    try:
+        items, usage = await chat_faq.extract(body, store_id, agent.faqs or [])
+    except AIError as exc:
+        raise HTTPException(400, exc.message_fa)
+    return {"items": items, "truncated": len(body) > chat_faq.MAX_CHARS, "usage": usage}
 
 
 # ---------- knowledge: references ----------

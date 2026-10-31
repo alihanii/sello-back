@@ -405,3 +405,27 @@ async def test_catalog_reaches_the_model(client, monkeypatch):
     assert "Never say you have no access" in llm.calls[-1]["system"]
     await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "کفشاتون چند؟"})
     assert "کفش اسپرت سفید" in llm.calls[-1]["prompt"].split("PRODUCTS")[1].splitlines()[1]
+
+
+async def test_faq_extract_from_text_and_file(client, monkeypatch):
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550010")
+    monkeypatch.setattr("app.services.chat_faq.ai.generate_chat", llm)
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"faqs": [{"q": "هزینه ارسال چقدر است؟", "a": "۵۰ هزار"}]})
+    llm.answers = [{"items": [{"q": "هزینه ارسال چقدر است؟", "a": "تکراری"},
+                              {"q": "چند روزه می‌رسد؟", "a": "۲ تا ۴ روز کاری"}, {"q": "", "a": "x"}]}]
+    r = await client.post(f"/stores/{sid}/chat/faq/extract", headers=h,
+                          data={"text": "ارسال به تهران ۲ تا ۴ روز کاری طول می‌کشد و هزینه ارسال ۵۰ هزار تومان است."})
+    assert r.status_code == 200, r.text
+    assert r.json()["items"] == [{"q": "چند روزه می‌رسد؟", "a": "۲ تا ۴ روز کاری"}]
+    assert "<doc>" in llm.calls[-1]["prompt"] and "ارسال به تهران" in llm.calls[-1]["prompt"]
+
+    import io, zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("word/document.xml", "<w:document><w:p><w:t>مرجوعی تا ۷ روز امکان‌پذیر است</w:t></w:p></w:document>")
+    llm.answers = [{"items": [{"q": "مرجوعی دارید؟", "a": "بله، تا ۷ روز"}]}]
+    r = await client.post(f"/stores/{sid}/chat/faq/extract", headers=h,
+                          files={"file": ("faq.docx", buf.getvalue(), "application/octet-stream")})
+    assert r.json()["items"][0]["q"] == "مرجوعی دارید؟" and "مرجوعی تا ۷ روز" in llm.calls[-1]["prompt"]
+    r = await client.post(f"/stores/{sid}/chat/faq/extract", headers=h, files={"file": ("a.xlsx", b"PK", "application/octet-stream")})
+    assert r.status_code == 422
