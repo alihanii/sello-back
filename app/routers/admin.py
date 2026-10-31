@@ -264,6 +264,14 @@ async def put_instagram_crawler(body: InstagramCrawlerIn, admin: AdminUser, db: 
     return await get_instagram_crawler(admin, db)
 
 
+@router.post("/integrations/instagram-crawler/test")
+async def test_instagram_crawler(admin: AdminUser, db: DB):
+    from app.services.instagram_crawl import check_key
+
+    ok, message = await check_key(await instagram_crawler(db))
+    return {"ok": ok, "message": message}
+
+
 class PaymentConfigIn(BaseModel):
     enabled: bool = False
     bank: str = "ZARINPAL"

@@ -45,6 +45,23 @@ async def fetch_posts(cfg: dict, username: str) -> list[IgPost]:
     return newest(await _apify(cfg, username))
 
 
+async def check_key(cfg: dict) -> tuple[bool, str]:
+    """Admin "test" button: is the token valid? Costs nothing (reads the Apify account)."""
+    if not cfg.get("token"):
+        return False, "کلیدی ذخیره نشده است."
+    try:
+        async with httpx.AsyncClient(timeout=30, proxy=cfg.get("proxy") or None) as client:
+            resp = await client.get("https://api.apify.com/v2/users/me", params={"token": cfg["token"]})
+    except httpx.HTTPError:
+        return False, "ارتباط با Apify برقرار نشد؛ اینترنت یا پروکسی را بررسی کن."
+    if resp.status_code in (401, 403):
+        return False, "کلید Apify نامعتبر است."
+    if resp.status_code >= 400:
+        return False, f"Apify خطا داد ({resp.status_code})."
+    name = (resp.json().get("data") or {}).get("username", "")
+    return True, f"کلید سالم است{f' (حساب {name})' if name else ''}؛ کرال اینستاگرام برای همهٔ فروشنده‌ها باز است."
+
+
 def newest(posts: list[IgPost]) -> list[IgPost]:
     """The newest LIMIT posts by date (pinned posts come first in the feed even when they are old)."""
     return sorted(posts, key=lambda p: p.taken_at, reverse=True)[:LIMIT]

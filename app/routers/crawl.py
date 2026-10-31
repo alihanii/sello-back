@@ -10,6 +10,7 @@ from app.deps import DB, CurrentUser, get_store_for
 from app.models import Channel, CrawlSource, Product
 from app.schemas import OperationOut, ProductOut
 from app.services.instagram_crawl import normalize_username
+from app.services.integrations import instagram_crawler
 from app.services.ops import enqueue
 
 router = APIRouter(tags=["crawl"])
@@ -33,6 +34,20 @@ def _out(s: CrawlSource) -> dict:
             "include_reels": bool((s.options or {}).get("include_reels"))}
 
 
+IG_LOCKED = "کرال اینستاگرام هنوز فعال نشده است؛ ادمین سایت باید آن را در پنل ادمین فعال کند."
+
+
+async def _instagram_ready(db) -> bool:
+    return bool((await instagram_crawler(db))["token"])
+
+
+@router.get("/crawl/capabilities")
+async def capabilities(user: CurrentUser, db: DB):
+    """Which crawl sources sellers may add; Instagram unlocks once the admin sets the crawl service key."""
+    ready = await _instagram_ready(db)
+    return {"instagram_profile": {"available": ready, "reason": "" if ready else IG_LOCKED}}
+
+
 @router.get("/stores/{store_id}/crawl-sources")
 async def list_sources(store_id: int, user: CurrentUser, db: DB):
     await get_store_for(db, user, store_id)
@@ -49,12 +64,16 @@ async def create_source(store_id: int, body: SourceIn, user: CurrentUser, db: DB
         ch = await db.get(Channel, body.channel_id or 0)
         if not ch or ch.store_id != store_id:
             raise HTTPException(422, "کانال منبع را انتخاب کنید.")
+        if body.type == "channel_posts" and ch.platform == "instagram":
+            raise HTTPException(422, "برای کرال اینستاگرام، منبع «پیج اینستاگرام» را با آیدی پیج بساز.")
         name = body.name or f"{ch.display_name or ch.platform}"
     elif body.type == "url":
         if not body.url.startswith(("http://", "https://")):
             raise HTTPException(422, "لینک معتبر وارد کنید.")
         name = body.name or body.url[:80]
     elif body.type == "instagram_profile":
+        if not await _instagram_ready(db):
+            raise HTTPException(422, IG_LOCKED)
         username = normalize_username(body.url)
         if not username:
             raise HTTPException(422, "آیدی اینستاگرام معتبر وارد کنید؛ مثلاً mystore یا ‎@mystore")
@@ -101,6 +120,8 @@ async def run_now(source_id: int, user: CurrentUser, db: DB):
     if not s:
         raise HTTPException(404, "منبع پیدا نشد.")
     await get_store_for(db, user, s.store_id)
+    if s.type == "instagram_profile" and not await _instagram_ready(db):
+        raise HTTPException(422, IG_LOCKED)
     op = await enqueue(db, store_id=s.store_id, type="crawl", ref_type="crawl_source", ref_id=s.id,
                        channel_id=s.channel_id, title_fa=f"کرال «{s.name}»")
     await db.commit()

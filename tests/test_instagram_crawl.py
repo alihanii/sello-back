@@ -36,21 +36,22 @@ async def test_instagram_page_crawl(client, monkeypatch):
     h = await login(client, "09126666666")
     sid = (await client.post("/stores", json={"name": "ig"}, headers=h)).json()["id"]
 
+    # locked until the admin sets the crawl key
+    caps = (await client.get("/crawl/capabilities", headers=h)).json()["instagram_profile"]
+    assert caps["available"] is False and "ادمین" in caps["reason"]
+    r = await client.post(f"/stores/{sid}/crawl-sources", headers=h, json={"type": "instagram_profile", "url": "@shoe.shop"})
+    assert r.status_code == 422 and "ادمین" in r.json()["detail"]["message"]
+
+    cfg = (await client.put("/admin/integrations/instagram-crawler", headers=admin,
+                            json={"provider": "apify", "token": "apify_api_test_1234"})).json()
+    assert cfg["has_token"] and "token" not in cfg and cfg["token_hint"] == "…1234"
+    assert (await client.get("/crawl/capabilities", headers=h)).json()["instagram_profile"]["available"] is True
+
     r = await client.post(f"/stores/{sid}/crawl-sources", headers=h, json={"type": "instagram_profile", "url": "bad name"})
     assert r.status_code == 422
     src = (await client.post(f"/stores/{sid}/crawl-sources", headers=h, json={
         "type": "instagram_profile", "url": "@Shoe.Shop", "extraction_mode": "regex"})).json()
     assert src["url"] == "shoe.shop" and src["include_reels"] is False
-
-    # no key yet: a clear message for the seller
-    op = (await client.post(f"/crawl-sources/{src['id']}/run", headers=h)).json()
-    await drain()
-    op = (await client.get(f"/operations/{op['id']}", headers=h)).json()
-    assert op["status"] == "failed" and "کلید" in op["error_message_fa"]
-
-    cfg = (await client.put("/admin/integrations/instagram-crawler", headers=admin,
-                            json={"provider": "apify", "token": "apify_api_test_1234"})).json()
-    assert cfg["has_token"] and "token" not in cfg and cfg["token_hint"] == "…1234"
 
     rows = [
         {"shortCode": "A1", "type": "Image", "caption": "کفش اسپرت مردانه\nقیمت: ۲۵۰ هزار تومان", "displayUrl": "https://cdn/a1.jpg",
