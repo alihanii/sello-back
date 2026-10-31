@@ -139,6 +139,8 @@ async def _call(
                 json={
                     "model": model,
                     "temperature": temperature,
+                    # Without a cap OpenRouter reserves the model's whole output (65536) and answers 402 on a small balance.
+                    **({"max_tokens": 8192} if provider.kind == "openrouter" else {}),
                     # OpenRouter drops every provider that lacks response_format (404); the prompt asks for JSON there.
                     **({"response_format": {"type": "json_object"}} if json_mode and provider.kind == "openai" else {}),
                     "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}],
@@ -206,6 +208,11 @@ def _provider_message(resp: httpx.Response) -> str:
 def _raise_for(resp: httpx.Response) -> None:
     low = resp.text[:2000].lower()
     said = _provider_message(resp)
+    if resp.status_code == 404 and not resp.text.strip():
+        # OpenRouter, Gemini and OpenAI always send a body with a 404; an empty one comes from a VPN or proxy on the way.
+        raise AIError("پاسخ ۴۰۴ بدون متن آمد؛ این پاسخ از سرویس هوش مصنوعی نیست و معمولاً از VPN یا پروکسی سیستم "
+                      "(مثلاً v2rayN) می‌آید. پروکسی سیستم را خاموش کن یا برای این کلید پروکسی درست بگذار.",
+                      code="ai_proxy_404")
     if resp.status_code == 404 and "data policy" in low:
         raise AIError("OpenRouter این مدل را به‌خاطر تنظیمات حریم خصوصی حسابت اجرا نمی‌کند؛ در openrouter.ai/settings/privacy "
                       "گزینه‌های مدل‌های رایگان/آموزش را روشن کن یا یک مدل پولی انتخاب کن." + (f" ({said})" if said else ""),
