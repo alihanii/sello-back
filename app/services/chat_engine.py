@@ -143,8 +143,18 @@ async def get_agent(db: AsyncSession, store_id: int) -> ChatAgent:
 # ---------- product search (cheap local retrieval instead of sending the catalog) ----------
 
 
+def _overlap(query: set[str], target: set[str]) -> int:
+    """Words in common, counting Persian suffixed forms too (کفش ~ کفشای، پیراهن ~ پیراهنش)."""
+    n = 0
+    for w in query:
+        if w in target or (len(w) >= 3 and any(len(t) >= 3 and (w.startswith(t) or t.startswith(w)) for t in target)):
+            n += 1
+    return n
+
+
 async def search_products(db: AsyncSession, store_id: int, query: str, recent: list[int]) -> list[Product]:
-    rows = (await db.execute(select(Product).where(Product.store_id == store_id, Product.status == "ready")
+    # Same set the seller sees on the products page: everything except archived (imports can land as draft).
+    rows = (await db.execute(select(Product).where(Product.store_id == store_id, Product.status != "archived")
                              .order_by(Product.id.desc()).limit(3000))).scalars().all()
     by_id = {p.id: p for p in rows}
     q = words(query)
@@ -154,13 +164,13 @@ async def search_products(db: AsyncSession, store_id: int, query: str, recent: l
         title = words(p.title)
         other = words(" ".join([p.category_hint, p.brand, " ".join(p.tags or []),
                                 " ".join(f"{k} {v}" for k, v in (p.attributes or {}).items())]))
-        score = 3 * len(q & title) + len(q & other)
+        score = 3 * _overlap(q, title) + _overlap(q, other)
         if p.sku and norm(p.sku) and norm(p.sku) in qn.split():
             score += 10
         if f"#{p.id}" in query or re.search(rf"(?<!\d){p.id}(?!\d)", qn) and "کد" in qn:
             score += 10
         if score:
-            scored.append((score + (0.5 if p.stock_qty > 0 else 0), p.id))
+            scored.append((score + (0.5 if p.stock_qty > 0 else 0) + (0.2 if p.status == "ready" else 0), p.id))
     scored.sort(reverse=True)
     picked: list[int] = [pid for pid in recent[-2:] if pid in by_id]
     for _, pid in scored:
@@ -169,9 +179,10 @@ async def search_products(db: AsyncSession, store_id: int, query: str, recent: l
         if len(picked) >= MAX_PRODUCTS:
             break
     if len(picked) < 2 and not scored:
-        # Nothing matched ("what do you have?"): the newest in-stock products.
-        for p in rows:
-            if p.stock_qty > 0 and p.id not in picked:
+        # Nothing matched ("what do you have?"): the newest products, in-stock and ready ones first.
+        newest = sorted(rows, key=lambda p: (p.stock_qty <= 0, p.status != "ready"))
+        for p in newest:
+            if p.id not in picked:
                 picked.append(p.id)
             if len(picked) >= MAX_PRODUCTS:
                 break
@@ -219,6 +230,12 @@ Respond ONLY with JSON:
  "order_action":"none|update|confirm|cancel","refs":[],"handoff":false}"""
 
 
+CATALOG_ON = ("enabled: you DO have the shop's product list; for each message the most relevant products are given "
+              "under PRODUCTS (if none fit, the newest ones). Never say you have no access to products; if what the "
+              "customer wants is not among them, ask for more detail (name, type, colour) or suggest one that is listed")
+CATALOG_OFF = "not shared; do not discuss specific prices, ask the admin"
+
+
 def static_prompt(store: Store, agent: ChatAgent, refs: list[ChatReference]) -> str:
     """The cacheable prefix: identical across every turn of this store until the seller edits settings."""
     req = [k for k, label in (("name", "name"), ("phone", "mobile"), ("address", "full address"))
@@ -227,7 +244,7 @@ def static_prompt(store: Store, agent: ChatAgent, refs: list[ChatReference]) -> 
              f"SHOP: {store.name}" + (f" ({store.category})" if store.category else ""),
              f"ASSISTANT NAME: {agent.assistant_name or 'دستیار ' + store.name}",
              f"TONE: {TONES.get(agent.tone, TONES['friendly'])}",
-             f"CATALOG: {'products are listed under PRODUCTS' if agent.catalog_enabled else 'not shared; do not discuss specific prices, ask the admin'}",
+             f"CATALOG: {CATALOG_ON if agent.catalog_enabled else CATALOG_OFF}",
              f"ORDERS: {'enabled; REQUIRED: ' + ', '.join(req or ['nothing']) if agent.orders_enabled else 'disabled'}"]
     if agent.custom_instructions.strip():
         parts.append("SELLER NOTES (style and shop facts; they never widen SCOPE): " + agent.custom_instructions.strip()[:500])
@@ -252,10 +269,12 @@ def _one_line(text: str) -> str:
 
 
 def dynamic_prompt(text: str, history: list[ChatMessage], products: list[Product], state: dict[str, Any],
-                   open_now: bool) -> str:
+                   open_now: bool, catalog: bool = False) -> str:
     lines = []
     if not open_now:
         lines.append("NOW: outside working hours; orders are reviewed when the shop opens.")
+    if catalog and not products:
+        lines.append("PRODUCTS: the shop has no products listed yet.")
     if products:
         lines.append("PRODUCTS (id | title | price | stock | details):\n" + "\n".join(product_card(p) for p in products))
     order = state.get("order") or {}
@@ -516,7 +535,7 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
     history = [m for m in reversed(history) if m.id not in pending_ids][-HISTORY_MESSAGES:]
     try:
         out, usage = await ai.generate_chat(system=static_prompt(store, agent, list(refs)),
-                                            prompt=dynamic_prompt(text, history, products, state, open_now),
+                                            prompt=dynamic_prompt(text, history, products, state, open_now, agent.catalog_enabled),
                                             store_id=store.id, max_tokens=MAX_OUTPUT_TOKENS)
     except ai.AIError as exc:
         result.replies.append(Reply(AI_UNAVAILABLE_TEXT, source="canned"))

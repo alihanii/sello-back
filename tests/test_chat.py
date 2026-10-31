@@ -388,3 +388,20 @@ async def test_polling_saves_messages_and_moves_offset(client, monkeypatch):
     assert seen == [0, 42] and len(scheduled) == 1  # the group message is ignored
     lst = (await client.get(f"/stores/{sid}/chat/conversations?platform=bale", headers=h)).json()
     assert lst["items"][0]["customer_name"] == "رضا"
+
+
+async def test_catalog_reaches_the_model(client, monkeypatch):
+    """Draft (imported) and out-of-stock products are still the seller's catalog; suffixed words still match."""
+    h, sid, llm, p1, p2 = await _setup(client, monkeypatch, "09125550009")
+    from app.core.db import SessionLocal
+    from app.models import Product
+    async with SessionLocal() as db:
+        db.add(Product(store_id=sid, title="کفش اسپرت سفید", price=900000, stock_qty=0, status="draft"))
+        await db.commit()
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "چه محصولاتی دارید؟"})
+    prompt = llm.calls[-1]["prompt"]
+    assert "مانتو لینن کرم" in prompt and "کفش اسپرت سفید" in prompt
+    assert "Never say you have no access" in llm.calls[-1]["system"]
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "کفشاتون چند؟"})
+    assert "کفش اسپرت سفید" in llm.calls[-1]["prompt"].split("PRODUCTS")[1].splitlines()[1]
