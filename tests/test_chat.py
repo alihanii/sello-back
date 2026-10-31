@@ -456,3 +456,36 @@ async def test_assistant_keeps_the_chat_unless_a_person_is_wanted(client, monkey
     before = len(llm.calls)
     saved, status = await say("وصلم کن به پشتیبانی")
     assert saved[-1].source == "handoff" and status == "needs_human" and len(llm.calls) == before
+
+
+async def test_photos_variants_and_clarify(client, monkeypatch):
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550012")
+    from app.core.db import SessionLocal
+    from app.models import Product, ProductImage
+    async with SessionLocal() as db:
+        hoodie = Product(store_id=sid, title="هودی کلاه‌دار", price=890000, stock_qty=4,
+                         attributes={"جنس": "دورس", "برند": "X", "کشور": "ایران", "یقه": "کلاه‌دار",
+                                     "آستین": "بلند", "رنگ": "مشکی، نارنجی، طوسی", "سایز": "L، XL"})
+        db.add(hoodie)
+        await db.flush()
+        db.add_all([ProductImage(product_id=hoodie.id, url=f"/media/x/h{i}.jpg", position=i) for i in range(4)])
+        await db.commit()
+        hid = hoodie.id
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
+    llm.answers = [{"reply": "این هودی کلاه‌دار ماست 👇", "intent": "product", "products": [hid], "images": [hid]}]
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "عکس هودی رو بفرست"})).json()
+    call = llm.calls[-1]
+    # colour/size come first in the product line even with many details, and the photo count is shown
+    line = next(x for x in call["prompt"].splitlines() if x.startswith(f"#{hid} "))
+    assert "رنگ: مشکی، نارنجی، طوسی" in line and "سایز: L، XL" in line and "۴ عکس" in line
+    assert "CLARIFY" in call["system"] and "VARIANTS" in call["system"]
+    imgs = [m for m in r["messages"] if m["image_url"]]
+    assert len(imgs) == 1 and imgs[0]["image_url"] == "/media/x/h0.jpg" and "هودی کلاه‌دار" in imgs[0]["text"]
+    llm.answers = [{"reply": "بفرما", "intent": "product", "products": [hid], "images": [hid]}]
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "عکس‌های بیشتر"})).json()
+    assert len([m for m in r["messages"][-4:] if m["image_url"]]) == 3
+    assert f"LAST PRODUCT: #{hid}" in llm.calls[-1]["prompt"]
+    # an id the model made up gets no photo
+    llm.answers = [{"reply": "بفرما", "intent": "product", "images": [99999]}]
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "عکسشو ببینم"})).json()
+    assert not r["messages"][-1]["image_url"]

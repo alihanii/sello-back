@@ -252,8 +252,14 @@ async def deliver(db: AsyncSession, bot: ChatBot | None, conv: ChatConversation,
         try:
             if reply.image_url and (local := read_local(reply.image_url)):
                 data, mime = local
-                row.external_id = await tg.send_photo(bot, conv.external_chat_id, data, "ref" + _ext(mime),
+                row.external_id = await tg.send_photo(bot, conv.external_chat_id, data, "photo" + _ext(mime),
                                                       reply.text, biz)
+            elif reply.image_url.startswith(("http://", "https://")):
+                try:
+                    row.external_id = await tg.send_photo_url(bot, conv.external_chat_id, reply.image_url, reply.text, biz)
+                except PlatformError:  # the messenger could not fetch the picture: still send the caption
+                    if reply.text:
+                        row.external_id = await tg.send_text(bot, conv.external_chat_id, reply.text, biz)
             elif reply.text:
                 row.external_id = await tg.send_text(bot, conv.external_chat_id, reply.text, biz)
         except PlatformError as exc:

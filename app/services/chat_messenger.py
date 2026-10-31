@@ -71,6 +71,15 @@ async def send_photo(bot: ChatBot, chat_id: str, image: bytes, filename: str, ca
     return str((result or {}).get("message_id", ""))
 
 
+async def send_photo_url(bot: ChatBot, chat_id: str, url: str, caption: str = "",
+                         business_connection_id: str = "") -> str:
+    data: dict[str, Any] = {"chat_id": str(chat_id), "photo": url, "caption": caption[:1000]}
+    if business_connection_id:
+        data["business_connection_id"] = business_connection_id
+    result = await call(bot, "sendPhoto", data)
+    return str((result or {}).get("message_id", ""))
+
+
 async def download(bot: ChatBot, file_id: str) -> tuple[bytes, str]:
     adapter = ADAPTERS[bot.platform]
     token = bot_token(bot)

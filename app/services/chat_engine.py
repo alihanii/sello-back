@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import utcnow
 from app.models import (
-    AiOrder, ChatAgent, ChatConversation, ChatMessage, ChatReference, Product, Store, User,
+    AiOrder, ChatAgent, ChatConversation, ChatMessage, ChatReference, Product, ProductImage, Store, User,
 )
 from app.services import ai
 from app.services.text import fa_number, normalize_fa, to_en_digits
@@ -194,11 +194,17 @@ async def search_products(db: AsyncSession, store_id: int, query: str, recent: l
     return [by_id[i] for i in picked]
 
 
-def product_card(p: Product) -> str:
-    attrs = "، ".join(f"{k}: {v}" for k, v in list((p.attributes or {}).items())[:4])
+_VARIANT_KEY = re.compile(r"(رنگ|سایز|اندازه|size|color|colour|مدل|طرح|جنس|سایزبندی|تنوع)", re.I)
+
+
+def product_card(p: Product, photos: int = 0) -> str:
+    items = sorted((p.attributes or {}).items(), key=lambda kv: not _VARIANT_KEY.search(str(kv[0])))
+    attrs = "، ".join(f"{k}: {str(v)[:120]}" for k, v in items[:8])
     stock = f"موجودی {p.stock_qty}" if p.stock_qty > 0 else "ناموجود"
     desc = re.sub(r"\s+", " ", p.description or "")[:140]
-    return f"#{p.id} | {p.title[:90]} | {money(p.price)} | {stock}" + (f" | {attrs}" if attrs else "") + (f" | {desc}" if desc else "")
+    pics = f" | {fa_number(photos)} عکس" if photos else " | بدون عکس"
+    return (f"#{p.id} | {p.title[:90]} | {money(p.price)} | {stock}{pics}" + (f" | {attrs}" if attrs else "")
+            + (f" | {desc}" if desc else ""))
 
 
 # ---------- prompts ----------
@@ -228,6 +234,19 @@ summary and payment info itself; do not write card numbers or totals). If the cu
 "cancel". If ORDERS are disabled, still answer product questions, and for buying say the admin will take the
 order in this chat (handoff stays false).
 
+CLARIFY. Before answering, work out exactly which product and which option the customer means, using RECENT CHAT
+and LAST PRODUCT ("this one", "همین", "اون هودی" usually mean LAST PRODUCT). If it is still unclear (several products
+could match, the message is vague or garbled, or they want to buy a product that has several colours/sizes and did
+not choose), do NOT guess: ask ONE short question with up to 3 concrete options by name, and set intent "clarify".
+If exactly one product fits, just answer.
+
+VARIANTS. Colours, sizes and other options are in each product's details (رنگ، سایز، …). Answer "what colours?"
+from them. If the asked colour/size is not listed, say so kindly and list the ones that are. In an order, put the
+chosen options in item.variant (e.g. "نارنجی، XL"); a different colour of the same product is the same product_id.
+
+PHOTOS. If the customer asks to see a product (عکس، تصویر، ببینم، نشون بده) put its id in "images" (max 3 ids);
+the shop sends the photos itself, so just write a short caption-like reply. Only products with photos ("N عکس").
+
 REFS. If a reference (e.g. a size chart) answers the question, put its id in "refs".
 HANDOFF is rare: you are the one who answers. Set handoff true ONLY when (a) the customer clearly asks to talk to a
 person/admin, or (b) they complain angrily or report a problem with an order they already placed (late, wrong,
@@ -235,8 +254,8 @@ damaged, refund). Then set handoff_reason "asked_human" or "complaint" and still
 Never hand off for a normal question, even if you lack the answer.
 
 Respond ONLY with JSON:
-{"reply":"<Persian text>","intent":"product|order|faq|greeting|admin|off_topic|handoff",
- "products":[<product ids you talked about>],
+{"reply":"<Persian text>","intent":"product|order|faq|greeting|clarify|admin|off_topic|handoff",
+ "products":[<product ids you talked about>],"images":[],
  "order":{"items":[{"product_id":0,"qty":1,"variant":""}],"name":"","phone":"","address":"","note":""},
  "order_action":"none|update|confirm|cancel","refs":[],"handoff":false,"handoff_reason":""}"""
 
@@ -280,14 +299,18 @@ def _one_line(text: str) -> str:
 
 
 def dynamic_prompt(text: str, history: list[ChatMessage], products: list[Product], state: dict[str, Any],
-                   open_now: bool, catalog: bool = False) -> str:
+                   open_now: bool, catalog: bool = False, photos: dict[int, int] | None = None) -> str:
     lines = []
     if not open_now:
         lines.append("NOW: outside working hours; orders are reviewed when the shop opens.")
     if catalog and not products:
         lines.append("PRODUCTS: the shop has no products listed yet.")
     if products:
-        lines.append("PRODUCTS (id | title | price | stock | details):\n" + "\n".join(product_card(p) for p in products))
+        lines.append("PRODUCTS (id | title | price | stock | photos | details):\n"
+                     + "\n".join(product_card(p, (photos or {}).get(p.id, 0)) for p in products))
+        last = (state.get("recent_products") or [None])[-1]
+        if last in {p.id for p in products}:
+            lines.append(f"LAST PRODUCT: #{last}")
     order = state.get("order") or {}
     if order:
         lines.append("ORDER SO FAR: " + json.dumps(order, ensure_ascii=False))
@@ -402,7 +425,7 @@ async def _merge_order(db: AsyncSession, store_id: int, agent: ChatAgent, state:
                 qty = 1
             pid = it.get("product_id")
             p = await db.get(Product, int(pid)) if str(pid or "").isdigit() and int(pid) else None
-            if p and p.store_id == store_id and p.status == "ready":
+            if p and p.store_id == store_id and p.status != "archived":
                 if p.stock_qty > 0:
                     qty = min(qty, p.stock_qty)
                 items.append({"product_id": p.id, "qty": qty, "variant": str(it.get("variant") or "")[:80]})
@@ -539,6 +562,10 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
     refs = (await db.execute(select(ChatReference).where(ChatReference.store_id == store.id)
                              .order_by(ChatReference.id))).scalars().all()
     products = await search_products(db, store.id, text, state.get("recent_products") or []) if agent.catalog_enabled else []
+    photos: dict[int, int] = {}
+    if products:
+        photos = dict((await db.execute(select(ProductImage.product_id, func.count()).where(
+            ProductImage.product_id.in_([p.id for p in products])).group_by(ProductImage.product_id))).all())
     pending_ids = {m.id for m in pending}
     history = (await db.execute(select(ChatMessage).where(ChatMessage.conversation_id == conv.id,
                                                           ChatMessage.role.in_(["customer", "ai", "seller"]))
@@ -546,7 +573,7 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
     history = [m for m in reversed(history) if m.id not in pending_ids][-HISTORY_MESSAGES:]
     try:
         out, usage = await ai.generate_chat(system=static_prompt(store, agent, list(refs)),
-                                            prompt=dynamic_prompt(text, history, products, state, open_now, agent.catalog_enabled),
+                                            prompt=dynamic_prompt(text, history, products, state, open_now, agent.catalog_enabled, photos),
                                             store_id=store.id, max_tokens=MAX_OUTPUT_TOKENS)
     except ai.AIError as exc:
         result.replies.append(Reply(AI_UNAVAILABLE_TEXT, source="canned"))
@@ -594,6 +621,8 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         reply.text, reply.source = NO_ANSWER_TEXT, "canned"
         result.replies.append(reply)
 
+    result.replies += await product_photos(db, [p for p in products if photos.get(p.id)], out.get("images"), text)
+
     for rid in (out.get("refs") or [])[:2]:
         ref = next((r for r in refs if str(r.id) == str(rid)), None)
         if ref:
@@ -606,6 +635,27 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
             result.replies.append(Reply(HANDOFF_TEXT, source="handoff", intent="handoff", usage=usage))
         result.notify_admin.append(f"🙋 گفتگو با {conv.customer_name or 'مشتری'} به ادمین نیاز دارد: «{text[:120]}»")
     return done()
+
+
+_MORE_PHOTOS = re.compile(r"(عکس|تصویر)\S*\s*(های|‌های)?\s*(بیشتر|دیگه|دیگر|بقیه)|همه\s*(ی\s*)?(عکس|تصویر)")
+MAX_PHOTOS = 3
+
+
+async def product_photos(db: AsyncSession, products: list[Product], ids: Any, text: str) -> list[Reply]:
+    """Photos the model asked to show: one per product, or up to 3 of a single product when more are wanted."""
+    by_id = {p.id: p for p in products}
+    wanted = [by_id[int(i)] for i in (ids or [])[:MAX_PHOTOS] if str(i).isdigit() and int(i) in by_id]
+    if not wanted:
+        return []
+    per = MAX_PHOTOS if len(wanted) == 1 and _MORE_PHOTOS.search(text) else 1
+    out: list[Reply] = []
+    for p in wanted:
+        urls = (await db.execute(select(ProductImage.url).where(ProductImage.product_id == p.id)
+                                 .order_by(ProductImage.position, ProductImage.id).limit(per))).scalars().all()
+        for n, url in enumerate(urls):
+            out.append(Reply(f"{p.title} — {money(p.price)}" if n == 0 else "", image_url=url, source="canned",
+                             intent="product"))
+    return out
 
 
 async def create_order(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent,
