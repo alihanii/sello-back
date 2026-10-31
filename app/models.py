@@ -459,6 +459,9 @@ class ChatAgent(TimestampMixin, Base):
     handoff_minutes: Mapped[int] = mapped_column(Integer, default=60)
     # How answers must look: {"stock": "exact" | "available", "rules": ["never ...", ...]} (see chat_engine.policy)
     answer_policy: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict, nullable=True)
+    # Extra things every order needs, the seller's own: [{"label": "طرح چاپ", "kind": "image"|"text", "required": true,
+    # "hint": "..."}] — e.g. a custom-print shop collects the customer's design (like Shopify line-item properties).
+    order_fields: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, default=list, nullable=True)
 
 
 class ChatBot(TimestampMixin, Base):
@@ -578,3 +581,4 @@ class AiOrder(TimestampMixin, Base):
     receipt_text: Mapped[str] = mapped_column(Text, default="")
     seller_note: Mapped[str] = mapped_column(Text, default="")
     is_test: Mapped[bool] = mapped_column(Boolean, default=False)
+    extras: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict, nullable=True)  # {label: text or image url}

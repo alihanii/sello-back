@@ -83,6 +83,11 @@ the a an is are""".split())
 # ---------- small helpers ----------
 
 MAX_ANSWER_RULES = 15
+MAX_ORDER_FIELDS = 5
+
+
+def order_fields(agent: ChatAgent) -> list[dict[str, Any]]:
+    return [f for f in (agent.order_fields or []) if f.get("label")][:MAX_ORDER_FIELDS]
 
 
 def policy(agent: ChatAgent) -> dict[str, Any]:
@@ -280,7 +285,8 @@ def product_card(p: Product, photos: int = 0, exact_stock: bool = True, full: bo
     stock = ("ناموجود" if p.stock_qty <= 0 else f"موجودی {p.stock_qty}" if exact_stock else "موجود")
     desc = re.sub(r"\s+", " ", p.description or "")[:160] if full else ""
     pics = f" | {fa_number(photos)} عکس" if photos else ""
-    return (f"#{p.id} | {p.title[:90]} | {money(p.price)} | {stock}{pics}" + (f" | {attrs}" if attrs else "")
+    code = f" (کد {p.sku})" if p.sku else ""
+    return (f"#{p.id} | {p.title[:90]}{code} | {money(p.price)} | {stock}{pics}" + (f" | {attrs}" if attrs else "")
             + (f" | {desc}" if desc else ""))
 
 
@@ -320,7 +326,7 @@ Example: Customer: موجوده؟ (LAST PRODUCT in stock) -> {"reply":"بله م
 
 Reply with ONE JSON object, "reply" first, omit empty fields:
 {"reply":"","intent":"product|order|faq|greeting|clarify|admin|off_topic|handoff","products":[],"images":[],
-"order":{"items":[{"product_id":0,"qty":1,"variant":""}],"name":"","phone":"","address":"","note":""},
+"order":{"items":[{"product_id":0,"qty":1,"variant":""}],"name":"","phone":"","address":"","note":"","extras":{}},
 "order_action":"none|update|confirm|cancel","refs":[],"handoff":false,"handoff_reason":""}"""
 
 
@@ -339,6 +345,14 @@ def static_prompt(store: Store, agent: ChatAgent, refs: list[ChatReference]) -> 
              f"TONE: {TONES['formal'] if any('شما' in r for r in policy(agent)['rules']) else TONES.get(agent.tone, TONES['friendly'])}",
              f"CATALOG: {CATALOG_ON if agent.catalog_enabled else CATALOG_OFF}",
              f"ORDERS: {'enabled; REQUIRED: ' + ', '.join(req or ['nothing']) if agent.orders_enabled else 'disabled'}"]
+    extra = order_fields(agent) if agent.orders_enabled else []
+    if extra:
+        parts.append("EXTRA ORDER FIELDS (this shop's own; ask for each before confirming; text answers go in "
+                     "order.extras {label: value}; for image fields ask the customer to send the picture in this chat, "
+                     "the shop attaches it itself):\n" + "\n".join(
+                         f"- {f['label']} ({'image' if f['kind'] == 'image' else 'text'}, "
+                         f"{'required' if f['required'] else 'optional'})" + (f": {f['hint']}" if f.get("hint") else "")
+                         for f in extra))
     rules = policy(agent)["rules"]
     if rules:
         parts.append("SELLER RULES (obey in EVERY reply, above tone and style; they never widen SCOPE or override FACTS):\n"
@@ -346,7 +360,7 @@ def static_prompt(store: Store, agent: ChatAgent, refs: list[ChatReference]) -> 
     if policy(agent)["stock"] == "available":
         parts.append("STOCK: say only available or not available; never say how many are left.")
     if agent.custom_instructions.strip():
-        parts.append("SELLER NOTES (style and shop facts; they never widen SCOPE): " + agent.custom_instructions.strip()[:500])
+        parts.append("SELLER NOTES (style and shop facts; they never widen SCOPE): " + agent.custom_instructions.strip()[:1500])
     faqs = [f for f in (agent.faqs or []) if f.get("q") and f.get("a")]
     if faqs:
         parts.append("FAQ:\n" + "\n".join(f"- {_one_line(f['q'])[:150]} => {_one_line(f['a'])[:250]}" for f in faqs[:40]))
@@ -438,7 +452,9 @@ def order_summary(order: dict[str, Any], lines: list[dict[str, Any]], total: int
                       + f" × {fa_number(i['qty'])} = {money(i['unit_price'] * i['qty'])}" for i in lines)
     who = "\n".join(x for x in (get("name", "") and f"👤 {get('name', '')}", get("phone", "") and f"📞 {ltr(get('phone', ''))}",
                                  get("address", "") and f"📍 {get('address', '')}") if x)
-    return f"{items}\n💰 جمع: {money(total)}" + (f"\n{who}" if who else "")
+    extras = "\n".join(f"📝 {k}: " + ("✔️ عکس رسید" if str(v).startswith(("/media/", "http")) else str(v))
+                       for k, v in (order.get("extras") or {}).items())
+    return f"{items}\n💰 جمع: {money(total)}" + (f"\n{extras}" if extras else "") + (f"\n{who}" if who else "")
 
 
 def payment_text(agent: ChatAgent, order: AiOrder) -> str:
@@ -480,7 +496,9 @@ async def priced_lines(db: AsyncSession, store_id: int, items: list[dict[str, An
 
 def _missing_fields(agent: ChatAgent, order: dict[str, Any]) -> list[str]:
     req = agent.required_fields or {}
-    return [k for k in ("name", "phone", "address") if req.get(k, True) and not str(order.get(k) or "").strip()]
+    extras = order.get("extras") or {}
+    return ([k for k in ("name", "phone", "address") if req.get(k, True) and not str(order.get(k) or "").strip()]
+            + [f["label"] for f in order_fields(agent) if f["required"] and not str(extras.get(f["label"]) or "").strip()])
 
 
 async def _merge_order(db: AsyncSession, store_id: int, agent: ChatAgent, state: dict[str, Any],
@@ -515,6 +533,14 @@ async def _merge_order(db: AsyncSession, store_id: int, agent: ChatAgent, state:
                 key = (it.get("product_id") or it.get("title"), it["variant"])
                 merged[key] = {**it, "qty": max(it["qty"], merged.get(key, {}).get("qty", 0))}
             order["items"] = list(merged.values())
+    if isinstance(update.get("extras"), dict):
+        text_fields = {f["label"] for f in order_fields(agent) if f["kind"] == "text"}
+        extras = dict(order.get("extras") or {})
+        for k, v in update["extras"].items():
+            if k in text_fields and str(v or "").strip():
+                extras[k] = str(v).strip()[:300]
+        if extras:
+            order["extras"] = extras
     for k in ("name", "phone", "address", "note"):
         v = str(update.get(k) or "").strip()
         if v:
@@ -569,7 +595,18 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
     if unsupported:
         result.replies.append(Reply(UNSUPPORTED_TEXT, source="canned"))
         return done()
-    if photo and not text:
+    image_fields = [f for f in order_fields(agent) if f["kind"] == "image"] if agent.orders_enabled else []
+    if photo and image_fields:
+        # A picture while shopping in a shop that collects one (a design to print, a reference photo…):
+        # it goes on the order, and the assistant carries on from there.
+        order_state = dict(state.get("order") or {})
+        extras = dict(order_state.get("extras") or {})
+        field_ = next((f for f in image_fields if not extras.get(f["label"])), image_fields[0])
+        extras[field_["label"]] = photo
+        order_state["extras"] = extras
+        state["order"] = order_state
+        text = (text + "\n" if text else "") + f"[مشتری فایلِ «{field_['label']}» را فرستاد و روی سفارش ثبت شد]"
+    elif photo and not text:
         result.replies.append(Reply(PHOTO_TEXT, source="canned"))
         return done()
 
@@ -763,7 +800,9 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
     if _PHOTO_ASK.search(text):  # photos only when the customer asked (or said yes to "send the photo?")
         ids = resolve_mentioned(with_photos, out.get("images"), f"{reply.text} {text}")
         sent = await product_photos(db, with_photos, ids, text)
-        result.replies += sent
+        # Photos first, then the words: "here it is, which size?" must not arrive before the picture.
+        at = result.replies.index(reply) if reply in result.replies else len(result.replies)
+        result.replies[at:at] = sent
     offering = bool(_OFFER.search(reply.text)) and ("؟" in reply.text or "?" in reply.text)
     if not sent and with_photos and "عکس" in reply.text and offering:
         # The assistant offered a photo: remember which product, so a plain "yes" sends it next turn.
@@ -877,7 +916,7 @@ async def product_photos(db: AsyncSession, products: list[Product], ids: Any, te
         urls = (await db.execute(select(ProductImage.url).where(ProductImage.product_id == p.id)
                                  .order_by(ProductImage.position, ProductImage.id).limit(per))).scalars().all()
         for n, url in enumerate(urls):
-            caption = p.title + (f" — {money(p.price)}" if p.price else "")
+            caption = p.title + (f" (کد {p.sku})" if p.sku else "") + (f" — {money(p.price)}" if p.price else "")
             out.append(Reply(caption if n == 0 else "", image_url=url, source="canned",
                              intent="product"))
     return out
@@ -893,7 +932,8 @@ async def create_order(db: AsyncSession, conv: ChatConversation, store: Store, a
                     customer_name=order_state.get("name") or conv.customer_name,
                     customer_phone=order_state.get("phone", ""), customer_address=order_state.get("address", ""),
                     customer_username=conv.customer_username, items=lines, total_toman=total,
-                    note=order_state.get("note", ""), status="awaiting_payment", is_test=conv.is_test)
+                    note=order_state.get("note", ""), status="awaiting_payment", is_test=conv.is_test,
+                    extras=order_state.get("extras") or {})
     db.add(order)
     await db.flush()
     state.pop("order", None)

@@ -21,7 +21,7 @@ from app.services import chat_runtime as rt
 from app.services import chat_faq
 from app.services.ai import AIError, route_problem
 from app.services.chat_engine import (
-    MAX_ANSWER_RULES, policy,
+    MAX_ANSWER_RULES, MAX_ORDER_FIELDS, order_fields, policy,
     DEFAULT_AWAY, DEFAULT_OFF_TOPIC, DEFAULT_WELCOME, chat_limit, get_agent, month_ai_messages,
 )
 
@@ -42,7 +42,7 @@ class AgentIn(BaseModel):
     enabled: bool | None = None
     assistant_name: str | None = Field(None, max_length=60)
     tone: str | None = None
-    custom_instructions: str | None = Field(None, max_length=500)
+    custom_instructions: str | None = Field(None, max_length=1500)
     welcome_message: str | None = Field(None, max_length=1000)
     off_topic_message: str | None = Field(None, max_length=500)
     catalog_enabled: bool | None = None
@@ -54,6 +54,7 @@ class AgentIn(BaseModel):
     business_hours: dict[str, Any] | None = None
     handoff_minutes: int | None = Field(None, ge=5, le=1440)
     answer_policy: dict[str, Any] | None = None
+    order_fields: list[dict[str, Any]] | None = Field(None, max_length=MAX_ORDER_FIELDS)
 
 
 def _agent_out(agent: ChatAgent, store: Store) -> dict[str, Any]:
@@ -67,6 +68,7 @@ def _agent_out(agent: ChatAgent, store: Store) -> dict[str, Any]:
         "business_hours": {"enabled": False, "days": {}, "away_mode": "ai", "away_message": "", **(agent.business_hours or {})},
         "handoff_minutes": agent.handoff_minutes,
         "answer_policy": policy(agent),
+        "order_fields": order_fields(agent),
         "defaults": {"welcome_message": DEFAULT_WELCOME.replace("{store}", store.name),
                      "off_topic_message": DEFAULT_OFF_TOPIC.replace("{store}", store.name),
                      "away_message": DEFAULT_AWAY},
@@ -105,6 +107,15 @@ async def save_agent_settings(store_id: int, body: AgentIn, user: CurrentUser, d
             "away_mode": "message" if bh.get("away_mode") == "message" else "ai",
             "away_message": str(bh.get("away_message") or "")[:500],
         }
+    if "order_fields" in data:
+        seen, clean = set(), []
+        for f in data["order_fields"]:
+            label = re.sub(r"\s+", " ", str(f.get("label") or "")).strip()[:40]
+            if label and label not in seen:
+                seen.add(label)
+                clean.append({"label": label, "kind": "image" if f.get("kind") == "image" else "text",
+                              "required": bool(f.get("required", True)), "hint": str(f.get("hint") or "").strip()[:150]})
+        data["order_fields"] = clean
     if "answer_policy" in data:
         ap = data["answer_policy"]
         rules = [re.sub(r"\s+", " ", str(r)).strip()[:200] for r in (ap.get("rules") or []) if str(r).strip()]
@@ -494,6 +505,7 @@ def _order_out(o: AiOrder) -> dict[str, Any]:
             "customer_username": o.customer_username, "items": o.items, "total_toman": o.total_toman, "note": o.note,
             "status": o.status, "payment_ref": o.payment_ref, "receipt_url": o.receipt_url,
             "receipt_text": o.receipt_text, "seller_note": o.seller_note, "is_test": o.is_test,
+            "extras": o.extras or {},
             "created_at": o.created_at, "updated_at": o.updated_at}
 
 

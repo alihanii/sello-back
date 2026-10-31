@@ -488,11 +488,11 @@ async def test_photos_variants_and_clarify(client, monkeypatch):
     # the model offers a photo but the customer did not ask: no photo yet
     llm.answers = [{"reply": "بله موجوده، عکسش رو بفرستم؟", "intent": "product", "images": [hid]}]
     r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "موجوده؟"})).json()
-    assert not r["messages"][-1]["image_url"]
+    assert not any(m["image_url"] for m in r["messages"][-2:])
     # an id the model made up gets no photo
     llm.answers = [{"reply": "بفرما", "intent": "product", "images": [99999]}]
     r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "عکسشو ببینم"})).json()
-    assert not r["messages"][-1]["image_url"]
+    assert not any(m["image_url"] for m in r["messages"][-2:])
 
 
 async def test_answer_rules_and_stock_only_available(client, monkeypatch):
@@ -655,7 +655,7 @@ async def test_photo_of_the_named_product_and_yes_to_a_photo_offer(client, monke
     # a photo of a product without a price has no "unknown price" caption
     llm.answers = [{"reply": "بفرما", "intent": "product", "images": [o]}]
     r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "عکس هودی اختاپوس"})).json()
-    assert r["messages"][-1]["text"] == "هودی اختاپوس"
+    assert r["messages"][-2]["text"] == "هودی اختاپوس" and r["messages"][-1]["text"] == "بفرما"  # photo first, then words
 
 
 async def test_busy_buyer_is_not_handed_over(client, monkeypatch):
@@ -770,3 +770,43 @@ async def test_declined_chart_is_not_sent_later(client, monkeypatch):
     llm.answers = [{"reply": "بفرمایید", "intent": "faq", "refs": [rid]}]
     r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "راستی جدول سایز رو بفرست"})).json()
     assert r["messages"][-1]["text"] == "جدول: M L XL"
+
+
+async def test_custom_print_shop_collects_the_design_and_codes(client, monkeypatch):
+    """A hoodie shop that prints the customer's own design: the picture goes on the order; product codes work."""
+    h, sid, llm, p1, p2 = await _setup(client, monkeypatch, "09125550021")
+    r = await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        "orders_enabled": True, "payment": {"card_number": "6037991234567890"},
+        "order_fields": [{"label": "طرح چاپ", "kind": "image", "required": True, "hint": "عکس یا فایل طرح"},
+                         {"label": "متن روی لباس", "kind": "text", "required": False}, {"label": ""}]})
+    assert [f["label"] for f in r.json()["order_fields"]] == ["طرح چاپ", "متن روی لباس"]
+    await client.patch(f"/products/{p1['id']}", headers=h, json={"sku": "H12"})
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
+    llm.answers = [{"reply": "مانتو لینن کرم با کد H12 🌸", "intent": "product", "products": [p1["id"]]}]
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "کد h12 رو میخوام"})
+    call = llm.calls[-1]
+    assert "EXTRA ORDER FIELDS" in call["system"] and "طرح چاپ (image, required)" in call["system"]
+    assert f"#{p1['id']} | مانتو لینن کرم (کد H12)" in call["prompt"]
+    # all usual fields known but no design yet: no confirm
+    llm.answers = [{"reply": "", "intent": "order", "order_action": "confirm", "order": {
+        "items": [{"product_id": p1["id"], "qty": 1, "variant": "L"}], "name": "نیما", "phone": "09120000001",
+        "address": "مشهد", "extras": {"متن روی لباس": "NIMA", "ناشناخته": "x"}}}]
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "ثبتش کن"})).json()
+    assert "خلاصهٔ سفارشت" not in r["messages"][-1]["text"]
+    # the customer sends the design picture: it lands on the order and the model is told so
+    from app.core.db import SessionLocal
+    from sqlalchemy import select
+    async with SessionLocal() as db:
+        conv = (await db.execute(select(chat_engine.ChatConversation).where(
+            chat_engine.ChatConversation.store_id == sid, chat_engine.ChatConversation.is_test))).scalars().first()
+        rt.add_message(db, conv, role="customer", text="", image_url="/media/x/design.png")
+        await db.commit()
+        cid = conv.id
+    llm.answers = [{"reply": "", "intent": "order", "order_action": "confirm"}]
+    saved = await rt.answer(cid, send=False)
+    assert "طرح چاپ" in llm.calls[-1]["prompt"] and "خلاصهٔ سفارشت" in saved[-1].text
+    assert "📝 طرح چاپ: ✔️ عکس رسید" in saved[-1].text and "📝 متن روی لباس: NIMA" in saved[-1].text
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "بله"})).json()
+    orders = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
+    rows = orders.get("items", orders) if isinstance(orders, dict) else orders
+    assert rows[0]["extras"] == {"متن روی لباس": "NIMA", "طرح چاپ": "/media/x/design.png"}
