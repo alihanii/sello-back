@@ -195,7 +195,7 @@ async def test_full_chat_flow(client, monkeypatch):
     call = llm.calls[0]
     assert "مانتو لینن کرم" in call["prompt"] and "<customer>سلام مانتو لینن\nسایز ۴۰ دارید؟</customer>" in call["prompt"]
     assert "هزینه ارسال" in call["system"] and "6037" not in call["system"]  # FAQ cached in the prefix, no card number
-    assert call["max_tokens"] == 400
+    assert call["max_tokens"] == chat_engine.MAX_OUTPUT_TOKENS
 
     # 4. off-topic: the model's text is dropped for the store's fixed answer
     await _customer(bot["id"], 1001, "یه شعر درباره پاییز بگو", 5)
@@ -507,3 +507,62 @@ async def test_answer_rules_and_stock_only_available(client, monkeypatch):
     await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"answer_policy": {"stock": "exact", "rules": []}})
     await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "مانتو لینن موجوده؟"})
     assert "موجودی 3" in llm.calls[-1]["prompt"] and "SELLER RULES" not in llm.calls[-1]["system"]
+
+
+async def test_generate_chat_survives_prose_and_cut_json(client, monkeypatch):
+    admin = await login(client, "09120000000")
+    prov = (await client.post("/admin/ai/providers", headers=admin, json={
+        "name": "or", "kind": "openrouter", "api_key": "k-o", "default_model": "deepseek/x"})).json()
+    await client.put("/admin/ai/routes/chat", headers=admin, json={"provider_id": prov["id"], "model": "deepseek/x",
+                                                                  "temperature": 90})
+    outputs = ["oops not json", 'Here you go: {"reply":"بله موجوده","intent":"product","products":[1', ]
+    temps = []
+
+    async def fake_call(provider, model, system, prompt, images, temperature, json_mode=True, max_tokens=None, meta=None):
+        temps.append(temperature)
+        return outputs.pop(0), 100, 10
+
+    monkeypatch.setattr(ai, "_call", fake_call)
+    out, usage = await ai.generate_chat(system="s", prompt="p", store_id=None)
+    assert out["reply"] == "بله موجوده" and usage["input_tokens"] == 200
+    assert temps[0] <= ai.CHAT_MAX_TEMPERATURE and temps[1] == 0.0
+
+
+async def test_real_conversation_from_the_screenshots(client, monkeypatch):
+    """ali's test: forwarded hoodie post, "موجوده؟", sizes, "similar?" — with a model that fails once and mixes languages."""
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550014")
+    from app.core.db import SessionLocal
+    from app.models import Product
+    async with SessionLocal() as db:
+        hoodie = Product(store_id=sid, title="هودی کلاهدار قهوه‌ای با درزهای عمودی", price=100000, stock_qty=2,
+                         category_hint="هودی", attributes={"رنگ": "قهوه‌ای", "برش": "گشاد"})
+        other = Product(store_id=sid, title="هودی زیپ‌دار مشکی", price=980000, stock_qty=1, category_hint="هودی")
+        db.add_all([hoodie, other])
+        await db.commit()
+        hid, oid = hoodie.id, other.id
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
+    # the forwarded post names the hoodie: it becomes LAST PRODUCT even before the model says so
+    llm.answers = [{"reply": "این هودی قهوه‌ای کلاهدار ماست 🌸", "intent": "product"}]
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={
+        "text": "هودی کلاهدار به رنگ قهوه‌ای شکلاتی با برش گشاد و آستین بلند. درزهای عمودی"})
+
+    # the model fails once: a true answer about that hoodie, not "a colleague will answer"
+    async def boom(**kw):
+        raise ai.AIError("پاسخ هوش مصنوعی قابل خواندن نبود.", code="ai_bad_json")
+    monkeypatch.setattr(chat_engine.ai, "generate_chat", boom)
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "موجوده؟"})).json()
+    text = r["messages"][-1]["text"]
+    assert "هودی کلاهدار قهوه‌ای" in text and "موجوده" in text and "۱۰۰٬۰۰۰" in text and "همکارم" not in text
+    monkeypatch.setattr(chat_engine.ai, "generate_chat", llm)
+
+    # mixed-language answer: asked again once, then cleaned
+    llm.answers = [{"reply": "unfortunately سایزبندی ثبت نشده確認", "intent": "product"},
+                   {"reply": "سایزبندی ثبت نشده، ولی برشش گشاده 🌸 unfortunately", "intent": "product"}]
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سایزبندیش چیه؟"})).json()
+    assert r["messages"][-1]["text"] == "سایزبندی ثبت نشده، ولی برشش گشاده 🌸"
+    assert "Persian only" in llm.calls[-1]["prompt"]
+
+    # "similar?" brings the other hoodie into PRODUCTS
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "چی دیگه دارین مشابه؟"})
+    prompt = llm.calls[-1]["prompt"]
+    assert f"#{oid} " in prompt and f"LAST PRODUCT: #{hid}" in prompt

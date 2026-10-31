@@ -429,6 +429,31 @@ async def generate_text(
     raise last  # type: ignore[misc]
 
 
+def parse_chat_json(text: str) -> dict[str, Any]:
+    """The model's JSON, tolerating prose around it, and a cut-off answer (max_tokens hit mid-JSON): then the
+    "reply" text alone is kept, so the customer still gets an answer instead of an error."""
+    raw = _strip_fences(text)
+    start, end = raw.find("{"), raw.rfind("}")
+    if start != -1 and end > start:
+        try:
+            result = json.loads(raw[start:end + 1])
+            if isinstance(result, dict):
+                return result
+        except json.JSONDecodeError:
+            pass
+    m = re.search(r'"reply"\s*:\s*"((?:[^"\\]|\\.)*)', raw)
+    if m and m.group(1).strip():
+        try:
+            reply = json.loads(f'"{m.group(1)}"')
+        except json.JSONDecodeError:
+            reply = m.group(1)
+        return {"reply": reply, "intent": "product", "partial": True}
+    raise json.JSONDecodeError("no JSON object", text, 0)
+
+
+CHAT_MAX_TEMPERATURE = 0.4  # sales answers must be steady; higher values drift into other languages
+
+
 async def generate_chat(
     *, system: str, prompt: str, store_id: int | None, max_tokens: int = 400, task: str = "chat",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -442,12 +467,20 @@ async def generate_chat(
         started = time.monotonic()
         meta: dict[str, Any] = {}
         try:
-            text, tin, tout = await _retry_busy(
-                lambda provider=provider, model=model, temp=temp: _call(
-                    provider, model, system, prompt, [], temp, json_mode=True, max_tokens=max_tokens, meta=meta))
-            result = json.loads(_strip_fences(text))
-            if not isinstance(result, dict):
-                raise json.JSONDecodeError("not an object", text, 0)
+            temp = min(temp, CHAT_MAX_TEMPERATURE)
+            tin = tout = 0
+            for attempt in range(2):  # one quiet retry on unreadable output before the next key/model
+                text, t_in, t_out = await _retry_busy(
+                    lambda provider=provider, model=model, temp=temp: _call(
+                        provider, model, system, prompt, [], temp, json_mode=True, max_tokens=max_tokens, meta=meta))
+                tin, tout = tin + t_in, tout + t_out
+                try:
+                    result = parse_chat_json(text)
+                    break
+                except json.JSONDecodeError:
+                    if attempt:
+                        raise
+                    temp = 0.0
             ms = int((time.monotonic() - started) * 1000)
             cached = int(meta.get("cached_tokens") or 0)
             await _log(provider, task, model, store_id, ok=True, is_fallback=is_fallback, latency_ms=ms,
