@@ -265,3 +265,29 @@ async def test_worn_clothing_hides_the_person_before_the_image_model(monkeypatch
                                "General Clothing (Apparel - Flat Lay)\n\n"
                                "Analyze the attached e-commerce image and return exactly one raw English paragraph.")
     assert seen["sent"] == buf.getvalue()
+
+
+async def test_openrouter_key_makes_images(client, monkeypatch):
+    """OpenRouter: chat/completions with image modality, the picture comes back as a data URL."""
+    admin = await login(client, "09120000000")
+    prov = (await client.post("/admin/ai/providers", headers=admin, json={
+        "name": "or", "kind": "openrouter", "api_key": "k-or", "default_model": "google/gemini-2.5-flash"})).json()
+    r = await client.put("/admin/ai/routes/image_edit", headers=admin,
+                         json={"provider_id": prov["id"], "model": "google/gemini-3.1-flash-lite-image"})
+    assert r.status_code == 200, r.text
+    sent = {}
+
+    def handler(req):
+        sent["url"], sent["body"] = str(req.url), req.content
+        return httpx.Response(200, json={"choices": [{"message": {"content": "", "images": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(PNG).decode()}}]}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 7}})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(ai.httpx, "AsyncClient", lambda *a, **kw: real(*a, transport=httpx.MockTransport(handler),
+                                                                      **{k: v for k, v in kw.items() if k != "proxy"}))
+    data, mime = await ai.generate_image(system="s", prompt="p", images=[(PNG, "image/png")])
+    assert data == PNG and mime == "image/png"
+    assert sent["url"] == "https://openrouter.ai/api/v1/chat/completions"
+    assert b'"modalities":["image","text"]' in sent["body"] and b"google/gemini-3.1-flash-lite-image" in sent["body"]
+    assert b"data:image/png;base64," in sent["body"]  # the seller's photo goes along

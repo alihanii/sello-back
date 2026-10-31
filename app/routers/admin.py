@@ -12,7 +12,7 @@ from app.core.db import utcnow
 from app.core.security import decrypt_credentials, encrypt_credentials
 from app.deps import DB, AdminUser
 from app.models import (
-    AI_TASKS, IMAGE_TASKS, AdminAuditLog, AiProvider, AiTaskRoute, AiUsageLog, Channel, ChannelListing, FeatureInterest,
+    AI_TASKS, IMAGE_KINDS, IMAGE_TASKS, AdminAuditLog, AiProvider, AiTaskRoute, AiUsageLog, Channel, ChannelListing, FeatureInterest,
     Operation, Payment, Plan, PlanRequest, Product, Store, Subscription, User,
 )
 from app.services.bank import BANKS
@@ -350,6 +350,9 @@ async def providers(admin: AdminUser, db: DB):
                        "hint": "کلید متیس؛ از داخل ایران بدون پروکسی کار می‌کند.", "model": "gemini-3.6-flash"},
                       {"kind": "openai", "label": "OpenAI یا سرویس سازگار", "base_url": DEFAULT_BASE_URLS["openai"],
                        "hint": "هر سرویس سازگار با OpenAI (مثلاً واسط‌های ایرانی)", "model": "gpt-4.1-mini"},
+                      {"kind": "openrouter", "label": "OpenRouter", "base_url": DEFAULT_BASE_URLS["openrouter"],
+                       "hint": "کلید را از openrouter.ai/keys بگیر. برای ساخت عکس: google/gemini-3.1-flash-lite-image (Nano Banana 2 Lite).",
+                       "model": "google/gemini-2.5-flash"},
                       {"kind": "anthropic", "label": "Claude (Anthropic)", "base_url": DEFAULT_BASE_URLS["anthropic"], "hint": "", "model": "claude-sonnet-5-5"}],
             "tasks": AI_TASKS}
 
@@ -475,8 +478,8 @@ async def set_route(task: str, body: RouteIn, admin: AdminUser, db: DB):
         effective = model.strip() or (p.default_model if p and task not in IMAGE_TASKS else "")
         if problem := check_model(task, effective):
             raise HTTPException(422, f"{label}: {problem}")
-        if task in IMAGE_TASKS and p and p.kind not in ("gemini", "metis"):
-            raise HTTPException(422, f"{label}: تمیز کردن عکس فعلاً فقط با کلید Gemini (مستقیم یا متیس) کار می‌کند.")
+        if task in IMAGE_TASKS and p and p.kind not in IMAGE_KINDS:
+            raise HTTPException(422, f"{label}: ساخت عکس فقط با کلید Gemini (مستقیم یا متیس) یا OpenRouter کار می‌کند.")
     r = (await db.execute(select(AiTaskRoute).where(AiTaskRoute.task == task))).scalar_one_or_none()
     if not r:
         r = AiTaskRoute(task=task)

@@ -2,7 +2,8 @@
 ai_task_routes); every call is written to ai_usage_logs for the monitoring page.
 
 Wire formats: `gemini` (a key straight from Google AI Studio), `metis` (the same Gemini format through
-the MetisAI gateway), `openai` (OpenAI and compatible gateways), `anthropic`. Each key may carry its own
+the MetisAI gateway), `openai` (OpenAI and compatible gateways), `openrouter` (OpenAI format, plus image output),
+`anthropic`. Each key may carry its own
 proxy, stored with the key in the encrypted blob, because Google and OpenAI refuse requests from Iran."""
 
 import asyncio
@@ -17,12 +18,13 @@ from sqlalchemy import select
 
 from app.core.db import SessionLocal, utcnow
 from app.core.security import decrypt_credentials
-from app.models import IMAGE_TASKS, AiProvider, AiTaskRoute, AiUsageLog
+from app.models import IMAGE_KINDS, IMAGE_TASKS, AiProvider, AiTaskRoute, AiUsageLog
 
 DEFAULT_BASE_URLS = {
     "gemini": "https://generativelanguage.googleapis.com",
     "metis": "https://api.metisai.ir",
     "openai": "https://api.openai.com/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
     "anthropic": "https://api.anthropic.com",
 }
 
@@ -117,7 +119,7 @@ async def _call(
             usage = data.get("usageMetadata", {})
             return text, usage.get("promptTokenCount", 0), usage.get("candidatesTokenCount", 0)
 
-        if provider.kind == "openai":
+        if provider.kind in ("openai", "openrouter"):
             content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
             content += [
                 {"type": "image_url", "image_url": {"url": f"data:{m};base64,{base64.b64encode(d).decode()}"}}
@@ -236,7 +238,7 @@ async def _route(task: str) -> list[tuple[AiProvider, str, float, bool]]:
             if p:
                 candidates.append((p, p.default_model, temp, False))
         return [c for c in candidates if not check_model(task, c[1])
-                and (task not in IMAGE_TASKS or c[0].kind in ("gemini", "metis"))]
+                and (task not in IMAGE_TASKS or c[0].kind in IMAGE_KINDS)]
 
 
 async def has_route(task: str) -> bool:
@@ -352,6 +354,22 @@ async def generate_image(
     for provider, model, temp, is_fallback in candidates:
         started = time.monotonic()
         base = (provider.base_url or DEFAULT_BASE_URLS[provider.kind]).rstrip("/")
+        if provider.kind == "openrouter":
+            try:
+                data, mime, tin, tout = await _retry_busy(
+                    lambda provider=provider, model=model, base=base, temp=temp:
+                    _openrouter_image(provider, model, base, system, prompt, images, temp))
+                await _log(provider, task, model, store_id, ok=True, is_fallback=is_fallback,
+                           latency_ms=int((time.monotonic() - started) * 1000), input_tokens=tin, output_tokens=tout)
+                return data, mime
+            except (AIError, httpx.HTTPError) as exc:
+                err = exc if isinstance(exc, AIError) else AIError("ارتباط با سرویس هوش مصنوعی برقرار نشد.",
+                                                                   code="ai_network", detail=str(exc)[:500])
+                await _log(provider, task, model, store_id, ok=False, is_fallback=is_fallback,
+                           latency_ms=int((time.monotonic() - started) * 1000),
+                           error_code=err.code, error_message=f"{err.message_fa} {err.detail or ''}"[:1000])
+                last = err
+                continue
         parts: list[dict[str, Any]] = [{"text": prompt}]
         parts += [{"inlineData": {"mimeType": m, "data": base64.b64encode(d).decode()}} for d, m in images]
         async def post(provider=provider, model=model, base=base, parts=parts, temp=temp):
@@ -388,6 +406,32 @@ async def generate_image(
     raise last  # type: ignore[misc]
 
 
+async def _openrouter_image(provider: AiProvider, model: str, base: str, system: str, prompt: str,
+                            images: list[tuple[bytes, str]], temp: float) -> tuple[bytes, str, int, int]:
+    """OpenRouter image output: chat/completions with modalities, the picture comes back as a data URL."""
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    content += [{"type": "image_url", "image_url": {"url": f"data:{m};base64,{base64.b64encode(d).decode()}"}}
+                for d, m in images]
+    async with httpx.AsyncClient(timeout=180, proxy=provider_proxy(provider) or None) as client:
+        resp = await client.post(f"{base}/chat/completions", headers={"Authorization": f"Bearer {_api_key(provider)}"},
+                                 json={"model": model, "temperature": temp, "modalities": ["image", "text"],
+                                       "image_config": {"aspect_ratio": "1:1"},
+                                       "messages": [{"role": "system", "content": system},
+                                                    {"role": "user", "content": content}]})
+    _raise_for(resp)
+    data = resp.json()
+    msg = (data.get("choices") or [{}])[0].get("message") or {}
+    url = next((i.get("image_url", {}).get("url", "") for i in msg.get("images") or []
+                if i.get("image_url", {}).get("url", "").startswith("data:")), "")
+    if not url:
+        raise AIError("عکس ساخته نشد؛ با یک عکس دیگر دوباره امتحان کن.", code="ai_no_image",
+                      detail=json.dumps(data, ensure_ascii=False)[:500])
+    head, b64 = url.split(",", 1)
+    usage = data.get("usage", {})
+    return (base64.b64decode(b64), head.removeprefix("data:").split(";")[0] or "image/png",
+            usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+
+
 async def list_models(provider: AiProvider) -> list[str]:
     """Model ids the key can use for text generation, newest first as the provider lists them."""
     key = _api_key(provider)
@@ -399,7 +443,7 @@ async def list_models(provider: AiProvider) -> list[str]:
             return [m["name"].removeprefix("models/") for m in resp.json().get("models", [])
                     if "generateContent" in m.get("supportedGenerationMethods", [])
                     and model_kind(m["name"].removeprefix("models/"))[0] != "unsupported"]
-        if provider.kind == "openai":
+        if provider.kind in ("openai", "openrouter"):
             resp = await client.get(f"{base}/models", headers={"Authorization": f"Bearer {key}"})
             _raise_for(resp)
             return sorted((m["id"] for m in resp.json().get("data", [])), reverse=True)

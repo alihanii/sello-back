@@ -398,6 +398,8 @@ AI_TASKS: dict[str, str] = {
 }
 # Tasks that need a model which returns an image; every other task needs a text (JSON) model.
 IMAGE_TASKS = {"image_edit"}
+# Key types whose models can return a picture.
+IMAGE_KINDS = ("gemini", "metis", "openrouter")
 
 
 class AiTaskRoute(TimestampMixin, Base):
