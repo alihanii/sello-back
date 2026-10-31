@@ -15,7 +15,7 @@ from app.platforms.digikala import digikala
 from app.platforms.instagram import authorize_url
 from app.platforms.registry import PLATFORM_INFO
 from app.schemas import ChannelOut, OperationOut
-from app.services.integrations import instagram_app
+from app.services.integrations import instagram_app, instagram_crawler
 from app.services.ops import OpContext, enqueue, fail_operation
 from app.services.plans import check_limit
 
@@ -24,12 +24,19 @@ router = APIRouter(tags=["channels"])
 
 @router.get("/platforms")
 async def platforms(db: DB):
+    """Instagram opens for publishing when the admin's Meta app is on, and for crawl only
+    (publish off) when just the admin's crawl key is set."""
     ig = await instagram_app(db)
+    crawl_ready = bool((await instagram_crawler(db))["token"])
     out = []
     for k, v in PLATFORM_INFO.items():
         row = {"platform": k, **v, "enabled": not v.get("flag") or ig["enabled"]}
         if k == "instagram":
             row["oauth"] = ig["oauth_ready"]
+            row["publish_ready"] = ig["enabled"]
+            row["crawl_ready"] = crawl_ready
+            row["crawl_only"] = crawl_ready and not ig["enabled"]
+            row["enabled"] = ig["enabled"] or crawl_ready
         out.append(row)
     return out
 

@@ -39,6 +39,8 @@ async def test_instagram_page_crawl(client, monkeypatch):
     # locked until the admin sets the crawl key
     caps = (await client.get("/crawl/capabilities", headers=h)).json()["instagram_profile"]
     assert caps["available"] is False and "ادمین" in caps["reason"]
+    igp = next(p for p in (await client.get("/platforms", headers=h)).json() if p["platform"] == "instagram")
+    assert igp["enabled"] is False and igp["crawl_only"] is False
     r = await client.post(f"/stores/{sid}/crawl-sources", headers=h, json={"type": "instagram_profile", "url": "@shoe.shop"})
     assert r.status_code == 422 and "ادمین" in r.json()["detail"]["message"]
 
@@ -46,6 +48,8 @@ async def test_instagram_page_crawl(client, monkeypatch):
                             json={"provider": "apify", "token": "apify_api_test_1234"})).json()
     assert cfg["has_token"] and "token" not in cfg and cfg["token_hint"] == "…1234"
     assert (await client.get("/crawl/capabilities", headers=h)).json()["instagram_profile"]["available"] is True
+    igp = next(p for p in (await client.get("/platforms", headers=h)).json() if p["platform"] == "instagram")
+    assert igp["enabled"] and igp["crawl_only"] and igp["crawl_ready"] and not igp["publish_ready"]
 
     r = await client.post(f"/stores/{sid}/crawl-sources", headers=h, json={"type": "instagram_profile", "url": "bad name"})
     assert r.status_code == 422
