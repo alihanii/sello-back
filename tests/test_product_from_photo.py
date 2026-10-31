@@ -271,7 +271,7 @@ async def test_openrouter_key_makes_images(client, monkeypatch):
     """OpenRouter: chat/completions with image modality, the picture comes back as a data URL."""
     admin = await login(client, "09120000000")
     prov = (await client.post("/admin/ai/providers", headers=admin, json={
-        "name": "or", "kind": "openrouter", "api_key": "k-or", "default_model": "google/gemini-2.5-flash"})).json()
+        "name": "or", "kind": "openrouter", "api_key": "k-or", "default_model": "google/gemini-3.6-flash"})).json()
     r = await client.put("/admin/ai/routes/image_edit", headers=admin,
                          json={"provider_id": prov["id"], "model": "google/gemini-3.1-flash-lite-image"})
     assert r.status_code == 200, r.text

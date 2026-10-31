@@ -192,8 +192,9 @@ def _raise_for(resp: httpx.Response) -> None:
     if "api_key_invalid" in low or "api key not valid" in low or "incorrect api key" in low:
         raise AIError("کلید API نامعتبر است؛ کلید را دوباره کپی کنید یا یک کلید تازه بسازید.", code="ai_bad_key",
                       detail=resp.text[:500])
-    if resp.status_code == 404 and ("model" in low or "not found" in low or "no longer available" in low):
-        raise AIError("این مدل برای کلید شما در دسترس نیست؛ در ویرایش کلید، مدل پیش‌فرض را عوض کنید (مثلاً gemini-3.6-flash).",
+    if resp.status_code == 404 and ("model" in low or "not found" in low or "no longer available" in low
+                                    or "no endpoints" in low):
+        raise AIError("این مدل برای کلید شما در دسترس نیست؛ در ویرایش کلید، مدل پیش‌فرض را عوض کنید (مثلاً gemini-3.6-flash، یا در OpenRouter: google/gemini-3.6-flash).",
                       code="ai_bad_model", detail=resp.text[:500])
     if resp.status_code in (401, 403):
         raise AIError("کلید API نامعتبر است یا دسترسی ندارد.", code=f"ai_http_{resp.status_code}", detail=resp.text[:500])

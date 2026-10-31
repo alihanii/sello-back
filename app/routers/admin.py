@@ -352,7 +352,7 @@ async def providers(admin: AdminUser, db: DB):
                        "hint": "هر سرویس سازگار با OpenAI (مثلاً واسط‌های ایرانی)", "model": "gpt-4.1-mini"},
                       {"kind": "openrouter", "label": "OpenRouter", "base_url": DEFAULT_BASE_URLS["openrouter"],
                        "hint": "کلید را از openrouter.ai/keys بگیر. برای ساخت عکس: google/gemini-3.1-flash-lite-image (Nano Banana 2 Lite).",
-                       "model": "google/gemini-2.5-flash"},
+                       "model": "google/gemini-3.6-flash"},
                       {"kind": "anthropic", "label": "Claude (Anthropic)", "base_url": DEFAULT_BASE_URLS["anthropic"], "hint": "", "model": "claude-sonnet-5-5"}],
             "tasks": AI_TASKS}
 
