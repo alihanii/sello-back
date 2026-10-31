@@ -41,6 +41,8 @@ async def test_instagram_page_crawl(client, monkeypatch):
     assert caps["available"] is False and "ادمین" in caps["reason"]
     igp = next(p for p in (await client.get("/platforms", headers=h)).json() if p["platform"] == "instagram")
     assert igp["enabled"] is False and igp["crawl_only"] is False
+    r = await client.post(f"/stores/{sid}/crawl-sources", headers=h, json={"type": "url", "url": "https://example.com/p/1"})
+    assert r.status_code == 422  # crawl by link was removed
     r = await client.post(f"/stores/{sid}/crawl-sources", headers=h, json={"type": "instagram_profile", "url": "@shoe.shop"})
     assert r.status_code == 422 and "ادمین" in r.json()["detail"]["message"]
 

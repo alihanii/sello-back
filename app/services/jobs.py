@@ -1,11 +1,8 @@
 """Operation handlers the worker runs: connect, health_check, publish, crawl, ai_product."""
 
 import json
-import re
 from typing import Any
 
-import httpx
-from bs4 import BeautifulSoup
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
@@ -227,20 +224,14 @@ async def run_crawl(ctx: OpContext) -> None:
     if source.type == "instagram_profile":
         await _crawl_instagram(ctx, source, store)
         return
-    if source.type == "url":
-        async with ctx.step("fetch_url", "دریافت صفحه", request={"url": source.url}) as s:
-            page = await fetch_product_page(source.url)
-            s.response = {k: v for k, v in page.items() if k != "text"}
-        items = [CrawledItem(external_id=source.url, title=page.get("title", ""), description=page.get("description", ""),
-                             price=page.get("price", 0), brand=page.get("brand", ""), image_urls=page.get("images", [])[:5],
-                             url=source.url, caption="" if page.get("title") else page.get("text", "")[:3000])]
-    else:
-        if not channel or channel.status != "connected":
-            raise PlatformError("کانال منبع کرال وصل نیست.", "channel_disconnected", {"type": "reconnect", "label": "اتصال مجدد"})
-        items = await get_adapter(channel.platform).fetch_items(ctx, channel)
+    if source.type == "url":  # removed source type; old rows may still exist
+        raise PlatformError("کرال با لینک حذف شده است.", "source_removed")
+    if not channel or channel.status != "connected":
+        raise PlatformError("کانال منبع کرال وصل نیست.", "channel_disconnected", {"type": "reconnect", "label": "اتصال مجدد"})
+    items = await get_adapter(channel.platform).fetch_items(ctx, channel)
     counts = await ingest_items(ctx, store=store, items=items, mode=source.extraction_mode, channel=channel,
                                 source_key={"key": f"src:{source.id}", "source_id": source.id,
-                                            "platform": channel.platform if channel else "url"},
+                                            "platform": channel.platform},
                                 source_id=source.id, to_inbox=(store.settings or {}).get("crawl_to_inbox", False))
     source.last_run_at = utcnow()
     op.result = counts
@@ -301,50 +292,6 @@ async def _crawl_instagram(ctx: OpContext, source: CrawlSource, store: Store) ->
     if counts["failed"] and counts["failed"] < len(fresh):
         op.status = "partial"
         op.error_message_fa = f"{counts['failed']} پست از {len(fresh)} پست جدید استخراج نشد."
-
-
-# ---------- link fetching (url crawl) ----------
-
-async def fetch_product_page(url: str) -> dict[str, Any]:
-    """JSON-LD Product first, then OpenGraph/meta, then visible text for the LLM."""
-    try:
-        async with httpx.AsyncClient(timeout=25, follow_redirects=True,
-                                     headers={"User-Agent": "Mozilla/5.0 SelloBot/1.0", "Accept-Language": "fa,en"}) as c:
-            resp = await c.get(url)
-            resp.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise PlatformError("صفحهٔ لینک در دسترس نبود.", "url_unreachable", detail=str(exc)) from exc
-    soup = BeautifulSoup(resp.text, "html.parser")
-    out: dict[str, Any] = {"url": url, "method": "html"}
-    for tag in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(tag.string or "")
-        except (json.JSONDecodeError, TypeError):
-            continue
-        nodes = data if isinstance(data, list) else data.get("@graph", [data]) if isinstance(data, dict) else []
-        for node in nodes:
-            if isinstance(node, dict) and "Product" in str(node.get("@type")):
-                offers = node.get("offers") or {}
-                offers = offers[0] if isinstance(offers, list) and offers else offers
-                imgs = node.get("image") or []
-                out.update({
-                    "method": "json-ld", "title": node.get("name", ""), "description": node.get("description", ""),
-                    "brand": (node.get("brand") or {}).get("name", "") if isinstance(node.get("brand"), dict) else str(node.get("brand") or ""),
-                    "price": parse_number(str(offers.get("price", 0))) if isinstance(offers, dict) else 0,
-                    "images": imgs if isinstance(imgs, list) else [imgs],
-                    "attributes": {p.get("name"): p.get("value") for p in node.get("additionalProperty", []) if isinstance(p, dict)},
-                })
-                break
-    def meta(prop: str) -> str:
-        t = soup.find("meta", property=prop) or soup.find("meta", attrs={"name": prop})
-        return (t.get("content") or "").strip() if t else ""
-    out.setdefault("title", meta("og:title") or (soup.title.string.strip() if soup.title and soup.title.string else ""))
-    out.setdefault("description", meta("og:description") or meta("description"))
-    out.setdefault("images", [meta("og:image")] if meta("og:image") else [])
-    for t in soup(["script", "style", "noscript"]):
-        t.decompose()
-    out["text"] = re.sub(r"\s+", " ", soup.get_text(" "))[:6000]
-    return out
 
 
 # ---------- AI: product from the seller's photos and description ----------

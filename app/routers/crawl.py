@@ -19,7 +19,7 @@ SCHEDULES = {"manual", "hourly", "daily", "weekly"}
 
 class SourceIn(BaseModel):
     name: str = ""
-    type: str  # channel_posts | marketplace_listing | url | instagram_profile
+    type: str  # channel_posts | marketplace_listing | instagram_profile (added from the Channels page)
     channel_id: int | None = None
     url: str = ""
     schedule: str = "manual"
@@ -51,7 +51,8 @@ async def capabilities(user: CurrentUser, db: DB):
 @router.get("/stores/{store_id}/crawl-sources")
 async def list_sources(store_id: int, user: CurrentUser, db: DB):
     await get_store_for(db, user, store_id)
-    rows = (await db.execute(select(CrawlSource).where(CrawlSource.store_id == store_id).order_by(CrawlSource.id))).scalars()
+    rows = (await db.execute(select(CrawlSource).where(CrawlSource.store_id == store_id, CrawlSource.type != "url")
+                             .order_by(CrawlSource.id))).scalars()
     return [_out(s) for s in rows]
 
 
@@ -67,10 +68,6 @@ async def create_source(store_id: int, body: SourceIn, user: CurrentUser, db: DB
         if body.type == "channel_posts" and ch.platform == "instagram":
             raise HTTPException(422, "برای کرال اینستاگرام، منبع «پیج اینستاگرام» را با آیدی پیج بساز.")
         name = body.name or f"{ch.display_name or ch.platform}"
-    elif body.type == "url":
-        if not body.url.startswith(("http://", "https://")):
-            raise HTTPException(422, "لینک معتبر وارد کنید.")
-        name = body.name or body.url[:80]
     elif body.type == "instagram_profile":
         if not await _instagram_ready(db):
             raise HTTPException(422, IG_LOCKED)

@@ -82,7 +82,7 @@ async def _sync_failure(db, op: Operation) -> None:
 async def _scheduler_tick() -> None:
     async with SessionLocal() as db:
         now = utcnow()
-        sources = (await db.execute(select(CrawlSource).where(CrawlSource.is_active, CrawlSource.schedule != "manual"))).scalars()
+        sources = (await db.execute(select(CrawlSource).where(CrawlSource.is_active, CrawlSource.schedule != "manual", CrawlSource.type != "url"))).scalars()
         for src in sources:
             due = src.next_run_at is None or src.next_run_at.replace(tzinfo=now.tzinfo) <= now
             if not due:
