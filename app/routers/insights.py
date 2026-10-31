@@ -7,7 +7,7 @@ from sqlalchemy import func, select
 
 from app.core.db import utcnow
 from app.deps import DB, CurrentUser, get_store_for
-from app.models import ActivityEvent, Channel, ChannelListing, CrawlSource, Operation, Plan, Product
+from app.models import ActivityEvent, AiOrder, Channel, ChatConversation, ChannelListing, CrawlSource, Operation, Plan, Product
 from app.schemas import OperationOut
 from app.services.ai import ai_available, route_problem
 from app.services.plans import active_subscription, limits_for
@@ -106,6 +106,14 @@ async def dashboard(store_id: int, user: CurrentUser, db: DB):
         Product.store_id == store_id, Product.status == "draft"))
     if drafts:
         attention.append({"type": "inbox", "text": f"{drafts} پیش‌نویس (کرال یا AI) منتظر بررسی"})
+    receipts = await db.scalar(select(func.count()).select_from(AiOrder).where(
+        AiOrder.store_id == store_id, ~AiOrder.is_test, AiOrder.status == "payment_submitted"))
+    if receipts:
+        attention.append({"type": "ai_orders", "text": f"{receipts} سفارش چت با فیش پرداخت منتظر تأیید"})
+    needs_human = await db.scalar(select(func.count()).select_from(ChatConversation).where(
+        ChatConversation.store_id == store_id, ~ChatConversation.is_test, ChatConversation.status == "needs_human"))
+    if needs_human:
+        attention.append({"type": "chat", "text": f"{needs_human} گفتگوی چت منتظر جواب ادمین"})
     month_start = datetime.combine(today.replace(day=1), time.min, tzinfo=timezone.utc)
     publishes_month = await db.scalar(select(func.count()).select_from(Operation).where(
         Operation.store_id == store_id, Operation.type == "publish", Operation.status == "succeeded",
