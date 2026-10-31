@@ -124,7 +124,8 @@ async def _extract(items: list[CrawledItem], mode: str, store_id: int) -> tuple[
                 batch = pending[i:i + 20]
                 try:
                     res = await ai.generate_json(
-                        task="caption_extract", system=ai.CAPTION_EXTRACT_SYSTEM, store_id=store_id,
+                        task="caption_extract", store_id=store_id,
+                        system=ai.CAPTION_EXTRACT_FULL_SYSTEM if mode == "llm" else ai.CAPTION_EXTRACT_SYSTEM,
                         prompt=json.dumps({"posts": [{"message_id": b.external_id, "caption": b.caption} for b in batch]},
                                           ensure_ascii=False))
                 except ai.AIError as exc:
@@ -139,6 +140,8 @@ async def _extract(items: list[CrawledItem], mode: str, store_id: int) -> tuple[
                             "price": parse_number(str(row.get("price", 0))) or out[mid]["price"],
                             "quantity": parse_number(str(row.get("quantity", 0))) or out[mid]["quantity"],
                             "attributes": row.get("attributes") or {}, "method": "llm"})
+                        if mode == "llm" and row.get("category_hint"):
+                            out[mid]["category_hint"] = normalize_fa(str(row["category_hint"]))[:200]
     return out, notes
 
 

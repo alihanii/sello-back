@@ -628,6 +628,15 @@ Respond ONLY with JSON: {"posts":[{"message_id":"<copy>","title":"<short title>"
 Rules: one object per input post, preserve message_id; numbers are integers; parse Persian digits;
 do NOT invent data that is not in the caption."""
 
+# "AI only" crawl mode: the same fields plus the product category and a fuller set of details, like AI product creation.
+CAPTION_EXTRACT_FULL_SYSTEM = """You extract structured product fields from social post captions (usually Persian).
+Respond ONLY with JSON: {"posts":[{"message_id":"<copy>","title":"<short title>","description":"<text without price/stock lines>","price":<int Toman, 0 if missing>,"quantity":<int, 0 if missing>,"category_hint":"<Persian product type, e.g. ماگ سرامیکی, هودی, کیف دوشی>","attributes":{"<Persian name>":"<value>"}}]}
+Rules: one object per input post, preserve message_id; numbers are integers; parse Persian digits:
+«۴ میلیون تومان» = 4000000, «۲۵۰ هزار» = 250000, «۲۰ تا» = 20.
+category_hint: what the product IS, in a few Persian words, from the caption; empty if the caption doesn't say.
+attributes: every concrete detail the caption states (جنس, رنگ, سایز, ابعاد, وزن, مدل, کشور سازنده, گارانتی …), one key per detail,
+several values joined with «، ». Only what the caption says: do NOT invent data that is not in the caption."""
+
 PRODUCT_FROM_PHOTO_SYSTEM = """You are the product copywriter of an Iranian online shop. Write in Persian.
 You get: optional product photos and an optional short note from the seller.
 Build ONE product for THIS shop.
