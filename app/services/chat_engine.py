@@ -291,7 +291,8 @@ size, height and weight). Missing details are never a reason to hand off. If a p
 and offer a similar one from PRODUCTS.
 
 FIND. "Similar", "what else", "other models/colours" = look at PRODUCTS for items of the same type/category as
-LAST PRODUCT and name 1-3 of them with price. If none, say this model is the only one right now.
+LAST PRODUCT, closest in price first, and name 1-3 of them with price. If none, say this model is the only one
+right now.
 
 CLARIFY. Work out which product and option the customer means, using RECENT CHAT and LAST PRODUCT ("this",
 "همین", "اون هودی" = LAST PRODUCT). If still unclear (several products fit, the message is vague, or they want to
@@ -725,7 +726,8 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         reply.text, reply.source = NO_ANSWER_TEXT, "canned"
         result.replies.append(reply)
 
-    result.replies += await product_photos(db, [p for p in products if photos.get(p.id)], out.get("images"), text)
+    if _PHOTO_ASK.search(text):  # photos only when the customer asked (or said yes to "send the photo?")
+        result.replies += await product_photos(db, [p for p in products if photos.get(p.id)], out.get("images"), text)
 
     for rid in (out.get("refs") or [])[:2]:
         ref = next((r for r in refs if str(r.id) == str(rid)), None)
@@ -753,6 +755,7 @@ def hide_stock_counts(text: str) -> str:
 
 _MORE_PHOTOS = re.compile(r"(عکس|تصویر)\S*\s*(های|‌های)?\s*(بیشتر|دیگه|دیگر|بقیه)|همه\s*(ی\s*)?(عکس|تصویر)")
 MAX_PHOTOS = 3
+_PHOTO_ASK = re.compile(r"(عکس|تصویر|ببینم|ببینمش|نشون|نشان\s*بده|بفرست|photo|pic|^(آره|اره|بله|باشه|اوکی|حتما|حتماً)\b)", re.I)
 
 
 async def product_photos(db: AsyncSession, products: list[Product], ids: Any, text: str) -> list[Reply]:

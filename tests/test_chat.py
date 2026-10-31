@@ -485,6 +485,10 @@ async def test_photos_variants_and_clarify(client, monkeypatch):
     r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "عکس‌های بیشتر"})).json()
     assert len([m for m in r["messages"][-4:] if m["image_url"]]) == 3
     assert f"LAST PRODUCT: #{hid}" in llm.calls[-1]["prompt"]
+    # the model offers a photo but the customer did not ask: no photo yet
+    llm.answers = [{"reply": "بله موجوده، عکسش رو بفرستم؟", "intent": "product", "images": [hid]}]
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "موجوده؟"})).json()
+    assert not r["messages"][-1]["image_url"]
     # an id the model made up gets no photo
     llm.answers = [{"reply": "بفرما", "intent": "product", "images": [99999]}]
     r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "عکسشو ببینم"})).json()
