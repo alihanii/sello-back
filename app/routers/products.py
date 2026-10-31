@@ -1,19 +1,21 @@
 import csv
 import io
 
+import httpx
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import selectinload
 
 from app.deps import DB, CurrentUser, get_store_for
-from app.models import Channel, ChannelListing, Operation, Product, ProductImage
+from app.models import Channel, ChannelListing, Operation, Product, ProductImage, Store
 from app.schemas import OperationOut, ProductIn, ProductOut, ProductPatch
 from app.services.ops import queue_publish
 from app.services.media import ALLOWED, save_bytes
 from app.services.ops import record_event
-from app.services.plans import check_limit
+from app.services import product_import
+from app.services.plans import check_limit, limits_for
 
 router = APIRouter(tags=["products"])
 
@@ -202,3 +204,122 @@ async def export_csv(store_id: int, user: CurrentUser, db: DB):
         w.writerow([p.id, p.sku, p.title, p.price, p.stock_qty, p.source, p.status, " ".join(p.tags or [])])
     return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv",
                              headers={"Content-Disposition": f"attachment; filename=products-{store_id}.csv"})
+
+
+# ---------- import from Excel / CSV ----------
+
+@router.get("/stores/{store_id}/products/import-template")
+async def import_template(store_id: int, user: CurrentUser, db: DB, format: str = "xlsx"):
+    await get_store_for(db, user, store_id)
+    if format == "csv":
+        return Response(product_import.template_csv(), media_type="text/csv",
+                        headers={"Content-Disposition": "attachment; filename=sello-products-template.csv"})
+    return Response(product_import.template_xlsx(),
+                    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": "attachment; filename=sello-products-template.xlsx"})
+
+
+async def _skus(db, store_id: int) -> dict[str, int]:
+    rows = await db.execute(select(Product.sku, Product.id).where(Product.store_id == store_id, Product.sku != "",
+                                                                  Product.status != "archived"))
+    return {sku: pid for sku, pid in rows}
+
+
+@router.post("/stores/{store_id}/products/import/preview")
+async def import_preview(store_id: int, user: CurrentUser, db: DB, file: UploadFile = File(...)):
+    """Reads the file and checks every row; nothing is saved yet."""
+    await get_store_for(db, user, store_id)
+    try:
+        columns, raw_rows = product_import.read_rows(file.filename or "", await file.read())
+    except product_import.ImportError_ as exc:
+        raise HTTPException(422, str(exc))
+    known = await _skus(db, store_id)
+    seen: set[str] = set()
+    rows = []
+    for raw in raw_rows:
+        data, errors = product_import.clean_row(raw)
+        sku = data.get("sku", "")
+        if sku and sku in seen:
+            errors.append("کد کالا در این فایل تکراری است.")
+        seen.add(sku) if sku else None
+        rows.append({"row": raw["row"], "data": data, "errors": errors,
+                     "action": "update" if sku and sku in known else "create"})
+    ok = [r for r in rows if not r["errors"]]
+    return {"columns": columns, "rows": rows, "total": len(rows), "valid": len(ok),
+            "create": sum(r["action"] == "create" for r in ok), "update": sum(r["action"] == "update" for r in ok)}
+
+
+class ImportItem(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    price: int | None = Field(None, ge=0)
+    compare_at_price: int | None = Field(None, ge=0)
+    stock_qty: int | None = Field(None, ge=0)
+    sku: str = ""
+    brand: str | None = None
+    category_hint: str | None = None
+    description: str | None = None
+    tags: list[str] | None = None
+    images: list[str] = []
+
+
+class ImportIn(BaseModel):
+    items: list[ImportItem] = Field(max_length=product_import.MAX_ROWS)
+
+
+async def _fetch_image(client: httpx.AsyncClient, store_id: int, url: str) -> str | None:
+    try:
+        resp = await client.get(url)
+        ctype = resp.headers.get("content-type", "").split(";")[0]
+        if resp.status_code != 200 or not ctype.startswith("image/") or len(resp.content) > 8 * 1024 * 1024:
+            return None
+        return save_bytes(store_id, resp.content, content_type=ctype)
+    except httpx.HTTPError:
+        return None
+
+
+@router.post("/stores/{store_id}/products/import")
+async def import_products(store_id: int, body: ImportIn, user: CurrentUser, db: DB):
+    """Saves the rows checked in the preview: a known SKU updates that product, anything else is a new product."""
+    await get_store_for(db, user, store_id)
+    known = await _skus(db, store_id)
+    new_count = sum(1 for it in body.items if not (it.sku and it.sku in known))
+    limits = await limits_for(db, user)
+    used = await db.scalar(select(func.count()).select_from(Product).join(Store).where(
+        Store.owner_id == user.id, Product.status != "archived"))
+    if used + new_count > limits["max_products"]:
+        raise HTTPException(402, {"message": f"با این فایل از سقف محصول پلن ({limits['max_products']}) رد می‌شوی؛ "
+                                             f"فقط {max(0, limits['max_products'] - used)} محصول جدید دیگر جا دارد.",
+                                  "action": {"type": "upgrade", "label": "ارتقای پلن"}})
+    created = updated = 0
+    image_failed = 0
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0 SelloBot/1.0"}) as client:
+        for it in body.items:
+            fields = it.model_dump(exclude={"images"}, exclude_none=True)
+            pid = known.get(it.sku) if it.sku else None
+            if pid:
+                p = await db.get(Product, pid)
+                for k, v in fields.items():
+                    setattr(p, k, v)
+                for l in (await db.execute(select(ChannelListing).where(ChannelListing.product_id == pid))).scalars():
+                    if l.status == "published":
+                        l.status = "out_of_sync"
+                updated += 1
+            else:
+                p = Product(store_id=store_id, source="manual", created_by="import", status="ready", **fields)
+                db.add(p)
+                await db.flush()
+                if it.sku:
+                    known[it.sku] = p.id
+                created += 1
+            if it.images:
+                start = await db.scalar(select(func.count()).select_from(ProductImage).where(ProductImage.product_id == p.id))
+                for i, url in enumerate(it.images[:5]):
+                    local = await _fetch_image(client, store_id, url)
+                    if local:
+                        db.add(ProductImage(product_id=p.id, url=local, position=start + i, origin_url=url))
+                    else:
+                        image_failed += 1
+    if created:
+        await record_event(db, store_id, "product_created", created)
+    await db.commit()
+    return {"created": created, "updated": updated, "image_failed": image_failed}
