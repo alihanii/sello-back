@@ -1,8 +1,8 @@
 """LLM layer. Keys, models and per-task routing come from the admin panel (ai_providers,
 ai_task_routes); every call is written to ai_usage_logs for the monitoring page.
 
-Wire formats: `gemini` (a key straight from Google AI Studio), `metis` (the same Gemini format through
-the MetisAI gateway), `openai` (OpenAI and compatible gateways), `openrouter` (OpenAI format, plus image output),
+Wire formats: `gemini` (a key straight from Google AI Studio), `metis` (one MetisAI key for every model it
+sells: Gemini models go out in the Gemini format, Claude through /anthropic, the rest through /openai/v1), `openai` (OpenAI and compatible gateways), `openrouter` (OpenAI format, plus image output),
 `anthropic`. Each key may carry its own
 proxy, stored with the key in the encrypted blob, because Google and OpenAI refuse requests from Iran."""
 
@@ -90,6 +90,30 @@ def _base(provider: AiProvider) -> str:
     return base
 
 
+_METIS_SUFFIXES = ("/openai/v1", "/anthropic/v1", "/anthropic", "/v1beta")
+
+
+def metis_family(model: str) -> str:
+    """Which MetisAI path serves a model: 'gemini', 'anthropic' or 'openai'."""
+    m = (model or "").lower().removeprefix("models/")
+    if m.startswith(("gemini", "gemma", "nano-banana", "learnlm")):
+        return "gemini"
+    if m.startswith("claude"):
+        return "anthropic"
+    return "openai"
+
+
+def _wire(provider: AiProvider, model: str) -> tuple[str, str]:
+    """(wire format, base URL) for one call. Metis picks the format from the model family."""
+    if provider.kind != "metis":
+        return provider.kind, _base(provider)
+    root = _base(provider)
+    for suffix in _METIS_SUFFIXES:
+        root = root.removesuffix(suffix)
+    family = metis_family(model)
+    return family, {"gemini": root, "anthropic": f"{root}/anthropic", "openai": f"{root}/openai/v1"}[family]
+
+
 def provider_proxy(provider: AiProvider) -> str:
     return decrypt_credentials(provider.api_key_encrypted).get("proxy", "")
 
@@ -100,9 +124,9 @@ async def _call(
 ) -> tuple[str, int, int]:
     """Returns (text, input_tokens, output_tokens)."""
     key = _api_key(provider)
-    base = _base(provider)
+    kind, base = _wire(provider, model)
     async with httpx.AsyncClient(timeout=120, proxy=provider_proxy(provider) or None) as client:
-        if provider.kind in ("gemini", "metis"):
+        if kind == "gemini":
             parts: list[dict[str, Any]] = [{"text": prompt}]
             parts += [{"inlineData": {"mimeType": m, "data": base64.b64encode(d).decode()}} for d, m in images]
             resp = await client.post(
@@ -126,8 +150,8 @@ async def _call(
             usage = data.get("usageMetadata", {})
             return text, usage.get("promptTokenCount", 0), usage.get("candidatesTokenCount", 0)
 
-        if provider.kind in ("openai", "openrouter"):
-            text = prompt + ("\n\nRespond with JSON only." if json_mode and provider.kind == "openrouter" else "")
+        if kind in ("openai", "openrouter"):
+            text = prompt + ("\n\nRespond with JSON only." if json_mode and kind == "openrouter" else "")
             content: list[dict[str, Any]] = [{"type": "text", "text": text}]
             content += [
                 {"type": "image_url", "image_url": {"url": f"data:{m};base64,{base64.b64encode(d).decode()}"}}
@@ -140,9 +164,9 @@ async def _call(
                     "model": model,
                     "temperature": temperature,
                     # Without a cap OpenRouter reserves the model's whole output (65536) and answers 402 on a small balance.
-                    **({"max_tokens": 8192} if provider.kind == "openrouter" else {}),
+                    **({"max_tokens": 8192} if kind == "openrouter" else {}),
                     # OpenRouter drops every provider that lacks response_format (404); the prompt asks for JSON there.
-                    **({"response_format": {"type": "json_object"}} if json_mode and provider.kind == "openai" else {}),
+                    **({"response_format": {"type": "json_object"}} if json_mode and kind == "openai" else {}),
                     "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}],
                 },
             )
@@ -155,7 +179,7 @@ async def _call(
                 usage.get("completion_tokens", 0),
             )
 
-        if provider.kind == "anthropic":
+        if kind == "anthropic":
             content = [
                 {"type": "image", "source": {"type": "base64", "media_type": m, "data": base64.b64encode(d).decode()}}
                 for d, m in images
@@ -388,7 +412,7 @@ async def generate_image(
     last: AIError | None = None
     for provider, model, temp, is_fallback in candidates:
         started = time.monotonic()
-        base = _base(provider)
+        base = _wire(provider, model)[1]
         if provider.kind == "openrouter":
             try:
                 data, mime, tin, tout = await _retry_busy(
@@ -468,25 +492,46 @@ async def _openrouter_image(provider: AiProvider, model: str, base: str, system:
 
 
 async def list_models(provider: AiProvider) -> list[str]:
-    """Model ids the key can use for text generation, newest first as the provider lists them."""
+    """Model ids the key can use, newest first as the provider lists them. A Metis key lists every family it sells."""
     key = _api_key(provider)
-    base = _base(provider)
     async with httpx.AsyncClient(timeout=30, proxy=provider_proxy(provider) or None) as client:
-        if provider.kind in ("gemini", "metis"):
-            resp = await client.get(f"{base}/v1beta/models", params={"pageSize": 200}, headers={"x-goog-api-key": key})
-            _raise_for(resp)
-            return [m["name"].removeprefix("models/") for m in resp.json().get("models", [])
-                    if "generateContent" in m.get("supportedGenerationMethods", [])
-                    and model_kind(m["name"].removeprefix("models/"))[0] != "unsupported"]
-        if provider.kind in ("openai", "openrouter"):
-            resp = await client.get(f"{base}/models", headers={"Authorization": f"Bearer {key}"})
-            _raise_for(resp)
-            return sorted((m["id"] for m in resp.json().get("data", [])), reverse=True)
-        if provider.kind == "anthropic":
-            resp = await client.get(f"{base}/v1/models", headers={"x-api-key": key, "anthropic-version": "2023-06-01"})
-            _raise_for(resp)
-            return [m["id"] for m in resp.json().get("data", [])]
-    return []
+        async def fetch(kind: str, base: str) -> list[str]:
+            if kind == "gemini":
+                resp = await client.get(f"{base}/v1beta/models", params={"pageSize": 200}, headers={"x-goog-api-key": key})
+                _raise_for(resp)
+                return [m["name"].removeprefix("models/") for m in resp.json().get("models", [])
+                        if "generateContent" in m.get("supportedGenerationMethods", [])
+                        and model_kind(m["name"].removeprefix("models/"))[0] != "unsupported"]
+            if kind in ("openai", "openrouter"):
+                resp = await client.get(f"{base}/models", headers={"Authorization": f"Bearer {key}"})
+                _raise_for(resp)
+                ids = sorted((m["id"] for m in resp.json().get("data", [])), reverse=True)
+                return [i for i in ids if not _not_chat(i)] if provider.kind == "metis" else ids
+            if kind == "anthropic":
+                resp = await client.get(f"{base}/v1/models", headers={"x-api-key": key, "anthropic-version": "2023-06-01"})
+                _raise_for(resp)
+                return [m["id"] for m in resp.json().get("data", [])]
+            return []
+
+        if provider.kind != "metis":
+            return await fetch(provider.kind, _base(provider))
+        probes = {"gemini": "gemini", "anthropic": "claude", "openai": "gpt"}
+        results = await asyncio.gather(*(fetch(fam, _wire(provider, sample)[1]) for fam, sample in probes.items()),
+                                       return_exceptions=True)
+        ok = [r for r in results if isinstance(r, list)]
+        if not ok:
+            raise next(r for r in results if isinstance(r, BaseException))
+        return [m for r in ok for m in r]
+
+
+# OpenAI lists speech, realtime, embedding, moderation and legacy completion models too; none answer chat JSON.
+_NOT_CHAT = ("tts", "whisper", "transcribe", "realtime", "audio", "embedding", "moderation", "dall-e", "gpt-image",
+             "babbage", "davinci", "search", "computer-use", "codex", "sora", "instruct")
+
+
+def _not_chat(model: str) -> bool:
+    m = model.lower()
+    return any(x in m for x in _NOT_CHAT)
 
 
 async def test_provider(provider: AiProvider, model: str | None = None) -> tuple[bool, str, int]:

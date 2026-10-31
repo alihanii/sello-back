@@ -59,6 +59,42 @@ async def test_metis_kind_uses_metis_gateway(monkeypatch):
     assert seen["url"].startswith("https://api.metisai.ir/v1beta/models/")
 
 
+async def test_metis_routes_each_model_family_to_its_path(monkeypatch):
+    seen = []
+
+    def handler(req):
+        seen.append((str(req.url), req.headers.get("authorization"), req.headers.get("x-api-key")))
+        if "/anthropic/" in str(req.url):
+            return httpx.Response(200, json={"content": [{"type": "text", "text": "{}"}], "usage": {}})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}], "usage": {}})
+
+    _patch(monkeypatch, handler, {})
+    await ai._call(_provider(kind="metis"), "gpt-5-mini", "s", "p", [], 0)
+    await ai._call(_provider(kind="metis"), "claude-sonnet-5-5", "s", "p", [], 0)
+    assert seen[0] == ("https://api.metisai.ir/openai/v1/chat/completions", "Bearer AIza-test", None)
+    assert seen[1][0] == "https://api.metisai.ir/anthropic/v1/messages" and seen[1][2] == "AIza-test"
+
+
+async def test_metis_lists_models_of_every_family(monkeypatch):
+    def handler(req):
+        u = str(req.url)
+        if "/v1beta/models" in u:
+            return httpx.Response(200, json={"models": [
+                {"name": "models/gemini-3.6-flash", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-3.1-flash-image", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-2.5-flash-preview-tts", "supportedGenerationMethods": ["generateContent"]}]})
+        if "/anthropic/v1/models" in u:
+            return httpx.Response(200, json={"data": [{"id": "claude-sonnet-5-5"}]})
+        if "/openai/v1/models" in u:
+            return httpx.Response(200, json={"data": [{"id": "gpt-5-mini"}, {"id": "tts-1"}, {"id": "text-embedding-3-large"},
+                                                      {"id": "gpt-realtime"}, {"id": "gpt-image-1"}]})
+        return httpx.Response(404)
+
+    _patch(monkeypatch, handler, {})
+    ids = await ai.list_models(_provider(kind="metis"))
+    assert ids == ["gemini-3.6-flash", "gemini-3.1-flash-image", "claude-sonnet-5-5", "gpt-5-mini"]
+
+
 async def test_busy_503_is_retried_before_failing(monkeypatch):
     hits = []
 

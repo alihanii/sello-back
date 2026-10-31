@@ -22,7 +22,7 @@ from app.services.integrations import (
 )
 from app.services.plans import PLAN_TIER, create_subscription, plan_config
 from app.schemas import ChannelOut, PlanConfig, PlanOut, StoreOut, UserOut
-from app.services.ai import DEFAULT_BASE_URLS, AIError, check_model, list_models, model_kind, provider_proxy, test_provider
+from app.services.ai import DEFAULT_BASE_URLS, AIError, check_model, list_models, metis_family, model_kind, provider_proxy, test_provider
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -382,8 +382,9 @@ async def providers(admin: AdminUser, db: DB):
             "kinds": [{"kind": "gemini", "label": "Google Gemini (کلید مستقیم AI Studio)", "base_url": DEFAULT_BASE_URLS["gemini"],
                        "hint": "کلید را از aistudio.google.com/apikey بگیر. گوگل ایران را تحریم کرده؛ روی سرور داخل ایران پروکسی لازم است.",
                        "model": "gemini-3.6-flash"},
-                      {"kind": "metis", "label": "Gemini از طریق متیس", "base_url": DEFAULT_BASE_URLS["metis"],
-                       "hint": "کلید متیس؛ از داخل ایران بدون پروکسی کار می‌کند.", "model": "gemini-3.6-flash"},
+                      {"kind": "metis", "label": "متیس", "base_url": DEFAULT_BASE_URLS["metis"],
+                       "hint": "کلید متیس؛ از داخل ایران بدون پروکسی کار می‌کند. «دریافت مدل‌ها» همهٔ مدل‌های متیس (Gemini، GPT و Claude) را می‌آورد.",
+                       "model": "gemini-3.6-flash"},
                       {"kind": "openai", "label": "OpenAI یا سرویس سازگار", "base_url": DEFAULT_BASE_URLS["openai"],
                        "hint": "هر سرویس سازگار با OpenAI (مثلاً واسط‌های ایرانی)", "model": "gpt-4.1-mini"},
                       {"kind": "openrouter", "label": "OpenRouter", "base_url": DEFAULT_BASE_URLS["openrouter"],
@@ -516,6 +517,8 @@ async def set_route(task: str, body: RouteIn, admin: AdminUser, db: DB):
             raise HTTPException(422, f"{label}: {problem}")
         if task in IMAGE_TASKS and p and p.kind not in IMAGE_KINDS:
             raise HTTPException(422, f"{label}: ساخت عکس فقط با کلید Gemini (مستقیم یا متیس) یا OpenRouter کار می‌کند.")
+        if task in IMAGE_TASKS and p and p.kind == "metis" and metis_family(effective) != "gemini":
+            raise HTTPException(422, f"{label}: ساخت عکس با متیس فقط با مدل‌های تصویری Gemini کار می‌کند (مثل gemini-3.1-flash-image).")
     r = (await db.execute(select(AiTaskRoute).where(AiTaskRoute.task == task))).scalar_one_or_none()
     if not r:
         r = AiTaskRoute(task=task)
