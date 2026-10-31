@@ -498,7 +498,8 @@ async def test_provider(provider: AiProvider, model: str | None = None) -> tuple
         msg = exc.message_fa if isinstance(exc, AIError) else f"خطا: {exc}"
         ms = int((time.monotonic() - started) * 1000)
         await _log(provider, "key_test", model or provider.default_model, None, ok=False, latency_ms=ms,
-                   error_code=getattr(exc, "code", "error"), error_message=msg[:1000])
+                   error_code=getattr(exc, "code", "error"),
+                   error_message=f"{msg} {getattr(exc, 'detail', None) or ''}"[:1000])
         return False, msg, ms
 
 
