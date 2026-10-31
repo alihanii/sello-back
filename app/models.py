@@ -362,6 +362,7 @@ AI_TASKS: dict[str, str] = {
     "field_fill": "پر کردن فیلدهای اجباری پلتفرم‌ها",
     "image_prompt": "نوشتن دستور عکس محصول (مثل platform-wrappers؛ اگر خالی باشد از «تحلیل عکس» استفاده می‌شود)",
     "image_edit": "ساخت و تمیز کردن عکس محصول — فقط مدل تصویری",
+    "chat": "دستیار چت فروش (تلگرام و بله) — یک مدل سریع و ارزان مثل flash-lite",
 }
 # Tasks that need a model which returns an image; every other task needs a text (JSON) model.
 IMAGE_TASKS = {"image_edit"}
@@ -393,6 +394,8 @@ class AiUsageLog(Base):
     latency_ms: Mapped[int] = mapped_column(Integer, default=0)
     input_tokens: Mapped[int] = mapped_column(Integer, default=0)
     output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    # Part of input_tokens the provider served from its prompt cache (billed at ~25%).
+    cached_tokens: Mapped[int | None] = mapped_column(Integer, default=0, nullable=True)
     cost_toman: Mapped[int] = mapped_column(BigInteger, default=0)
     error_code: Mapped[str] = mapped_column(String(60), default="")
     error_message: Mapped[str] = mapped_column(Text, default="")
@@ -426,3 +429,150 @@ class Payment(TimestampMixin, Base):
 
     user: Mapped[User] = relationship()
     plan: Mapped[Plan] = relationship()
+
+
+# ---------- sales chat assistant (see specs/sello-chat-spec.md) ----------
+
+
+class ChatAgent(TimestampMixin, Base):
+    """The store's assistant settings: one row per store. JSON columns keep the editable lists together."""
+
+    __tablename__ = "chat_agents"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), unique=True, index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    assistant_name: Mapped[str] = mapped_column(String(60), default="")
+    tone: Mapped[str] = mapped_column(String(20), default="friendly")  # formal | friendly | casual
+    custom_instructions: Mapped[str] = mapped_column(Text, default="")
+    welcome_message: Mapped[str] = mapped_column(Text, default="")
+    off_topic_message: Mapped[str] = mapped_column(Text, default="")
+    catalog_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    orders_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    # {"card_number","sheba","holder","link","note","require_receipt"}
+    payment: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # {"name": true, "phone": true, "address": true}
+    required_fields: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    faqs: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)  # [{"q","a"}]
+    rules: Mapped[str] = mapped_column(Text, default="")
+    # {"enabled", "days": {"0".."6": [["09:00","21:00"]]}, "away_mode": "ai|message", "away_message"}
+    business_hours: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    handoff_minutes: Mapped[int] = mapped_column(Integer, default=60)
+
+
+class ChatBot(TimestampMixin, Base):
+    """A Telegram/Bale bot the assistant answers through: its own bot (`bot`) or the seller's
+    personal chats via Telegram Business (`business`)."""
+
+    __tablename__ = "chat_bots"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), index=True)
+    platform: Mapped[str] = mapped_column(String(20))  # telegram | bale
+    mode: Mapped[str] = mapped_column(String(12), default="bot")  # bot | business
+    # connected | waiting_business | error | disconnected
+    status: Mapped[str] = mapped_column(String(20), default="connected")
+    credentials_encrypted: Mapped[str | None] = mapped_column(Text)
+    bot_user_id: Mapped[str] = mapped_column(String(40), default="")
+    bot_username: Mapped[str] = mapped_column(String(120), default="")
+    bot_name: Mapped[str] = mapped_column(String(160), default="")
+    token_hash: Mapped[str] = mapped_column(String(64), default="", index=True)
+    admin_chat_id: Mapped[str] = mapped_column(String(40), default="")
+    admin_name: Mapped[str] = mapped_column(String(160), default="")
+    admin_link_code: Mapped[str] = mapped_column(String(12), default="")
+    admin_link_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    business_connection_id: Mapped[str] = mapped_column(String(120), default="")
+    business_user_id: Mapped[str] = mapped_column(String(40), default="")
+    business_user_name: Mapped[str] = mapped_column(String(160), default="")
+    can_reply: Mapped[bool] = mapped_column(Boolean, default=False)
+    update_offset: Mapped[int] = mapped_column(BigInteger, default=0)
+    webhook_secret: Mapped[str] = mapped_column(String(64), default="")
+    last_update_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str] = mapped_column(Text, default="")
+
+
+class ChatReference(TimestampMixin, Base):
+    """Something the assistant can show a customer: a size chart, a care guide…"""
+
+    __tablename__ = "chat_references"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), index=True)
+    title: Mapped[str] = mapped_column(String(160))
+    keywords: Mapped[str] = mapped_column(String(300), default="")
+    text: Mapped[str] = mapped_column(Text, default="")
+    image_url: Mapped[str] = mapped_column(String(1000), default="")
+
+
+class ChatConversation(TimestampMixin, Base):
+    __tablename__ = "chat_conversations"
+    __table_args__ = (UniqueConstraint("bot_id", "external_chat_id", "business_connection_id"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), index=True)
+    bot_id: Mapped[int | None] = mapped_column(ForeignKey("chat_bots.id"), index=True)
+    platform: Mapped[str] = mapped_column(String(20))  # telegram | bale | test
+    mode: Mapped[str] = mapped_column(String(12), default="bot")  # bot | business | test
+    external_chat_id: Mapped[str] = mapped_column(String(40), default="")
+    business_connection_id: Mapped[str] = mapped_column(String(120), default="")
+    customer_name: Mapped[str] = mapped_column(String(160), default="")
+    customer_username: Mapped[str] = mapped_column(String(120), default="")
+    # ai | needs_human | human
+    status: Mapped[str] = mapped_column(String(12), default="ai", index=True)
+    ai_paused_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # {"order": {...}, "recent_products": [ids], "awaiting": "confirm|receipt", "away_sent_at": iso}
+    state: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    is_test: Mapped[bool] = mapped_column(Boolean, default=False)
+    message_count: Mapped[int] = mapped_column(Integer, default=0)
+    ai_message_count: Mapped[int] = mapped_column(Integer, default=0)
+    llm_calls: Mapped[int] = mapped_column(Integer, default=0)
+    tokens_in: Mapped[int] = mapped_column(Integer, default=0)
+    tokens_out: Mapped[int] = mapped_column(Integer, default=0)
+    tokens_cached: Mapped[int] = mapped_column(Integer, default=0)
+    cost_toman: Mapped[int] = mapped_column(BigInteger, default=0)
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_message_text: Mapped[str] = mapped_column(String(300), default="")
+    seller_unread: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    conversation_id: Mapped[int] = mapped_column(ForeignKey("chat_conversations.id"), index=True)
+    store_id: Mapped[int] = mapped_column(Integer, index=True)
+    role: Mapped[str] = mapped_column(String(10))  # customer | ai | seller | system
+    text: Mapped[str] = mapped_column(Text, default="")
+    image_url: Mapped[str] = mapped_column(String(1000), default="")
+    # How an `ai` message was produced: llm | faq | welcome | away | canned | receipt | limit | off_topic
+    source: Mapped[str] = mapped_column(String(12), default="")
+    intent: Mapped[str] = mapped_column(String(20), default="")
+    model: Mapped[str] = mapped_column(String(120), default="")
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cached_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cost_toman: Mapped[int] = mapped_column(BigInteger, default=0)
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+    external_id: Mapped[str] = mapped_column(String(60), default="")
+    is_test: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class AiOrder(TimestampMixin, Base):
+    """An order the assistant took in a chat. Prices are copied from the product at order time."""
+
+    __tablename__ = "ai_orders"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), index=True)
+    conversation_id: Mapped[int] = mapped_column(ForeignKey("chat_conversations.id"), index=True)
+    platform: Mapped[str] = mapped_column(String(20), default="")
+    customer_name: Mapped[str] = mapped_column(String(160), default="")
+    customer_phone: Mapped[str] = mapped_column(String(30), default="")
+    customer_address: Mapped[str] = mapped_column(Text, default="")
+    customer_username: Mapped[str] = mapped_column(String(120), default="")
+    items: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    total_toman: Mapped[int] = mapped_column(BigInteger, default=0)
+    note: Mapped[str] = mapped_column(Text, default="")
+    # awaiting_payment | payment_submitted | confirmed | rejected | cancelled
+    status: Mapped[str] = mapped_column(String(20), default="awaiting_payment", index=True)
+    payment_ref: Mapped[str] = mapped_column(String(120), default="")
+    receipt_url: Mapped[str] = mapped_column(String(1000), default="")
+    receipt_text: Mapped[str] = mapped_column(Text, default="")
+    seller_note: Mapped[str] = mapped_column(Text, default="")
+    is_test: Mapped[bool] = mapped_column(Boolean, default=False)
