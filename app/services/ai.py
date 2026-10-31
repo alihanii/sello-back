@@ -141,23 +141,35 @@ async def _call(
                 gen["maxOutputTokens"] = max_tokens
                 if "flash" in model.lower():
                     # Thinking tokens are billed as output and count against maxOutputTokens; short chat answers
-                    # don't need them. Models that refuse a zero budget get the request again without it.
-                    gen["thinkingConfig"] = {"thinkingBudget": 0}
+                    # don't need them. Gemini 3 takes a level instead of a budget. A model (or a gateway like
+                    # Metis) that rejects either gets the request again without it.
+                    gen["thinkingConfig"] = ({"thinkingLevel": "minimal"} if re.match(r"gemini-([3-9]|\d\d)", model.lower())
+                                             else {"thinkingBudget": 0})
             body = {"contents": [{"role": "user", "parts": parts}],
                     "systemInstruction": {"parts": [{"text": system}]}, "generationConfig": gen}
             url = f"{base}/v1beta/models/{model}:generateContent"
             resp = await client.post(url, headers={"x-goog-api-key": key}, json=body)
-            if resp.status_code == 400 and "thinking" in resp.text.lower() and "thinkingConfig" in gen:
+            if resp.status_code == 400 and "thinkingConfig" in gen:
+                # Often a bare "Request contains an invalid argument." with no word about thinking.
                 gen.pop("thinkingConfig")
                 resp = await client.post(url, headers={"x-goog-api-key": key}, json=body)
             _raise_for(resp)
             data = resp.json()
-            text = "\n".join(
-                p.get("text", "")
-                for c in data.get("candidates", [])
-                for p in c.get("content", {}).get("parts", [])
-                if isinstance(p.get("text"), str) and not p.get("thought")
-            )
+
+            def _text(d: dict[str, Any]) -> str:
+                return "\n".join(p.get("text", "") for c in d.get("candidates", [])
+                                 for p in c.get("content", {}).get("parts", [])
+                                 if isinstance(p.get("text"), str) and not p.get("thought"))
+
+            text = _text(data)
+            finish = ((data.get("candidates") or [{}])[0]).get("finishReason", "")
+            if max_tokens and not text.strip() and finish == "MAX_TOKENS":
+                # The model spent the whole cap thinking: once more with room to answer.
+                gen["maxOutputTokens"] = max(4096, max_tokens * 4)
+                resp = await client.post(url, headers={"x-goog-api-key": key}, json=body)
+                _raise_for(resp)
+                data = resp.json()
+                text = _text(data)
             usage = data.get("usageMetadata", {})
             meta["cached_tokens"] = usage.get("cachedContentTokenCount", 0)
             return (text, usage.get("promptTokenCount", 0),
@@ -170,21 +182,26 @@ async def _call(
                 {"type": "image_url", "image_url": {"url": f"data:{m};base64,{base64.b64encode(d).decode()}"}}
                 for d, m in images
             ]
-            resp = await client.post(
-                f"{base}/chat/completions",
-                headers={"Authorization": f"Bearer {key}"},
-                json={
-                    "model": model,
-                    "temperature": temperature,
-                    # Without a cap OpenRouter reserves the model's whole output (65536) and answers 402 on a small balance.
-                    **({"max_tokens": max_tokens or 8192} if kind == "openrouter" or max_tokens else {}),
-                    # OpenRouter drops every provider that lacks response_format (404); the prompt asks for JSON there.
-                    **({"response_format": {"type": "json_object"}} if json_mode and kind == "openai" else {}),
-                    "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}],
-                },
-            )
+            req = {
+                "model": model,
+                "temperature": temperature,
+                # Without a cap OpenRouter reserves the model's whole output (65536) and answers 402 on a small balance.
+                **({"max_tokens": max_tokens or 8192} if kind == "openrouter" or max_tokens else {}),
+                # OpenRouter drops every provider that lacks response_format (404); the prompt asks for JSON there.
+                **({"response_format": {"type": "json_object"}} if json_mode and kind == "openai" else {}),
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}],
+            }
+            resp = await client.post(f"{base}/chat/completions", headers={"Authorization": f"Bearer {key}"}, json=req)
             _raise_for(resp)
             data = resp.json()
+            choice = (data.get("choices") or [{}])[0]
+            if max_tokens and not ((choice.get("message") or {}).get("content") or "").strip() \
+                    and choice.get("finish_reason") == "length":
+                # A reasoning model used the whole cap before answering: once more with room to answer.
+                req["max_tokens"] = max(4096, max_tokens * 4)
+                resp = await client.post(f"{base}/chat/completions", headers={"Authorization": f"Bearer {key}"}, json=req)
+                _raise_for(resp)
+                data = resp.json()
             usage = data.get("usage", {})
             meta["cached_tokens"] = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
             return (

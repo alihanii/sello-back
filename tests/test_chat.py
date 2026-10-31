@@ -566,3 +566,57 @@ async def test_real_conversation_from_the_screenshots(client, monkeypatch):
     await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "چی دیگه دارین مشابه؟"})
     prompt = llm.calls[-1]["prompt"]
     assert f"#{oid} " in prompt and f"LAST PRODUCT: #{hid}" in prompt
+
+
+class _Resp:
+    def __init__(self, status, body):
+        self.status_code, self._body = status, body
+        self.text = json.dumps(body)
+
+    def json(self):
+        return self._body
+
+
+async def test_gemini3_chat_drops_rejected_thinking_config_and_retries_when_cut(monkeypatch):
+    """ali's Metis route (gemini-3.5-flash-lite) answered a bare 400 "invalid argument" to the thinking setting."""
+    from app.models import AiProvider
+    from app.core.security import encrypt_credentials
+    prov = AiProvider(name="m", kind="gemini", api_key_encrypted=encrypt_credentials({"api_key": "k"}), base_url="")
+    bodies = []
+    replies = [
+        _Resp(400, {"error": {"code": 400, "message": "Request contains an invalid argument.", "status": "INVALID_ARGUMENT"}}),
+        _Resp(200, {"candidates": [{"content": {"parts": []}, "finishReason": "MAX_TOKENS"}], "usageMetadata": {}}),
+        _Resp(200, {"candidates": [{"content": {"parts": [{"text": '{"reply":"بله موجوده"}'}]}, "finishReason": "STOP"}],
+                    "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5}}),
+    ]
+
+    async def fake_post(self, url, headers=None, json=None):
+        bodies.append(__import__("copy").deepcopy(json))
+        return replies.pop(0)
+
+    import httpx
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    text, tin, tout = await ai._call(prov, "gemini-3.5-flash-lite", "s", "p", [], 0.3, max_tokens=700)
+    assert text == '{"reply":"بله موجوده"}'
+    assert bodies[0]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "minimal"}
+    assert "thinkingConfig" not in bodies[1]["generationConfig"]
+    assert bodies[2]["generationConfig"]["maxOutputTokens"] == 4096
+
+
+async def test_openai_compatible_retries_an_answer_lost_to_reasoning(monkeypatch):
+    from app.models import AiProvider
+    from app.core.security import encrypt_credentials
+    prov = AiProvider(name="d", kind="openai", api_key_encrypted=encrypt_credentials({"api_key": "k"}),
+                      base_url="https://x.test/v1")
+    caps = []
+    replies = [_Resp(200, {"choices": [{"message": {"content": ""}, "finish_reason": "length"}], "usage": {}}),
+               _Resp(200, {"choices": [{"message": {"content": '{"reply":"سلام"}'}, "finish_reason": "stop"}], "usage": {}})]
+
+    async def fake_post(self, url, headers=None, json=None):
+        caps.append(json["max_tokens"])
+        return replies.pop(0)
+
+    import httpx
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    text, *_ = await ai._call(prov, "deepseek-flash", "s", "p", [], 0.3, max_tokens=700)
+    assert text == '{"reply":"سلام"}' and caps == [700, 4096]
