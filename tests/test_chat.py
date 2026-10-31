@@ -510,7 +510,7 @@ async def test_answer_rules_and_stock_only_available(client, monkeypatch):
     # default: exact numbers
     await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"answer_policy": {"stock": "exact", "rules": []}})
     await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "مانتو لینن موجوده؟"})
-    assert "موجودی 3" in llm.calls[-1]["prompt"] and "SELLER RULES" not in llm.calls[-1]["system"]
+    assert "موجودی 3" in llm.calls[-1]["prompt"] and "SELLER RULES (obey" not in llm.calls[-1]["system"]
 
 
 async def test_generate_chat_survives_prose_and_cut_json(client, monkeypatch):
@@ -693,3 +693,28 @@ async def test_size_chart_offer_waits_for_yes(client, monkeypatch):
     llm.answers = [{"reply": "اینم جدول سایز 🌸", "intent": "faq", "refs": [rid]}]
     r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "جدول سایزتون رو بفرست"})).json()
     assert r["messages"][-1]["text"] == "جدول سایز: M=۱۰۰ L=۱۰۴"
+
+
+async def test_swapped_product_keeps_size_and_ok_is_not_a_photo_request(client, monkeypatch):
+    h, sid, llm, p1, p2 = await _setup(client, monkeypatch, "09125550018")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        "orders_enabled": True, "payment": {"card_number": "6037991234567890"}})
+    from app.core.db import SessionLocal
+    from app.models import ProductImage
+    async with SessionLocal() as db:
+        db.add(ProductImage(product_id=p1["id"], url="/media/x/m.jpg"))
+        await db.commit()
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام وقت بخیر"})
+    assert llm.calls == []  # a longer greeting is still a greeting
+    llm.answers = [{"reply": "ثبت شد", "intent": "order", "products": [p1["id"]], "images": [p1["id"]],
+                    "order": {"items": [{"product_id": p1["id"], "qty": 1, "variant": "XL"}]}, "order_action": "update"}]
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "اوکی مانتو لینن سایز XL"})).json()
+    assert not any(m["image_url"] for m in r["messages"][-2:])
+    llm.answers = [{"reply": "عوض شد", "intent": "order",
+                    "order": {"items": [{"product_id": p2["id"], "qty": 1}]}, "order_action": "update"}]
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "نه بجاش شال نخی"})
+    async with SessionLocal() as db:
+        from sqlalchemy import select
+        conv = (await db.execute(select(chat_engine.ChatConversation).where(
+            chat_engine.ChatConversation.store_id == sid, chat_engine.ChatConversation.is_test))).scalars().first()
+        assert conv.state["order"]["items"] == [{"product_id": p2["id"], "qty": 1, "variant": "XL"}]
