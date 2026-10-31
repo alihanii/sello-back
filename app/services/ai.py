@@ -2,7 +2,7 @@
 ai_task_routes); every call is written to ai_usage_logs for the monitoring page.
 
 Wire formats: `gemini` (a key straight from Google AI Studio), `metis` (one MetisAI key for every model it
-sells: Gemini models go out in the Gemini format, Claude through /anthropic, the rest through /openai/v1), `openai` (OpenAI and compatible gateways), `openrouter` (OpenAI format, plus image output),
+sells: Gemini models go out in the Gemini format, Claude through /anthropic, DeepSeek through /deepseek/v1, the rest through /openai/v1), `openai` (OpenAI and compatible gateways), `openrouter` (OpenAI format, plus image output),
 `anthropic`. Each key may carry its own
 proxy, stored with the key in the encrypted blob, because Google and OpenAI refuse requests from Iran."""
 
@@ -90,16 +90,18 @@ def _base(provider: AiProvider) -> str:
     return base
 
 
-_METIS_SUFFIXES = ("/openai/v1", "/anthropic/v1", "/anthropic", "/v1beta")
+_METIS_SUFFIXES = ("/openai/v1", "/deepseek/v1", "/anthropic/v1", "/anthropic", "/v1beta")
 
 
 def metis_family(model: str) -> str:
-    """Which MetisAI path serves a model: 'gemini', 'anthropic' or 'openai'."""
+    """Which MetisAI path serves a model: 'gemini', 'anthropic', 'deepseek' or 'openai'."""
     m = (model or "").lower().removeprefix("models/")
     if m.startswith(("gemini", "gemma", "nano-banana", "learnlm")):
         return "gemini"
     if m.startswith("claude"):
         return "anthropic"
+    if m.startswith("deepseek"):
+        return "deepseek"
     return "openai"
 
 
@@ -111,7 +113,9 @@ def _wire(provider: AiProvider, model: str) -> tuple[str, str]:
     for suffix in _METIS_SUFFIXES:
         root = root.removesuffix(suffix)
     family = metis_family(model)
-    return family, {"gemini": root, "anthropic": f"{root}/anthropic", "openai": f"{root}/openai/v1"}[family]
+    # DeepSeek speaks the OpenAI chat format on its own path.
+    return ("openai" if family == "deepseek" else family), {
+        "gemini": root, "anthropic": f"{root}/anthropic", "openai": f"{root}/openai/v1", "deepseek": f"{root}/deepseek/v1"}[family]
 
 
 def provider_proxy(provider: AiProvider) -> str:
@@ -120,44 +124,35 @@ def provider_proxy(provider: AiProvider) -> str:
 
 async def _call(
     provider: AiProvider, model: str, system: str, prompt: str, images: list[tuple[bytes, str]], temperature: float,
-    json_mode: bool = True, max_tokens: int | None = None, meta: dict[str, Any] | None = None,
+    json_mode: bool = True,
 ) -> tuple[str, int, int]:
-    """Returns (text, input_tokens, output_tokens). `meta`, when given, receives `cached_tokens` (the part of the
-    input the provider served from its prompt cache). `max_tokens` caps the answer (the chat assistant)."""
+    """Returns (text, input_tokens, output_tokens)."""
     key = _api_key(provider)
     kind, base = _wire(provider, model)
-    meta = meta if meta is not None else {}
     async with httpx.AsyncClient(timeout=120, proxy=provider_proxy(provider) or None) as client:
         if kind == "gemini":
             parts: list[dict[str, Any]] = [{"text": prompt}]
             parts += [{"inlineData": {"mimeType": m, "data": base64.b64encode(d).decode()}} for d, m in images]
-            gen: dict[str, Any] = {"temperature": temperature,
-                                   **({"responseMimeType": "application/json"} if json_mode else {})}
-            if max_tokens:
-                gen["maxOutputTokens"] = max_tokens
-                if "flash" in model.lower():
-                    # Thinking tokens are billed as output and count against maxOutputTokens; short chat answers
-                    # don't need them. Models that refuse a zero budget get the request again without it.
-                    gen["thinkingConfig"] = {"thinkingBudget": 0}
-            body = {"contents": [{"role": "user", "parts": parts}],
-                    "systemInstruction": {"parts": [{"text": system}]}, "generationConfig": gen}
-            url = f"{base}/v1beta/models/{model}:generateContent"
-            resp = await client.post(url, headers={"x-goog-api-key": key}, json=body)
-            if resp.status_code == 400 and "thinking" in resp.text.lower() and "thinkingConfig" in gen:
-                gen.pop("thinkingConfig")
-                resp = await client.post(url, headers={"x-goog-api-key": key}, json=body)
+            resp = await client.post(
+                f"{base}/v1beta/models/{model}:generateContent",
+                headers={"x-goog-api-key": key},
+                json={
+                    "contents": [{"role": "user", "parts": parts}],
+                    "systemInstruction": {"parts": [{"text": system}]},
+                    "generationConfig": {"temperature": temperature,
+                                         **({"responseMimeType": "application/json"} if json_mode else {})},
+                },
+            )
             _raise_for(resp)
             data = resp.json()
             text = "\n".join(
                 p.get("text", "")
                 for c in data.get("candidates", [])
                 for p in c.get("content", {}).get("parts", [])
-                if isinstance(p.get("text"), str) and not p.get("thought")
+                if isinstance(p.get("text"), str)
             )
             usage = data.get("usageMetadata", {})
-            meta["cached_tokens"] = usage.get("cachedContentTokenCount", 0)
-            return (text, usage.get("promptTokenCount", 0),
-                    usage.get("candidatesTokenCount", 0) + usage.get("thoughtsTokenCount", 0))
+            return text, usage.get("promptTokenCount", 0), usage.get("candidatesTokenCount", 0)
 
         if kind in ("openai", "openrouter"):
             text = prompt + ("\n\nRespond with JSON only." if json_mode and kind == "openrouter" else "")
@@ -173,7 +168,7 @@ async def _call(
                     "model": model,
                     "temperature": temperature,
                     # Without a cap OpenRouter reserves the model's whole output (65536) and answers 402 on a small balance.
-                    **({"max_tokens": max_tokens or 8192} if kind == "openrouter" or max_tokens else {}),
+                    **({"max_tokens": 8192} if kind == "openrouter" else {}),
                     # OpenRouter drops every provider that lacks response_format (404); the prompt asks for JSON there.
                     **({"response_format": {"type": "json_object"}} if json_mode and kind == "openai" else {}),
                     "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}],
@@ -182,7 +177,6 @@ async def _call(
             _raise_for(resp)
             data = resp.json()
             usage = data.get("usage", {})
-            meta["cached_tokens"] = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
             return (
                 data["choices"][0]["message"]["content"] or "",
                 usage.get("prompt_tokens", 0),
@@ -199,11 +193,9 @@ async def _call(
                 headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
                 json={
                     "model": model,
-                    "max_tokens": max_tokens or 4096,
+                    "max_tokens": 4096,
                     "temperature": temperature,
-                    # A cache breakpoint on the system prompt: Anthropic caches only when asked.
-                    "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
-                    if max_tokens else system,
+                    "system": system,
                     "messages": [{"role": "user", "content": content}],
                 },
             )
@@ -211,10 +203,7 @@ async def _call(
             data = resp.json()
             usage = data.get("usage", {})
             text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
-            cached = usage.get("cache_read_input_tokens", 0) or 0
-            meta["cached_tokens"] = cached
-            tin = usage.get("input_tokens", 0) + cached + (usage.get("cache_creation_input_tokens", 0) or 0)
-            return text, tin, usage.get("output_tokens", 0)
+            return text, usage.get("input_tokens", 0), usage.get("output_tokens", 0)
 
     raise AIError("نوع سرویس هوش مصنوعی پشتیبانی نمی‌شود.", code="ai_bad_kind")
 
@@ -283,18 +272,9 @@ def _raise_for(resp: httpx.Response) -> None:
                       detail=resp.text[:500])
 
 
-CACHED_INPUT_RATE = 0.25  # cached prompt tokens cost about a quarter of normal input on Gemini/OpenAI/Anthropic
-
-
-def token_cost(provider: AiProvider, tin: int, tout: int, cached: int = 0) -> int:
-    cached = min(cached, tin)
-    return int(((tin - cached) * provider.input_price_per_m + cached * provider.input_price_per_m * CACHED_INPUT_RATE
-                 + tout * provider.output_price_per_m) // 1_000_000)
-
-
 async def _log(provider: AiProvider, task: str, model: str, store_id: int | None, **fields: Any) -> None:
     tin, tout = fields.get("input_tokens", 0), fields.get("output_tokens", 0)
-    cost = token_cost(provider, tin, tout, fields.get("cached_tokens", 0))
+    cost = (tin * provider.input_price_per_m + tout * provider.output_price_per_m) // 1_000_000
     async with SessionLocal() as db:
         db.add(
             AiUsageLog(
@@ -425,45 +405,6 @@ async def generate_text(
     raise last  # type: ignore[misc]
 
 
-async def generate_chat(
-    *, system: str, prompt: str, store_id: int | None, max_tokens: int = 400, task: str = "chat",
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """One chat turn: a JSON answer with a capped length. Returns (answer, usage) where usage has the model,
-    input/output/cached tokens, cost and latency, so the conversation can show what each reply cost."""
-    candidates = await _route(task)
-    if not candidates:
-        raise AIError(await route_problem(task), code="ai_not_configured")
-    last: AIError | None = None
-    for provider, model, temp, is_fallback in candidates:
-        started = time.monotonic()
-        meta: dict[str, Any] = {}
-        try:
-            text, tin, tout = await _retry_busy(
-                lambda provider=provider, model=model, temp=temp: _call(
-                    provider, model, system, prompt, [], temp, json_mode=True, max_tokens=max_tokens, meta=meta))
-            result = json.loads(_strip_fences(text))
-            if not isinstance(result, dict):
-                raise json.JSONDecodeError("not an object", text, 0)
-            ms = int((time.monotonic() - started) * 1000)
-            cached = int(meta.get("cached_tokens") or 0)
-            await _log(provider, task, model, store_id, ok=True, is_fallback=is_fallback, latency_ms=ms,
-                       input_tokens=tin, output_tokens=tout, cached_tokens=cached)
-            return result, {"model": model, "input_tokens": tin, "output_tokens": tout, "cached_tokens": cached,
-                            "cost_toman": token_cost(provider, tin, tout, cached), "latency_ms": ms}
-        except (AIError, httpx.HTTPError, json.JSONDecodeError, KeyError) as exc:
-            err = exc if isinstance(exc, AIError) else AIError(
-                "پاسخ هوش مصنوعی قابل خواندن نبود." if isinstance(exc, (json.JSONDecodeError, KeyError))
-                else "ارتباط با سرویس هوش مصنوعی برقرار نشد.",
-                code="ai_bad_json" if isinstance(exc, (json.JSONDecodeError, KeyError)) else "ai_network",
-                detail=str(exc)[:500],
-            )
-            await _log(provider, task, model, store_id, ok=False, is_fallback=is_fallback,
-                       latency_ms=int((time.monotonic() - started) * 1000),
-                       error_code=err.code, error_message=f"{err.message_fa} {err.detail or ''}"[:1000])
-            last = err
-    raise last  # type: ignore[misc]
-
-
 async def generate_image(
     *, system: str, prompt: str, images: list[tuple[bytes, str]], store_id: int | None = None, task: str = "image_edit",
 ) -> tuple[bytes, str]:
@@ -578,9 +519,8 @@ async def list_models(provider: AiProvider) -> list[str]:
 
         if provider.kind != "metis":
             return await fetch(provider.kind, _base(provider))
-        probes = {"gemini": "gemini", "anthropic": "claude", "openai": "gpt"}
-        results = await asyncio.gather(*(fetch(fam, _wire(provider, sample)[1]) for fam, sample in probes.items()),
-                                       return_exceptions=True)
+        samples = ("gemini", "claude", "deepseek", "gpt")
+        results = await asyncio.gather(*(fetch(*_wire(provider, sample)) for sample in samples), return_exceptions=True)
         ok = [r for r in results if isinstance(r, list)]
         if not ok:
             raise next(r for r in results if isinstance(r, BaseException))

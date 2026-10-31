@@ -12,11 +12,10 @@ from fastapi.staticfiles import StaticFiles
 from app.core.config import settings
 from app.core.db import init_db
 from app.routers import (
-    admin, auth, billing, channels, chat, crawl, insights, notifications, ai_products, operations, payments, products,
+    admin, auth, billing, channels, crawl, insights, notifications, ai_products, operations, payments, products,
     stores,
 )
 from app.seed import seed
-from app.services.chat_runtime import poller_loop
 from app.services.worker import worker_loop
 
 logging.basicConfig(level=logging.INFO)
@@ -28,13 +27,10 @@ async def lifespan(_: FastAPI):
     await seed()
     stop = asyncio.Event()
     task = asyncio.create_task(worker_loop(stop)) if settings.worker_enabled else None
-    chat = (asyncio.create_task(poller_loop(stop))
-            if settings.worker_enabled and settings.chat_transport == "polling" else None)
     yield
     stop.set()
-    for t in (task, chat):
-        if t:
-            await t
+    if task:
+        await task
 
 
 app = FastAPI(title="Sello API", version="0.1.0", lifespan=lifespan)
@@ -55,7 +51,7 @@ async def validation_error(_: Request, exc: RequestValidationError):
 
 
 for r in (auth, stores, channels, products, operations, crawl, ai_products, insights, billing, payments, admin,
-          notifications, chat):
+          notifications):
     app.include_router(r.router, prefix="/api/v1")
 
 Path(settings.media_dir).mkdir(parents=True, exist_ok=True)

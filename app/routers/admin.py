@@ -383,7 +383,7 @@ async def providers(admin: AdminUser, db: DB):
                        "hint": "کلید را از aistudio.google.com/apikey بگیر. گوگل ایران را تحریم کرده؛ روی سرور داخل ایران پروکسی لازم است.",
                        "model": "gemini-3.6-flash"},
                       {"kind": "metis", "label": "متیس", "base_url": DEFAULT_BASE_URLS["metis"],
-                       "hint": "کلید متیس؛ از داخل ایران بدون پروکسی کار می‌کند. «دریافت مدل‌ها» همهٔ مدل‌های متیس (Gemini، GPT و Claude) را می‌آورد.",
+                       "hint": "کلید متیس؛ از داخل ایران بدون پروکسی کار می‌کند. «دریافت مدل‌ها» همهٔ مدل‌های متیس (Gemini، GPT، Claude و DeepSeek) را می‌آورد.",
                        "model": "gemini-3.6-flash"},
                       {"kind": "openai", "label": "OpenAI یا سرویس سازگار", "base_url": DEFAULT_BASE_URLS["openai"],
                        "hint": "هر سرویس سازگار با OpenAI (مثلاً واسط‌های ایرانی)", "model": "gpt-4.1-mini"},

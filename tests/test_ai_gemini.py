@@ -71,6 +71,8 @@ async def test_metis_routes_each_model_family_to_its_path(monkeypatch):
     _patch(monkeypatch, handler, {})
     await ai._call(_provider(kind="metis"), "gpt-5-mini", "s", "p", [], 0)
     await ai._call(_provider(kind="metis"), "claude-sonnet-5-5", "s", "p", [], 0)
+    await ai._call(_provider(kind="metis"), "deepseek-v4-flash", "s", "p", [], 0)
+    assert seen[2][:2] == ("https://api.metisai.ir/deepseek/v1/chat/completions", "Bearer AIza-test")
     assert seen[0] == ("https://api.metisai.ir/openai/v1/chat/completions", "Bearer AIza-test", None)
     assert seen[1][0] == "https://api.metisai.ir/anthropic/v1/messages" and seen[1][2] == "AIza-test"
 
@@ -85,6 +87,8 @@ async def test_metis_lists_models_of_every_family(monkeypatch):
                 {"name": "models/gemini-2.5-flash-preview-tts", "supportedGenerationMethods": ["generateContent"]}]})
         if "/anthropic/v1/models" in u:
             return httpx.Response(200, json={"data": [{"id": "claude-sonnet-5-5"}]})
+        if "/deepseek/v1/models" in u:
+            return httpx.Response(200, json={"data": [{"id": "deepseek-v4-flash"}]})
         if "/openai/v1/models" in u:
             return httpx.Response(200, json={"data": [{"id": "gpt-5-mini"}, {"id": "tts-1"}, {"id": "text-embedding-3-large"},
                                                       {"id": "gpt-realtime"}, {"id": "gpt-image-1"}]})
@@ -92,7 +96,7 @@ async def test_metis_lists_models_of_every_family(monkeypatch):
 
     _patch(monkeypatch, handler, {})
     ids = await ai.list_models(_provider(kind="metis"))
-    assert ids == ["gemini-3.6-flash", "gemini-3.1-flash-image", "claude-sonnet-5-5", "gpt-5-mini"]
+    assert ids == ["gemini-3.6-flash", "gemini-3.1-flash-image", "claude-sonnet-5-5", "deepseek-v4-flash", "gpt-5-mini"]
 
 
 async def test_busy_503_is_retried_before_failing(monkeypatch):
