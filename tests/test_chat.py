@@ -671,3 +671,25 @@ async def test_busy_buyer_is_not_handed_over(client, monkeypatch):
         assert saved[-1].source == "llm"
     async with SessionLocal() as db:
         assert (await db.get(chat_engine.ChatConversation, conv)).status == "ai"
+
+
+async def test_size_chart_offer_waits_for_yes(client, monkeypatch):
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550017")
+    from app.core.db import SessionLocal
+    from app.models import ChatReference
+    async with SessionLocal() as db:
+        ref = ChatReference(store_id=sid, title="راهنمای سایز", text="جدول سایز: M=۱۰۰ L=۱۰۴")
+        db.add(ref)
+        await db.commit()
+        rid = ref.id
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
+    llm.answers = [{"reply": "برشش گشاده 🌸 راهنمای سایز رو براتون بفرستم؟", "intent": "product", "refs": [rid]}]
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سایز مانتو لینن چطوره؟"})).json()
+    assert "جدول سایز" not in r["messages"][-1]["text"]
+    before = len(llm.calls)
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "آره لطفا"})).json()
+    assert len(llm.calls) == before and r["messages"][-1]["text"] == "جدول سایز: M=۱۰۰ L=۱۰۴"
+    # asked directly: the chart comes with the answer
+    llm.answers = [{"reply": "اینم جدول سایز 🌸", "intent": "faq", "refs": [rid]}]
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "جدول سایزتون رو بفرست"})).json()
+    assert r["messages"][-1]["text"] == "جدول سایز: M=۱۰۰ L=۱۰۴"

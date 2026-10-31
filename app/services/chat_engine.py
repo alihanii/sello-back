@@ -572,15 +572,18 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         state.pop("awaiting", None)  # anything else: the customer is changing the order; let the model handle it
 
     # 4b. "Yes" to "send you its photo?": the offered product's photos, no model needed.
-    offer = state.pop("photo_offer", None)
-    if offer and (_YES.match(squeeze(text)) or _PHOTO_YES.match(squeeze(text))):
-        p = await db.get(Product, offer)
+    offer, ref_offer = state.pop("photo_offer", None), state.pop("ref_offer", None)
+    if (offer or ref_offer) and (_YES.match(squeeze(text)) or _PHOTO_YES.match(squeeze(text))):
+        sent: list[Reply] = []
+        p = await db.get(Product, offer) if offer else None
         if p and p.store_id == store.id:
-            pics = await product_photos(db, [p], [p.id], text, per=MAX_PHOTOS)
-            if pics:
-                result.replies.append(Reply("بفرمایید 🌸", source="canned", intent="product"))
-                result.replies += pics
-                return done()
+            sent += await product_photos(db, [p], [p.id], text, per=MAX_PHOTOS)
+        if ref_offer:
+            sent += await ref_replies(db, store.id, ref_offer)
+        if sent:
+            result.replies.append(Reply("بفرمایید 🌸", source="canned", intent="product"))
+            result.replies += sent
+            return done()
 
     # 5. Asking for a human: no model needed.
     if _HUMAN.search(text) and len(words(text)) <= 8:
@@ -715,17 +718,19 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         ids = resolve_mentioned(with_photos, out.get("images"), f"{reply.text} {text}")
         sent = await product_photos(db, with_photos, ids, text)
         result.replies += sent
-    if not sent and with_photos and "عکس" in reply.text and _OFFER.search(reply.text):
+    offering = bool(_OFFER.search(reply.text)) and ("؟" in reply.text or "?" in reply.text)
+    if not sent and with_photos and "عکس" in reply.text and offering:
         # The assistant offered a photo: remember which product, so a plain "yes" sends it next turn.
         ids = resolve_mentioned(with_photos, shown or (state.get("recent_products") or [])[-1:], reply.text)
         if ids:
             state["photo_offer"] = int(ids[0])
 
-    for rid in (out.get("refs") or [])[:2]:
-        ref = next((r for r in refs if str(r.id) == str(rid)), None)
-        if ref:
-            result.replies.append(Reply(ref.text if not ref.image_url else (ref.text or ref.title)[:900],
-                                        image_url=ref.image_url, source="canned", intent="faq"))
+    ref_ids = [r.id for r in refs if str(r.id) in {str(x) for x in (out.get("refs") or [])[:2]}]
+    if ref_ids and offering:
+        # "Shall I send the size chart?" is a question: wait for the customer's yes.
+        state["ref_offer"] = ref_ids
+    else:
+        result.replies += await ref_replies(db, store.id, ref_ids, list(refs))
 
     if handoff:
         conv.status = "needs_human"
@@ -778,6 +783,18 @@ def resolve_mentioned(products: list[Product], ids: Any, mention: str) -> list[i
     if not asked:
         return [best.id] if score(best.id) else []
     return [i if score(i) or not score(best.id) else best.id for i in asked][:MAX_PHOTOS]
+
+
+async def ref_replies(db: AsyncSession, store_id: int, ids: list[int],
+                      refs: list[ChatReference] | None = None) -> list[Reply]:
+    if refs is None:
+        refs = list((await db.execute(select(ChatReference).where(ChatReference.store_id == store_id,
+                                                                  ChatReference.id.in_(ids or [0])))).scalars())
+    out = []
+    for ref in [r for r in refs if r.id in (ids or [])]:
+        out.append(Reply(ref.text if not ref.image_url else (ref.text or ref.title)[:900],
+                         image_url=ref.image_url, source="canned", intent="faq"))
+    return out
 
 
 async def product_photos(db: AsyncSession, products: list[Product], ids: Any, text: str,
