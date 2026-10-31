@@ -402,7 +402,7 @@ async def test_catalog_reaches_the_model(client, monkeypatch):
     await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "چه محصولاتی دارید؟"})
     prompt = llm.calls[-1]["prompt"]
     assert "مانتو لینن کرم" in prompt and "کفش اسپرت سفید" in prompt
-    assert "Never say you have no access" in llm.calls[-1]["system"]
+    assert "Never say you can't see products" in llm.calls[-1]["system"]
     await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "کفشاتون چند؟"})
     assert "کفش اسپرت سفید" in llm.calls[-1]["prompt"].split("PRODUCTS")[1].splitlines()[1]
 
@@ -478,7 +478,7 @@ async def test_photos_variants_and_clarify(client, monkeypatch):
     # colour/size come first in the product line even with many details, and the photo count is shown
     line = next(x for x in call["prompt"].splitlines() if x.startswith(f"#{hid} "))
     assert "رنگ: مشکی، نارنجی، طوسی" in line and "سایز: L، XL" in line and "۴ عکس" in line
-    assert "CLARIFY" in call["system"] and "VARIANTS" in call["system"]
+    assert "WHICH PRODUCT" in call["system"] and "VARIANTS" in call["system"]
     imgs = [m for m in r["messages"] if m["image_url"]]
     assert len(imgs) == 1 and imgs[0]["image_url"] == "/media/x/h0.jpg" and "هودی کلاه‌دار" in imgs[0]["text"]
     llm.answers = [{"reply": "بفرما", "intent": "product", "products": [hid], "images": [hid]}]
@@ -624,3 +624,50 @@ async def test_openai_compatible_retries_an_answer_lost_to_reasoning(monkeypatch
     monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
     text, *_ = await ai._call(prov, "deepseek-flash", "s", "p", [], 0.3, max_tokens=700)
     assert text == '{"reply":"سلام"}' and caps == [700, 4096]
+
+
+async def test_photo_of_the_named_product_and_yes_to_a_photo_offer(client, monkeypatch):
+    """ali's run: "photos of the brown hoodie" sent the black octopus one; "ارهه" to "send its photo?" got nothing."""
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550015")
+    from app.core.db import SessionLocal
+    from app.models import Product, ProductImage
+    async with SessionLocal() as db:
+        brown = Product(store_id=sid, title="هودی کلاهدار قهوه‌ای", price=100000, stock_qty=2)
+        octo = Product(store_id=sid, title="هودی اختاپوس", price=0, stock_qty=1)
+        sully = Product(store_id=sid, title="هودی سالیوان", price=890000, stock_qty=3)
+        db.add_all([brown, octo, sully])
+        await db.flush()
+        db.add_all([ProductImage(product_id=p.id, url=f"/media/x/{p.id}.jpg") for p in (brown, octo, sully)])
+        await db.commit()
+        b, o, s = brown.id, octo.id, sully.id
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
+    llm.answers = [{"reply": "عالیه 🌸 عکس‌های هودی قهوه‌ای رو ببینید.", "intent": "product", "images": [o]}]
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "عکس هودی قهوه‌ای رو بفرست"})).json()
+    imgs = [m for m in r["messages"] if m["image_url"]]
+    assert [m["image_url"] for m in imgs] == [f"/media/x/{b}.jpg"] and imgs[0]["text"] == "هودی کلاهدار قهوه‌ای — ۱۰۰٬۰۰۰ تومان"
+
+    llm.answers = [{"reply": "بله هودی سالیوان رو داریم 🌸 عکسش رو بفرستم؟", "intent": "product", "products": [s]}]
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "هودی با طرح سالیوان؟"})
+    before = len(llm.calls)
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "ارهه"})).json()
+    assert len(llm.calls) == before  # no model call for "yes"
+    assert r["messages"][-1]["image_url"] == f"/media/x/{s}.jpg" and r["messages"][-1]["text"] == "هودی سالیوان — ۸۹۰٬۰۰۰ تومان"
+    # a photo of a product without a price has no "unknown price" caption
+    llm.answers = [{"reply": "بفرما", "intent": "product", "images": [o]}]
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "عکس هودی اختاپوس"})).json()
+    assert r["messages"][-1]["text"] == "هودی اختاپوس"
+
+
+async def test_busy_buyer_is_not_handed_over(client, monkeypatch):
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550016")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True})
+    conv = await _real_conv(sid)
+    from app.core.db import SessionLocal
+    for i in range(12):  # the old limit (10 in 10 minutes) handed this chat to the admin
+        async with SessionLocal() as db:
+            rt.add_message(db, await db.get(chat_engine.ChatConversation, conv), role="customer", text=f"مانتو لینن سایز {i}؟")
+            await db.commit()
+        saved = await rt.answer(conv, send=False)
+        assert saved[-1].source == "llm"
+    async with SessionLocal() as db:
+        assert (await db.get(chat_engine.ChatConversation, conv)).status == "ai"
