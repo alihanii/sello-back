@@ -308,3 +308,25 @@ def test_openrouter_errors_say_what_happened():
         ai._raise_for(other)
     except ai.AIError as exc:
         assert "teapot" in exc.message_fa  # the provider's own words reach the admin
+    try:
+        ai._raise_for(httpx.Response(404, content=b""))
+    except ai.AIError as exc:
+        assert exc.code == "ai_proxy_404" and "VPN" in exc.message_fa  # an empty 404 is the proxy, not the model
+
+
+async def test_openrouter_caps_output_tokens(monkeypatch):
+    from app.models import AiProvider
+
+    monkeypatch.setattr(ai, "_api_key", lambda p: "k")
+    monkeypatch.setattr(ai, "provider_proxy", lambda p: "")
+    sent = {}
+
+    def handler(req):
+        sent["body"] = req.content
+        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}], "usage": {}})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(ai.httpx, "AsyncClient", lambda *a, **kw: real(*a, transport=httpx.MockTransport(handler),
+                                                                      **{k: v for k, v in kw.items() if k != "proxy"}))
+    await ai._call(AiProvider(kind="openrouter", base_url=""), "google/gemini-3.6-flash", "s", "p", [], 0.3)
+    assert b'"max_tokens":8192' in sent["body"]
