@@ -8,12 +8,11 @@ from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import selectinload
 
 from app.deps import DB, CurrentUser, get_store_for
-from app.models import Channel, ChannelListing, InventoryMovement, Operation, Product, ProductImage
+from app.models import Channel, ChannelListing, Operation, Product, ProductImage
 from app.schemas import OperationOut, ProductIn, ProductOut, ProductPatch
 from app.services.ops import queue_publish
 from app.services.media import ALLOWED, save_bytes
-from app.services.ai import route_problem
-from app.services.ops import enqueue, record_event
+from app.services.ops import record_event
 from app.services.plans import check_limit
 
 router = APIRouter(tags=["products"])
@@ -73,10 +72,7 @@ async def create_product(store_id: int, body: ProductIn, user: CurrentUser, db: 
     await db.flush()
     for i, url in enumerate(body.images):
         db.add(ProductImage(product_id=p.id, url=url, position=i))
-    if p.stock_qty:
-        db.add(InventoryMovement(product_id=p.id, delta=p.stock_qty, qty_after=p.stock_qty, reason="manual", note="موجودی اولیه"))
     await record_event(db, store_id, "product_created")
-    await db.commit()
     await db.commit()
     return await _get(db, user, p.id)
 
@@ -91,7 +87,6 @@ async def update_product(product_id: int, body: ProductPatch, user: CurrentUser,
     p = await _get(db, user, product_id)
     data = body.model_dump(exclude_unset=True)
     images = data.pop("images", None)
-    old_stock = p.stock_qty
     for k, v in data.items():
         setattr(p, k, v)
     if images is not None:
@@ -99,8 +94,6 @@ async def update_product(product_id: int, body: ProductPatch, user: CurrentUser,
         await db.flush()
         for i, url in enumerate(images):
             p.images.append(ProductImage(url=url, position=i))
-    if p.stock_qty != old_stock:
-        db.add(InventoryMovement(product_id=p.id, delta=p.stock_qty - old_stock, qty_after=p.stock_qty, reason="manual"))
     for l in p.listings:
         if l.status == "published":
             l.status = "out_of_sync"
@@ -120,27 +113,16 @@ async def archive_product(product_id: int, user: CurrentUser, db: DB):
 
 class StockIn(BaseModel):
     qty: int
-    note: str = ""
 
 
 @router.post("/products/{product_id}/stock", response_model=ProductOut)
 async def set_stock(product_id: int, body: StockIn, user: CurrentUser, db: DB):
     p = await _get(db, user, product_id)
-    db.add(InventoryMovement(product_id=p.id, delta=body.qty - p.stock_qty, qty_after=body.qty, reason="manual", note=body.note))
     p.stock_qty = body.qty
     await db.commit()
     pid = p.id
     db.expunge_all()
     return await _get(db, user, pid)
-
-
-@router.get("/products/{product_id}/inventory")
-async def inventory_history(product_id: int, user: CurrentUser, db: DB):
-    await _get(db, user, product_id)
-    rows = (await db.execute(select(InventoryMovement).where(InventoryMovement.product_id == product_id)
-                             .order_by(InventoryMovement.id.desc()).limit(100))).scalars()
-    return [{"id": r.id, "delta": r.delta, "qty_after": r.qty_after, "reason": r.reason, "note": r.note,
-             "created_at": r.created_at} for r in rows]
 
 
 @router.post("/stores/{store_id}/uploads")
@@ -220,23 +202,3 @@ async def export_csv(store_id: int, user: CurrentUser, db: DB):
         w.writerow([p.id, p.sku, p.title, p.price, p.stock_qty, p.source, p.status, " ".join(p.tags or [])])
     return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv",
                              headers={"Content-Disposition": f"attachment; filename=products-{store_id}.csv"})
-
-
-class CleanImageIn(BaseModel):
-    image_id: int | None = None  # empty: generate a photo from the product text
-    category: str = "general"  # flat_clothing | modeled_clothing | footwear | general
-
-
-@router.post("/products/{product_id}/clean-image", response_model=OperationOut, status_code=202)
-async def clean_image(product_id: int, body: CleanImageIn, user: CurrentUser, db: DB):
-    """Redraws a product photo as a clean white-background main image with AI."""
-    p = await _get(db, user, product_id)
-    if body.image_id and not any(i.id == body.image_id for i in p.images):
-        raise HTTPException(404, "عکس پیدا نشد.")
-    if problem := await route_problem("image_edit"):
-        raise HTTPException(422, problem)
-    op = await enqueue(db, store_id=p.store_id, type="image_clean", product_id=p.id, actor="ai",
-                       title_fa=f"{'تمیز کردن' if body.image_id else 'ساخت'} عکس «{p.title[:60]}»",
-                       payload={"image_id": body.image_id, "category": body.category})
-    await db.commit()
-    return op

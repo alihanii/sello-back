@@ -81,12 +81,6 @@ class OpContext:
             row.duration_ms = int((time.monotonic() - started) * 1000)
             await self.db.commit()
 
-    async def progress(self, pct: int, label_fa: str | None = None) -> None:
-        self.op.progress = max(0, min(100, pct))
-        if label_fa:
-            self.op.current_step = label_fa
-        await self.db.commit()
-
 
 def fail_operation(op: Operation, exc: Exception) -> None:
     op.status = "failed"

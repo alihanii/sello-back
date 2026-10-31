@@ -1,4 +1,4 @@
-"""Operation handlers the worker runs: connect, health_check, publish, crawl, ai_product, image_clean."""
+"""Operation handlers the worker runs: connect, health_check, publish, crawl, ai_product."""
 
 import json
 import re
@@ -348,28 +348,10 @@ async def _set_main_image(db, product_id: int, url: str, origin: str) -> None:
     await db.flush()
 
 
-async def run_image_clean(ctx: OpContext) -> None:
-    """Cleans one existing product photo (product page button)."""
-    db, op = ctx.db, ctx.op
-    product = await _load_product(db, op.product_id)
-    image = await db.get(ProductImage, int(op.payload["image_id"])) if op.payload.get("image_id") else None
-    if op.payload.get("image_id") and (not image or image.product_id != product.id):
-        raise PlatformError("عکس پیدا نشد.", "image_not_found")
-    try:
-        url = await make_photo(ctx, store_id=product.store_id, image_url=image.url if image else None, title=product.title,
-                               note=product.description[:500],
-                               category=str(op.payload.get("category") or "general"))
-    except ValueError as exc:
-        raise PlatformError(str(exc), "image_not_found")
-    await _set_main_image(db, product.id, url, origin=image.url if image else "")
-    op.result = {"clean_image": url, "source_image_id": image.id if image else None}
-
-
 HANDLERS = {
     "connect": run_connect,
     "health_check": run_health,
     "publish": run_publish,
     "crawl": run_crawl,
-    "image_clean": run_image_clean,
     "ai_product": run_ai_product,
 }

@@ -54,9 +54,6 @@ class Store(TimestampMixin, Base):
 DEFAULT_STORE_SETTINGS: dict[str, Any] = {
     "show_price_in_caption": True,
     "caption_signature": "",
-    "ai_tone": "friendly",  # friendly | formal
-    "default_publish_mode": "approval",  # auto | approval
-    "low_stock_threshold": 3,
     "crawl_to_inbox": False,
 }
 
@@ -119,17 +116,6 @@ class ProductImage(TimestampMixin, Base):
     product: Mapped[Product] = relationship(back_populates="images")
 
 
-class InventoryMovement(TimestampMixin, Base):
-    __tablename__ = "inventory_movements"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
-    delta: Mapped[int] = mapped_column(Integer)
-    qty_after: Mapped[int] = mapped_column(Integer)
-    reason: Mapped[str] = mapped_column(String(20), default="manual")  # manual | crawl_sync | channel_sync
-    note: Mapped[str] = mapped_column(String(300), default="")
-    actor: Mapped[str] = mapped_column(String(20), default="user")
-
-
 class ChannelListing(TimestampMixin, Base):
     """Product × channel. The unique key is what stops duplicate publishes."""
 
@@ -160,7 +146,7 @@ class Operation(TimestampMixin, Base):
     __tablename__ = "operations"
     id: Mapped[int] = mapped_column(primary_key=True)
     store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), index=True)
-    # connect | publish | crawl | health_check | ai_product | image_clean
+    # connect | publish | crawl | health_check | ai_product
     type: Mapped[str] = mapped_column(String(20), index=True)
     title_fa: Mapped[str] = mapped_column(String(300), default="")
     channel_id: Mapped[int | None] = mapped_column(ForeignKey("channels.id"))
@@ -227,19 +213,6 @@ class CrawlItem(TimestampMixin, Base):
     product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id"))
     result: Mapped[str] = mapped_column(String(12), default="")  # created | updated | duplicate | skipped | inbox | failed
     error_fa: Mapped[str] = mapped_column(Text, default="")
-
-
-class TelegramUpdate(TimestampMixin, Base):
-    """Channel posts the bot received; the crawler reads from here (bots can't read history)."""
-
-    __tablename__ = "bot_channel_posts"
-    __table_args__ = (UniqueConstraint("channel_id", "message_id"),)
-    id: Mapped[int] = mapped_column(primary_key=True)
-    channel_id: Mapped[int] = mapped_column(ForeignKey("channels.id"), index=True)
-    message_id: Mapped[str] = mapped_column(String(40))
-    caption: Mapped[str] = mapped_column(Text, default="")
-    photo_file_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
-    posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 # ---------- AI product requests ----------

@@ -89,10 +89,3 @@ async def callback(request: Request, db: DB):
     form = dict(await request.form()) if request.method == "POST" else {}
     outcome = await _finish(db, dict(request.query_params), {k: str(v) for k, v in form.items()}, request.method)
     return RedirectResponse(f"{settings.frontend_base_url.rstrip('/')}/app/billing?payment={outcome}", status_code=303)
-
-
-@router.get("/me/payments")
-async def my_payments(user: CurrentUser, db: DB):
-    rows = (await db.execute(select(Payment).where(Payment.user_id == user.id).order_by(Payment.id.desc()).limit(20))).scalars()
-    return [{"id": p.id, "plan_id": p.plan_id, "amount_toman": p.amount_toman, "status": p.status, "bank_type": p.bank_type,
-             "tracking_code": p.tracking_code, "created_at": p.created_at, "paid_at": p.paid_at} for p in rows]

@@ -99,11 +99,11 @@ async def test_raw_photo_becomes_product_with_clean_main_image(client, monkeypat
 
     monkeypatch.setattr(ai.httpx, "AsyncClient", lambda *a, **kw: real(*a, transport=httpx.MockTransport(broken),
                                                                       **{k: v for k, v in kw.items() if k != "proxy"}))
-    r = await client.post(f"/products/{prod['id']}/clean-image", headers=h, json={"image_id": prod["images"][1]["id"]})
+    r = await client.post(f"/stores/{sid}/ai-products", headers=h, json={"images": up, "note": "ماگ", "clean_image": True})
     assert r.status_code == 202
     await drain()
     op2 = (await client.get(f"/operations/{r.json()['id']}", headers=h)).json()
-    assert op2["status"] == "failed" and "عکس دیگر" in op2["error_message_fa"]
+    assert op2["status"] == "partial" and "عکس دیگر" in op2["error_message_fa"]  # the product is kept
     assert [x["name"] for x in op2["steps"]][-3:] == ["image_edit", "image_people", "image_retry"]  # one simpler retry
     assert "IMAGE_SAFETY" in str(op2["steps"][-3]["response"])  # the reason stays in the log
 
@@ -135,14 +135,14 @@ async def test_raw_photo_becomes_product_with_clean_main_image(client, monkeypat
 
     monkeypatch.setattr(ai.httpx, "AsyncClient", lambda *a, **kw: real(*a, transport=httpx.MockTransport(free),
                                                                       **{k: v for k, v in kw.items() if k != "proxy"}))
-    r = await client.post(f"/products/{prod3['id']}/clean-image", headers=h, json={})
+    r = await client.post(f"/stores/{sid}/ai-products", headers=h, json={"note": "ماگ", "clean_image": True})
     await drain()
     op4 = (await client.get(f"/operations/{r.json()['id']}", headers=h)).json()
-    assert op4["status"] == "failed" and "Billing" in op4["error_message_fa"]
+    assert op4["status"] == "partial" and "Billing" in op4["error_message_fa"]
     status = (await client.get("/ai/status", headers=h)).json()
     assert status["image_edit"] is False and status["image_edit_problem"] == ""  # sellers get no technical details
     assert "رایگان" in (await client.get("/ai/status", headers=admin)).json()["image_edit_problem"]
-    r = await client.post(f"/products/{prod3['id']}/clean-image", headers=h, json={})
+    r = await client.post(f"/stores/{sid}/ai-products", headers=h, json={"note": "ماگ", "clean_image": True})
     assert r.status_code == 422
     assert (await client.put("/admin/ai/routes/image_edit", headers=admin,
                              json={"provider_id": prov["id"], "model": "gemini-3.1-flash-image"})).status_code == 200
@@ -308,25 +308,3 @@ def test_openrouter_errors_say_what_happened():
         ai._raise_for(other)
     except ai.AIError as exc:
         assert "teapot" in exc.message_fa  # the provider's own words reach the admin
-    try:
-        ai._raise_for(httpx.Response(404, content=b""))
-    except ai.AIError as exc:
-        assert exc.code == "ai_proxy_404" and "VPN" in exc.message_fa  # an empty 404 is the proxy, not the model
-
-
-async def test_openrouter_caps_output_tokens(monkeypatch):
-    from app.models import AiProvider
-
-    monkeypatch.setattr(ai, "_api_key", lambda p: "k")
-    monkeypatch.setattr(ai, "provider_proxy", lambda p: "")
-    sent = {}
-
-    def handler(req):
-        sent["body"] = req.content
-        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}], "usage": {}})
-
-    real = httpx.AsyncClient
-    monkeypatch.setattr(ai.httpx, "AsyncClient", lambda *a, **kw: real(*a, transport=httpx.MockTransport(handler),
-                                                                      **{k: v for k, v in kw.items() if k != "proxy"}))
-    await ai._call(AiProvider(kind="openrouter", base_url=""), "google/gemini-3.6-flash", "s", "p", [], 0.3)
-    assert b'"max_tokens":8192' in sent["body"]

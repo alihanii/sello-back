@@ -79,7 +79,6 @@ class ProductIn(BaseModel):
     tags: list[str] = []
     status: str = "ready"
     images: list[str] = []
-    is_golden_sample: bool = False
 
 
 class ProductPatch(BaseModel):
@@ -95,7 +94,6 @@ class ProductPatch(BaseModel):
     tags: list[str] | None = None
     status: str | None = None
     images: list[str] | None = None
-    is_golden_sample: bool | None = None
 
 
 class ProductOut(ORM):
@@ -115,7 +113,6 @@ class ProductOut(ORM):
     status: str
     created_by: str
     tags: list[str]
-    is_golden_sample: bool
     created_at: datetime
     updated_at: datetime
     images: list[ImageOut] = []
