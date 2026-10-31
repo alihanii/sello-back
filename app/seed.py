@@ -7,7 +7,7 @@ from app.models import Plan
 from app.services.plans import PLAN_TIER
 
 FEATURES = ["۳ فروشگاه", "۸ کانال (تلگرام، بله، دیجی‌کالا، اینستاگرام)", "۲٬۰۰۰ محصول", "۳٬۰۰۰ انتشار در ماه",
-            "کرال ساعتی", "۵۰۰ اعتبار AI در ماه", "اتوماسیون انتشار و تولید محتوا با AI", "ساخت محصول از رفرنس"]
+            "کرال ساعتی", "۵۰۰ اعتبار AI در ماه", "ساخت محصول با AI"]
 LIMITS = {"max_stores": 3, "max_channels": 8, "max_products": 2000, "monthly_publishes": 3000,
           "monthly_ai_credits": 500, "crawl_frequency": "hourly"}
 MONTHLY = 990_000

@@ -54,7 +54,7 @@ async def test_raw_photo_becomes_product_with_clean_main_image(client, monkeypat
 
     up = (await client.post(f"/stores/{sid}/uploads", headers=h, files={"files": ("raw.png", PNG, "image/png")})).json()["urls"]
     # no image model yet: asking for a clean photo is refused with the reason
-    r = await client.post(f"/stores/{sid}/reference-sets", headers=h, json={"images": up, "note": "ماگ سرامیکی سفید", "clean_image": True})
+    r = await client.post(f"/stores/{sid}/ai-products", headers=h, json={"images": up, "note": "ماگ سرامیکی سفید", "clean_image": True})
     assert r.status_code == 422 and "تصویری" in r.json()["detail"]["message"]
     assert (await client.put("/admin/ai/routes/image_edit", headers=admin,
                              json={"provider_id": prov["id"], "model": "gemini-3.1-flash-image"})).status_code == 200
@@ -80,10 +80,10 @@ async def test_raw_photo_becomes_product_with_clean_main_image(client, monkeypat
     monkeypatch.setattr(ai, "_call", fake_call)
     monkeypatch.setattr(ai.httpx, "AsyncClient", lambda *a, **kw: real(*a, transport=httpx.MockTransport(handler),
                                                                       **{k: v for k, v in kw.items() if k != "proxy"}))
-    ops = (await client.post(f"/stores/{sid}/reference-sets", headers=h,
+    ops = (await client.post(f"/stores/{sid}/ai-products", headers=h,
                              json={"images": up, "note": "ماگ سرامیکی سفید", "clean_image": True})).json()
     await drain()
-    op = (await client.get(f"/operations/{ops[0]['id']}", headers=h)).json()
+    op = (await client.get(f"/operations/{ops["id"]}", headers=h)).json()
     assert op["status"] == "succeeded", op
     assert [s["name"] for s in op["steps"]][-2:] == ["image_prompt", "image_edit"]
     assert calls == [("gemini-3.6-flash", True, 1), ("gemini-3.6-flash", False, 1)]
@@ -117,10 +117,10 @@ async def test_raw_photo_becomes_product_with_clean_main_image(client, monkeypat
 
     monkeypatch.setattr(ai.httpx, "AsyncClient", lambda *a, **kw: real(*a, transport=httpx.MockTransport(ok),
                                                                       **{k: v for k, v in kw.items() if k != "proxy"}))
-    ops = (await client.post(f"/stores/{sid}/reference-sets", headers=h,
+    ops = (await client.post(f"/stores/{sid}/ai-products", headers=h,
                              json={"note": "ماگ سرامیکی مشکی", "clean_image": True})).json()
     await drain()
-    op3 = (await client.get(f"/operations/{ops[0]['id']}", headers=h)).json()
+    op3 = (await client.get(f"/operations/{ops["id"]}", headers=h)).json()
     assert op3["status"] == "succeeded", op3
     builder = next(s for s in op3["steps"] if s["name"] == "image_prompt")
     assert builder["request"]["has_photo"] is False

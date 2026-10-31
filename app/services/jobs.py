@@ -1,4 +1,4 @@
-"""Operation handlers the worker runs: connect, health_check, publish, crawl, reference, style."""
+"""Operation handlers the worker runs: connect, health_check, publish, crawl, ai_product, image_clean."""
 
 import json
 import re
@@ -12,8 +12,8 @@ from sqlalchemy.orm import selectinload
 from app.core.db import utcnow
 from app.core.security import encrypt_credentials
 from app.models import (
-    Channel, ChannelListing, CrawlItem, CrawlSource, Operation, Product, ProductImage, ReferenceSet,
-    Store, StoreStyleProfile,
+    AiProductRequest, Channel, ChannelListing, CrawlItem, CrawlSource, Operation, Product, ProductImage,
+    Store,
 )
 from app.platforms.base import CrawledItem, EDIT_PRODUCT, PlatformError
 from app.platforms.registry import get_adapter
@@ -241,7 +241,7 @@ async def run_crawl(ctx: OpContext) -> None:
         op.result["note"] = ctx.empty_reason or "آیتم جدیدی پیدا نشد."
 
 
-# ---------- link fetching (reference + url crawl) ----------
+# ---------- link fetching (url crawl) ----------
 
 async def fetch_product_page(url: str) -> dict[str, Any]:
     """JSON-LD Product first, then OpenGraph/meta, then visible text for the LLM."""
@@ -285,49 +285,23 @@ async def fetch_product_page(url: str) -> dict[str, Any]:
     return out
 
 
-# ---------- AI: reference-based generation & style profile ----------
+# ---------- AI: product from the seller's photos and description ----------
 
-async def run_reference(ctx: OpContext) -> None:
-    ref = await ctx.db.get(ReferenceSet, ctx.op.ref_id)
-    await generate_from_reference(ctx, ref)
+async def run_ai_product(ctx: OpContext) -> None:
+    req = await ctx.db.get(AiProductRequest, ctx.op.ref_id)
+    await generate_product(ctx, req)
 
 
-async def generate_from_reference(ctx: OpContext, ref: ReferenceSet) -> Product:
+async def generate_product(ctx: OpContext, ref: AiProductRequest) -> Product:
     db, op = ctx.db, ctx.op
     store = await db.get(Store, op.store_id)
-    pages: list[dict] = []
-    fetches = []
-    for i, url in enumerate(ref.urls):
-        try:
-            async with ctx.step(f"link_{i + 1}", f"کرال لینک {i + 1} از {len(ref.urls)}", request={"url": url}) as s:
-                page = await fetch_product_page(url)
-                s.response = {k: v for k, v in page.items() if k != "text"}
-            pages.append({k: v for k, v in page.items() if k != "images"})
-            fetches.append({"url": url, "status": "ok", "method": page["method"]})
-        except PlatformError as exc:
-            fetches.append({"url": url, "status": "failed", "error_fa": exc.message_fa})
-    ref.url_fetches = fetches
-
-    samples, profile = [], None
-    if ref.use_style_profile:
-        async with ctx.step("style", "خواندن سبک فروشگاه") as s:
-            prof = (await db.execute(select(StoreStyleProfile).where(StoreStyleProfile.store_id == store.id))).scalar_one_or_none()
-            profile = prof.profile if prof else None
-            ids = ref.product_ids or []
-            q = select(Product).where(Product.store_id == store.id, Product.source != "ai")
-            q = q.where(Product.id.in_(ids)) if ids else q.order_by(Product.is_golden_sample.desc(), Product.id.desc()).limit(5)
-            samples = [{"title": p.title, "description": p.description[:600], "price": p.price}
-                       for p in (await db.execute(q)).scalars()]
-            s.response = {"has_profile": bool(profile), "samples": len(samples)}
-
     images = [b for b in (read_local(u) for u in ref.images) if b][:4]
     photo_role = ("The attached photo is a DESIGN/artwork the seller prints on the product, not the product itself; "
                   "describe the product from the seller's note, with this design on it."
                   if (op.payload or {}).get("photo_kind") == "design" else "")
-    prompt = json.dumps({"seller_note": ref.note, "photo_role": photo_role, "price": ref.price, "style_profile": profile,
-                         "shop_examples": samples, "reference_pages": pages}, ensure_ascii=False)
-    async with ctx.step("generate", "ساخت محصول با هوش مصنوعی", request={"images": len(images), "links": len(pages)}) as s:
-        result = await ai.generate_json(task="product_generate", system=ai.PRODUCT_FROM_REFERENCE_SYSTEM,
+    prompt = json.dumps({"seller_note": ref.note, "photo_role": photo_role, "price": ref.price}, ensure_ascii=False)
+    async with ctx.step("generate", "ساخت محصول با هوش مصنوعی", request={"images": len(images)}) as s:
+        result = await ai.generate_json(task="product_generate", system=ai.PRODUCT_FROM_PHOTO_SYSTEM,
                                         prompt=prompt, images=images, store_id=store.id)
         s.response = result
     product = Product(store_id=store.id, title=normalize_fa(result.get("title") or "محصول جدید")[:300],
@@ -335,18 +309,16 @@ async def generate_from_reference(ctx: OpContext, ref: ReferenceSet) -> Product:
                       stock_qty=ref.stock_qty or parse_number(str(result.get("quantity") or 0)), brand=result.get("brand", ""), category_hint=result.get("category_hint", ""),
                       attributes=result.get("attributes") or {}, tags=(result.get("tags") or [])[:8], source="ai",
                       created_by="ai", status="draft",
-                      source_ref={"reference_set_id": ref.id, "urls": ref.urls, "field_sources": result.get("field_sources", {})})
+                      source_ref={"ai_request_id": ref.id, "field_sources": result.get("field_sources", {})})
     db.add(product)
     await db.flush()
     for pos, url in enumerate(ref.images[:10]):
         db.add(ProductImage(product_id=product.id, url=url, position=pos))
     ref.result_product_ids = [product.id]
     op.product_id = product.id
-    op.result = {"product_id": product.id, "url_fetches": fetches}
+    op.result = {"product_id": product.id}
     await record_event(db, store.id, "product_created", operation_id=op.id)
     problems = []
-    if any(f["status"] == "failed" for f in fetches):
-        problems.append("بعضی لینک‌ها کرال نشدند؛ محصول با بقیهٔ رفرنس‌ها ساخته شد.")
     if (op.payload or {}).get("clean_image"):
         await db.commit()  # keep the product even if the image step fails
         source = ref.images[0] if ref.images else None
@@ -393,34 +365,11 @@ async def run_image_clean(ctx: OpContext) -> None:
     op.result = {"clean_image": url, "source_image_id": image.id if image else None}
 
 
-async def run_style_profile(ctx: OpContext) -> None:
-    db, op = ctx.db, ctx.op
-    q = (select(Product).where(Product.store_id == op.store_id, Product.source != "ai")
-         .order_by(Product.is_golden_sample.desc(), Product.id.desc()).limit(25))
-    products = list((await db.execute(q)).scalars())
-    if len(products) < 3:
-        raise PlatformError("برای ساخت پروفایل سبک حداقل ۳ محصول (دستی یا کرال‌شده) لازم است.", "too_few_products")
-    async with ctx.step("analyse", f"تحلیل {len(products)} محصول") as s:
-        result = await ai.generate_json(
-            task="style_profile", system=ai.STYLE_PROFILE_SYSTEM, store_id=op.store_id,
-            prompt=json.dumps([{"title": p.title, "description": p.description[:800], "price": p.price,
-                                "category": p.category_hint} for p in products], ensure_ascii=False))
-        s.response = result
-    prof = (await db.execute(select(StoreStyleProfile).where(StoreStyleProfile.store_id == op.store_id))).scalar_one_or_none()
-    if not prof:
-        prof = StoreStyleProfile(store_id=op.store_id)
-        db.add(prof)
-    prof.profile = result
-    prof.sample_product_ids = [p.id for p in products]
-    op.result = {"profile": result}
-
-
 HANDLERS = {
     "connect": run_connect,
     "health_check": run_health,
     "publish": run_publish,
     "crawl": run_crawl,
     "image_clean": run_image_clean,
-    "reference": run_reference,
-    "style_profile": run_style_profile,
+    "ai_product": run_ai_product,
 }

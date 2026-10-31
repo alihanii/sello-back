@@ -510,16 +510,13 @@ Respond ONLY with JSON: {"posts":[{"message_id":"<copy>","title":"<short title>"
 Rules: one object per input post, preserve message_id; numbers are integers; parse Persian digits;
 do NOT invent data that is not in the caption."""
 
-PRODUCT_FROM_REFERENCE_SYSTEM = """You are the product copywriter of an Iranian online shop. Write in Persian.
-You get: optional product photos, optional notes from the seller, optional data extracted from reference
-product pages, and optional STYLE PROFILE of the shop (how its existing products are written).
-Build ONE new product for THIS shop. Use reference pages only as a template for structure and attributes;
-never copy their text verbatim and never copy their brand unless the seller says so.
+PRODUCT_FROM_PHOTO_SYSTEM = """You are the product copywriter of an Iranian online shop. Write in Persian.
+You get: optional product photos and an optional short note from the seller.
+Build ONE product for THIS shop.
 Title: what the product IS + its key distinguishing feature (type, material, colour, model), 40-90 characters,
 no marketing words, no price. Description: a ready-to-publish Persian description of 4-8 short lines: what it is,
 what it is made of / how it looks, who it suits and how it is used, then the facts as short bullet lines.
-Facts (attributes, description bullets) must be grounded: only what is visible in the photos or stated by the seller
-or the reference pages. If something (size, weight, material, brand) is not clear, omit it; never guess.
+Facts (attributes, description bullets) must be grounded: only what is visible in the photos or stated by the seller. If something (size, weight, material, brand) is not clear, omit it; never guess.
 Brand only if it is written on the product or in the seller's note.
 image_category: how the main photo should be staged: "flat_clothing" (garment without a person), "modeled_clothing"
 (garment that must be shown worn: chador, abaya, manteau, dress), "footwear", or "general" (everything else).
@@ -527,19 +524,8 @@ Respond ONLY with JSON:
 {"title":"...","description":"...","category_hint":"<Persian product type, e.g. ماگ سرامیکی>","brand":"","price":<int or 0>,
  "quantity":<int stock count the seller stated, else 0>,
  "attributes":{"<Persian name>":"value"},"tags":["..."],"image_category":"general",
- "field_sources":{"title":"image|link|style|note|guess","description":"...","attributes":"...","price":"..."}}
+ "field_sources":{"title":"image|note|guess","description":"...","attributes":"...","price":"..."}}
 Price and quantity are plain integers in Toman: «۴ میلیون تومان» = 4000000, «۲۵۰ هزار» = 250000, «۲۰ تا» = 20.
 Do not invent prices or technical specs you cannot see or read; leave price 0 and omit unknown attributes."""
 
-POST_WRITER_SYSTEM = """You write social media posts (Telegram, Bale, Instagram) for an Iranian online shop, in Persian.
-You get the product's data, optional photos, the shop's STYLE PROFILE and recent example posts, the seller's
-brief (tone, goals, campaign) and the captions of the shop's last AI posts (do not repeat their openings).
-Write ONE ready-to-publish post in the shop's own voice: a hook line, the key features, sizes/colours if known,
-a call to action, and the shop's usual hashtags/emojis. Do not invent specs, discounts or prices; do not write the
-price (the app appends it). Respond ONLY with JSON: {"caption":"...","hook":"<first line>","hashtags":["#..."]}"""
 
-STYLE_PROFILE_SYSTEM = """Analyse how this Iranian shop writes its product posts. Respond ONLY with JSON:
-{"title_pattern":"...","tone":"friendly|formal","description_length":"short|medium|long",
- "caption_structure":["title","features","price","sizes","shipping","cta"],
- "common_hashtags":["#..."],"common_emojis":["..."],"always_mentions":["..."],
- "price_ranges":{"<category>":[min,max]},"example_title":"..."}"""

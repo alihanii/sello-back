@@ -52,7 +52,7 @@ async def test_full_seller_flow(client, monkeypatch):
     listing = p["listings"][0]
     assert listing["status"] == "published" and listing["published_by"] == "user"
     assert listing["remote_url"] == "https://t.me/testshop/56"
-    log = (await client.get(f"/operations/{ops[0]['id']}", headers=h)).json()
+    log = (await client.get(f"/operations/{ops[0]["id"]}", headers=h)).json()
     assert [s["name"] for s in log["steps"]] == ["validate", "build_caption", "send"]
     assert "123:abc" not in str(log)  # token never reaches the visible log
 
@@ -98,9 +98,9 @@ async def test_failures_are_explained(client, monkeypatch):
     assert op["suggested_action"]["type"] == "reconnect"
 
     # AI not configured -> clear message pointing at the admin
-    ops = (await client.post(f"/stores/{sid}/reference-sets", headers=h, json={"note": "کفش اسپرت مردانه"})).json()
+    ops = (await client.post(f"/stores/{sid}/ai-products", headers=h, json={"note": "کفش اسپرت مردانه"})).json()
     await drain()
-    op = (await client.get(f"/operations/{ops[0]['id']}", headers=h)).json()
+    op = (await client.get(f"/operations/{ops["id"]}", headers=h)).json()
     assert op["status"] == "failed" and op["error_code"] == "ai_not_configured"
 
 
@@ -138,9 +138,9 @@ async def test_admin_plans_and_ai_keys(client, monkeypatch):
 
     monkeypatch.setattr(ai, "_call", fake)
     sid = (await client.post("/stores", json={"name": "s3"}, headers=seller)).json()["id"]
-    ops = (await client.post(f"/stores/{sid}/reference-sets", headers=seller, json={"note": "کفش اسپرت", "price": 1500000})).json()
+    ops = (await client.post(f"/stores/{sid}/ai-products", headers=seller, json={"note": "کفش اسپرت", "price": 1500000})).json()
     await drain()
-    op = (await client.get(f"/operations/{ops[0]['id']}", headers=seller)).json()
+    op = (await client.get(f"/operations/{ops["id"]}", headers=seller)).json()
     assert op["status"] == "succeeded", op
     prod = (await client.get(f"/products/{op['result']['product_id']}", headers=seller)).json()
     assert prod["source"] == "ai" and prod["status"] == "draft" and prod["price"] == 1500000

@@ -160,7 +160,7 @@ class Operation(TimestampMixin, Base):
     __tablename__ = "operations"
     id: Mapped[int] = mapped_column(primary_key=True)
     store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), index=True)
-    # connect | publish | crawl | health_check | reference | image_clean
+    # connect | publish | crawl | health_check | ai_product | image_clean
     type: Mapped[str] = mapped_column(String(20), index=True)
     title_fa: Mapped[str] = mapped_column(String(300), default="")
     channel_id: Mapped[int | None] = mapped_column(ForeignKey("channels.id"))
@@ -242,31 +242,25 @@ class TelegramUpdate(TimestampMixin, Base):
     posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
-# ---------- AI references & style ----------
+# ---------- AI product requests ----------
 
 
-class ReferenceSet(TimestampMixin, Base):
-    __tablename__ = "reference_sets"
+class AiProductRequest(TimestampMixin, Base):
+    """What the seller gave the "build with AI" form: photos and a short description."""
+    __tablename__ = "reference_sets"  # old table name, kept so existing databases keep working
     id: Mapped[int] = mapped_column(primary_key=True)
     store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), index=True)
     images: Mapped[list[str]] = mapped_column(JSON, default=list)
-    product_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
-    urls: Mapped[list[str]] = mapped_column(JSON, default=list)
     note: Mapped[str] = mapped_column(Text, default="")
     price: Mapped[int] = mapped_column(BigInteger, default=0)
     stock_qty: Mapped[int] = mapped_column(Integer, default=0)
-    use_style_profile: Mapped[bool] = mapped_column(Boolean, default=True)
-    url_fetches: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     result_product_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
     operation_id: Mapped[int | None] = mapped_column(ForeignKey("operations.id"))
-
-
-class StoreStyleProfile(TimestampMixin, Base):
-    __tablename__ = "store_style_profiles"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), unique=True)
-    profile: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    sample_product_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    # Unused columns that older databases have as NOT NULL.
+    product_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    urls: Mapped[list[str]] = mapped_column(JSON, default=list)
+    use_style_profile: Mapped[bool] = mapped_column(Boolean, default=False)
+    url_fetches: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
 
 
 class Notification(TimestampMixin, Base):
@@ -388,9 +382,8 @@ class AiProvider(TimestampMixin, Base):
 
 AI_TASKS: dict[str, str] = {
     "caption_extract": "استخراج محصول از پست/کپشن",
-    "product_generate": "ساخت محصول (از رفرنس، عکس، لینک)",
+    "product_generate": "ساخت محصول با AI (از عکس و توضیح)",
     "vision": "تحلیل عکس محصول",
-    "style_profile": "ساخت پروفایل سبک فروشگاه",
     "field_fill": "پر کردن فیلدهای اجباری پلتفرم‌ها",
     "caption_rewrite": "بازنویسی کپشن برای هر کانال",
     "image_prompt": "نوشتن دستور عکس محصول (platform-wrappers: gemini-2.5-flash)",
