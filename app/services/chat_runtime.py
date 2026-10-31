@@ -216,6 +216,9 @@ async def answer(conv_id: int, *, send: bool = True) -> list[ChatMessage]:
         if not pending:
             return []
         result = await run_turn(db, conv, store, agent, list(pending))
+        if conv.is_test and result.error and result.replies:
+            # Only the seller sees the test chat: say why the model failed instead of a vague "colleague will answer".
+            result.replies[-1].text += f"\n\n⚠️ (فقط در چت تست) خطای هوش مصنوعی: {result.error}"
         if conv.status == "needs_human":
             # Waiting for the seller: stay quiet instead of repeating "an admin will answer", for a while.
             conv.ai_paused_until = utcnow() + timedelta(minutes=max(1, agent.handoff_minutes or 60))

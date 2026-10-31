@@ -429,3 +429,30 @@ async def test_faq_extract_from_text_and_file(client, monkeypatch):
     assert r.json()["items"][0]["q"] == "مرجوعی دارید؟" and "مرجوعی تا ۷ روز" in llm.calls[-1]["prompt"]
     r = await client.post(f"/stores/{sid}/chat/faq/extract", headers=h, files={"file": ("a.xlsx", b"PK", "application/octet-stream")})
     assert r.status_code == 422
+
+
+async def test_assistant_keeps_the_chat_unless_a_person_is_wanted(client, monkeypatch):
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550011")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True})
+    conv = await _real_conv(sid)
+    from app.core.db import SessionLocal
+
+    async def say(text):
+        async with SessionLocal() as db:
+            rt.add_message(db, await db.get(chat_engine.ChatConversation, conv), role="customer", text=text)
+            await db.commit()
+        saved = await rt.answer(conv, send=False)
+        async with SessionLocal() as db:
+            return saved, (await db.get(chat_engine.ChatConversation, conv)).status
+
+    # an unsure model answer is not a handoff: the reply is sent and the assistant stays on
+    llm.answers = [{"reply": "این رو دقیق نمی‌دونم، ولی مانتو لینن موجوده.", "intent": "product", "handoff": True}]
+    saved, status = await say("جنس آستر مانتو چیه؟")
+    assert saved[-1].source == "llm" and status == "ai"
+    llm.answers = [{"reply": "", "intent": "faq", "handoff": True}]
+    saved, status = await say("پشتیبانی دارید؟")
+    assert saved[-1].text == chat_engine.NO_ANSWER_TEXT and status == "ai"
+    # a real request for a person pauses the assistant (no model call)
+    before = len(llm.calls)
+    saved, status = await say("وصلم کن به پشتیبانی")
+    assert saved[-1].source == "handoff" and status == "needs_human" and len(llm.calls) == before
