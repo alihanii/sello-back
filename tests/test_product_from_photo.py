@@ -93,6 +93,18 @@ async def test_raw_photo_becomes_product_with_clean_main_image(client, monkeypat
     assert prod["title"] == "ماگ سرامیکی سفید"
     assert prod["images"][0]["url"] == op["result"]["clean_image"] and prod["images"][1]["url"] == up[0]
 
+    # seller turned "make the photo too" off: text only, no image call, their photo kept as is
+    calls.clear()
+    sent.clear()
+    ops = (await client.post(f"/stores/{sid}/ai-products", headers=h,
+                             json={"images": up, "note": "ماگ سرامیکی سفید", "clean_image": False})).json()
+    await drain()
+    op = (await client.get(f"/operations/{ops["id"]}", headers=h)).json()
+    assert op["status"] == "succeeded" and "clean_image" not in op["result"]
+    assert calls == [("gemini-3.6-flash", True, 1)] and not sent
+    prod = (await client.get(f"/products/{op['result']['product_id']}", headers=h)).json()
+    assert [i["url"] for i in prod["images"]] == up
+
     # the image model failing keeps the product and says why
     def broken(req):
         return httpx.Response(200, json={"candidates": [{"finishReason": "IMAGE_SAFETY", "content": {"parts": []}}]})
