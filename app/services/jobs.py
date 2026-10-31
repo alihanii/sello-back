@@ -19,6 +19,8 @@ from app.platforms.base import CrawledItem, EDIT_PRODUCT, PlatformError
 from app.platforms.registry import get_adapter
 from app.services import ai
 from app.services.media import read_local, save_bytes
+from app.services import instagram_crawl as ig
+from app.services.integrations import instagram_crawler
 from app.services.product_images import make_photo
 from app.services.ops import OpContext, record_event
 from app.services.text import normalize_fa, parse_caption, parse_number
@@ -144,7 +146,9 @@ async def _extract(items: list[CrawledItem], mode: str, store_id: int) -> tuple[
 
 
 async def ingest_items(ctx: OpContext, *, store: Store, items: list[CrawledItem], source_key: dict[str, Any],
-                       mode: str, channel: Channel | None, source_id: int | None, to_inbox: bool) -> dict[str, int]:
+                       mode: str, channel: Channel | None, source_id: int | None, to_inbox: bool,
+                       fetch_image=None) -> dict[str, int]:
+    """`fetch_image(url) -> (bytes, content_type)` copies remote photos (Instagram links expire) to our media."""
     db, op = ctx.db, ctx.op
     counts = {"seen": len(items), "created": 0, "updated": 0, "duplicate": 0, "skipped": 0, "failed": 0, "inbox": 0}
     async with ctx.step("extract", f"استخراج دیتای {len(items)} آیتم", request={"mode": mode}) as s:
@@ -197,6 +201,9 @@ async def ingest_items(ctx: OpContext, *, store: Store, items: list[CrawledItem]
                     if url.startswith("botfile:") and channel:
                         blob, name = await get_adapter(channel.platform).download_file(channel, url.removeprefix("botfile:"))
                         url = save_bytes(store.id, blob, name)
+                    elif fetch_image and url.startswith("http"):
+                        blob, ctype = await fetch_image(url)
+                        url = save_bytes(store.id, blob, content_type=ctype)
                     db.add(ProductImage(product_id=prod.id, url=url, position=pos, origin_url=url))
                 except Exception:  # noqa: BLE001 - a missing photo shouldn't drop the product
                     row.error_fa = "بعضی عکس‌ها دریافت نشدند."
@@ -217,6 +224,9 @@ async def run_crawl(ctx: OpContext) -> None:
     source = await db.get(CrawlSource, op.ref_id)
     store = await db.get(Store, op.store_id)
     channel = await db.get(Channel, source.channel_id) if source.channel_id else None
+    if source.type == "instagram_profile":
+        await _crawl_instagram(ctx, source, store)
+        return
     if source.type == "url":
         async with ctx.step("fetch_url", "دریافت صفحه", request={"url": source.url}) as s:
             page = await fetch_product_page(source.url)
@@ -239,6 +249,58 @@ async def run_crawl(ctx: OpContext) -> None:
         op.error_message_fa = f"{counts['failed']} آیتم از {counts['seen']} آیتم استخراج نشد."
     if counts["seen"] == 0:
         op.result["note"] = ctx.empty_reason or "آیتم جدیدی پیدا نشد."
+
+
+async def _crawl_instagram(ctx: OpContext, source: CrawlSource, store: Store) -> None:
+    """Newest 25 posts of a public page. Posts crawled before are never imported again (reported as not loaded),
+    reels are skipped unless the source allows them, and then only their cover image is used."""
+    db, op = ctx.db, ctx.op
+    username, include_reels = source.url, bool((source.options or {}).get("include_reels"))
+    cfg = await instagram_crawler(db)
+    async with ctx.step("fetch_instagram", f"دریافت ۲۵ پست آخر ‎@{username}", request={"username": username,
+                        "include_reels": include_reels, "provider": cfg["provider"]}) as s:
+        posts = await ig.fetch_posts(cfg, username)
+        s.response = {"posts": len(posts), "kinds": {k: sum(p.kind == k for p in posts) for k in ("image", "carousel", "reel")}}
+    key = f"ig:{username}"  # per page, not per source: re-adding the same page doesn't re-import its posts
+    known = {(p.source_ref or {}).get("external_id")
+             for p in (await db.execute(select(Product).where(Product.store_id == store.id))).scalars()
+             if (p.source_ref or {}).get("key") == key}
+    fresh, reels, already = [], 0, 0
+    for p in posts:
+        if p.shortcode in known:
+            already += 1
+            db.add(CrawlItem(operation_id=op.id, source_id=source.id, external_id=p.shortcode, result="duplicate",
+                             raw={"url": p.url, "kind": p.kind}, error_fa="قبلاً کرال شده؛ دوباره بارگذاری نشد."))
+        elif p.kind == "reel" and not include_reels:
+            reels += 1
+            db.add(CrawlItem(operation_id=op.id, source_id=source.id, external_id=p.shortcode, result="skipped",
+                             raw={"url": p.url, "kind": p.kind}, error_fa="ریلز است؛ کرال ریلز خاموش است."))
+        elif not p.image_urls:
+            db.add(CrawlItem(operation_id=op.id, source_id=source.id, external_id=p.shortcode, result="skipped",
+                             raw={"url": p.url, "kind": p.kind}, error_fa="این پست عکس ندارد."))
+        else:
+            fresh.append(CrawledItem(external_id=p.shortcode, caption=p.caption, image_urls=p.image_urls[:1] if p.kind == "reel"
+                                     else p.image_urls, url=p.url, raw={"kind": p.kind}))
+    counts = await ingest_items(ctx, store=store, items=fresh, mode=source.extraction_mode, channel=None,
+                                source_key={"key": key, "source_id": source.id, "platform": "instagram"},
+                                source_id=source.id, to_inbox=(store.settings or {}).get("crawl_to_inbox", False),
+                                fetch_image=lambda u: ig.download(u, cfg["proxy"]))
+    skipped_other = len(posts) - len(fresh) - already - reels
+    counts.update(seen=len(posts), not_loaded=already, reels_skipped=reels, skipped=counts["skipped"] + skipped_other)
+    source.last_run_at = utcnow()
+    op.result = counts
+    notes = []
+    if already:
+        notes.append(f"{already} پست قبلاً کرال شده بود و دوباره بارگذاری نشد.")
+    if reels:
+        notes.append(f"{reels} ریلز رد شد؛ اگر ریلزها را هم می‌خواهی، گزینهٔ «ریلزها هم کرال شوند» را روشن کن (فقط عکس کاورشان برداشته می‌شود).")
+    if not posts:
+        notes.append("این پیج پستی نداشت.")
+    if notes:
+        op.result["note"] = " ".join(notes)
+    if counts["failed"] and counts["failed"] < len(fresh):
+        op.status = "partial"
+        op.error_message_fa = f"{counts['failed']} پست از {len(fresh)} پست جدید استخراج نشد."
 
 
 # ---------- link fetching (url crawl) ----------

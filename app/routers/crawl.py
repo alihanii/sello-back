@@ -9,6 +9,7 @@ from app.core.db import utcnow
 from app.deps import DB, CurrentUser, get_store_for
 from app.models import Channel, CrawlSource, Product
 from app.schemas import OperationOut, ProductOut
+from app.services.instagram_crawl import normalize_username
 from app.services.ops import enqueue
 
 router = APIRouter(tags=["crawl"])
@@ -17,17 +18,19 @@ SCHEDULES = {"manual", "hourly", "daily", "weekly"}
 
 class SourceIn(BaseModel):
     name: str = ""
-    type: str  # channel_posts | marketplace_listing | url
+    type: str  # channel_posts | marketplace_listing | url | instagram_profile
     channel_id: int | None = None
     url: str = ""
     schedule: str = "manual"
     extraction_mode: str = "auto"
     is_active: bool = True
+    include_reels: bool = False  # instagram_profile: also take reels, as their cover image only
 
 
 def _out(s: CrawlSource) -> dict:
-    return {c: getattr(s, c) for c in ("id", "store_id", "name", "type", "channel_id", "url", "schedule",
-                                         "extraction_mode", "is_active", "last_run_at", "next_run_at", "created_at")}
+    return {**{c: getattr(s, c) for c in ("id", "store_id", "name", "type", "channel_id", "url", "schedule",
+                                           "extraction_mode", "is_active", "last_run_at", "next_run_at", "created_at")},
+            "include_reels": bool((s.options or {}).get("include_reels"))}
 
 
 @router.get("/stores/{store_id}/crawl-sources")
@@ -51,9 +54,17 @@ async def create_source(store_id: int, body: SourceIn, user: CurrentUser, db: DB
         if not body.url.startswith(("http://", "https://")):
             raise HTTPException(422, "لینک معتبر وارد کنید.")
         name = body.name or body.url[:80]
+    elif body.type == "instagram_profile":
+        username = normalize_username(body.url)
+        if not username:
+            raise HTTPException(422, "آیدی اینستاگرام معتبر وارد کنید؛ مثلاً mystore یا ‎@mystore")
+        body.url, body.channel_id = username, None
+        name = body.name or f"اینستاگرام ‎@{username}"
     else:
         raise HTTPException(422, "نوع منبع نامعتبر است.")
-    s = CrawlSource(store_id=store_id, **{**body.model_dump(), "name": name},
+    data = body.model_dump(exclude={"include_reels"})
+    s = CrawlSource(store_id=store_id, **{**data, "name": name},
+                    options={"include_reels": body.include_reels} if body.type == "instagram_profile" else {},
                     next_run_at=utcnow() + timedelta(minutes=1) if body.schedule != "manual" else None)
     db.add(s)
     await db.commit()
@@ -67,6 +78,8 @@ async def update_source(source_id: int, body: SourceIn, user: CurrentUser, db: D
         raise HTTPException(404, "منبع پیدا نشد.")
     await get_store_for(db, user, s.store_id)
     s.name, s.schedule, s.extraction_mode, s.is_active = body.name or s.name, body.schedule, body.extraction_mode, body.is_active
+    if s.type == "instagram_profile":
+        s.options = {**(s.options or {}), "include_reels": body.include_reels}
     await db.commit()
     return _out(s)
 

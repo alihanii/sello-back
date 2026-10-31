@@ -16,7 +16,10 @@ from app.models import (
     Operation, Payment, Plan, PlanRequest, Product, Store, Subscription, User,
 )
 from app.services.bank import BANKS
-from app.services.integrations import INSTAGRAM_SCOPES, instagram_app, payment_config, save_instagram_app, save_payment_config
+from app.services.integrations import (
+    INSTAGRAM_SCOPES, instagram_app, instagram_crawler, payment_config, save_instagram_app, save_instagram_crawler,
+    save_payment_config,
+)
 from app.services.plans import PLAN_TIER, create_subscription, plan_config
 from app.schemas import ChannelOut, PlanConfig, PlanOut, StoreOut, UserOut
 from app.services.ai import DEFAULT_BASE_URLS, AIError, check_model, list_models, model_kind, provider_proxy, test_provider
@@ -234,6 +237,31 @@ async def put_instagram(body: InstagramAppIn, admin: AdminUser, db: DB):
           {"enabled": body.enabled, "app_id": body.app_id, "proxy": bool(body.proxy), "secret_changed": body.app_secret is not None})
     await db.commit()
     return await get_instagram(admin, db)
+
+
+class InstagramCrawlerIn(BaseModel):
+    provider: str = "apify"
+    token: str | None = None  # None keeps the stored token
+    proxy: str = ""
+
+
+@router.get("/integrations/instagram-crawler")
+async def get_instagram_crawler(admin: AdminUser, db: DB):
+    cfg = await instagram_crawler(db)
+    token = cfg["token"]
+    return {"provider": cfg["provider"], "proxy": cfg["proxy"], "has_token": bool(token),
+            "token_hint": f"…{token[-4:]}" if len(token) > 8 else "", "providers": [{"id": "apify", "label": "Apify"}]}
+
+
+@router.put("/integrations/instagram-crawler")
+async def put_instagram_crawler(body: InstagramCrawlerIn, admin: AdminUser, db: DB):
+    if body.provider != "apify":
+        raise HTTPException(422, "فعلاً فقط Apify پشتیبانی می‌شود.")
+    await save_instagram_crawler(db, provider=body.provider, proxy=body.proxy, token=body.token)
+    audit(db, admin, "update_integration", "instagram_crawler", None,
+          {"provider": body.provider, "proxy": bool(body.proxy), "token_changed": body.token is not None})
+    await db.commit()
+    return await get_instagram_crawler(admin, db)
 
 
 class PaymentConfigIn(BaseModel):

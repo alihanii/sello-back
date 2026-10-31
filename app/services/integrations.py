@@ -39,6 +39,27 @@ async def save_instagram_app(db: AsyncSession, *, enabled: bool, app_id: str, pr
         row.secret_encrypted = encrypt_credentials({"app_secret": app_secret.strip()}) if app_secret.strip() else None
 
 
+INSTAGRAM_CRAWLER = "instagram_crawler"
+
+
+async def instagram_crawler(db: AsyncSession) -> dict[str, Any]:
+    """Scraping service for crawling public Instagram pages by username: {provider, token, proxy}."""
+    row = await db.get(AppSetting, INSTAGRAM_CRAWLER)
+    value = row.value if row else {}
+    token = decrypt_credentials(row.secret_encrypted).get("token", "") if row and row.secret_encrypted else ""
+    return {"provider": value.get("provider") or "apify", "token": token, "proxy": value.get("proxy", "")}
+
+
+async def save_instagram_crawler(db: AsyncSession, *, provider: str, proxy: str, token: str | None) -> None:
+    row = await db.get(AppSetting, INSTAGRAM_CRAWLER)
+    if not row:
+        row = AppSetting(key=INSTAGRAM_CRAWLER, value={})
+        db.add(row)
+    row.value = {"provider": provider, "proxy": proxy.strip()}
+    if token is not None:
+        row.secret_encrypted = encrypt_credentials({"token": token.strip()}) if token.strip() else None
+
+
 PAYMENT = "payment"
 
 
