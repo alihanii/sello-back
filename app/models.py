@@ -507,6 +507,21 @@ class ChatReference(TimestampMixin, Base):
     image_url: Mapped[str] = mapped_column(String(1000), default="")
 
 
+class ChatAnswerCache(Base):
+    """A model answer to a general question (shipping, payment, off-topic…), reused when the same question comes
+    again. The key covers the question and the store's settings, so editing the assistant starts fresh."""
+
+    __tablename__ = "chat_answer_cache"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    store_id: Mapped[int] = mapped_column(Integer, index=True)
+    key: Mapped[str] = mapped_column(String(64), index=True)
+    question: Mapped[str] = mapped_column(String(300), default="")
+    answer: Mapped[str] = mapped_column(Text, default="")
+    intent: Mapped[str] = mapped_column(String(20), default="")
+    hits: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
 class ChatConversation(TimestampMixin, Base):
     __tablename__ = "chat_conversations"
     __table_args__ = (UniqueConstraint("bot_id", "external_chat_id", "business_connection_id"),)

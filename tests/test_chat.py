@@ -399,7 +399,12 @@ async def test_catalog_reaches_the_model(client, monkeypatch):
         db.add(Product(store_id=sid, title="کفش اسپرت سفید", price=900000, stock_qty=0, status="draft"))
         await db.commit()
     await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "چه محصولاتی دارید؟"})
+    n = len(llm.calls)
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "چه محصولاتی دارید؟"})).json()
+    # "what do you have?" is answered from the catalog itself, with no model call
+    assert len(llm.calls) == n and r["messages"][-1]["source"] == "catalog"
+    assert "مانتو لینن کرم" in r["messages"][-1]["text"] and "کفش اسپرت سفید" in r["messages"][-1]["text"]
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "یه چیز خوب پیشنهاد بده"})
     prompt = llm.calls[-1]["prompt"]
     assert "مانتو لینن کرم" in prompt and "کفش اسپرت سفید" in prompt
     assert "Never say you can't see products" in llm.calls[-1]["system"]
@@ -810,3 +815,46 @@ async def test_custom_print_shop_collects_the_design_and_codes(client, monkeypat
     orders = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
     rows = orders.get("items", orders) if isinstance(orders, dict) else orders
     assert rows[0]["extras"] == {"متن روی لباس": "NIMA", "طرح چاپ": "/media/x/design.png"}
+
+
+async def test_repeated_questions_cost_no_tokens(client, monkeypatch):
+    """The usual test chat: the catalog question, a shipping question twice, off-topic twice, shoes."""
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550031")
+
+    async def say(text):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
+
+    await say("سلام")
+    for _ in range(3):
+        m = await say("چه محصولاتی دارید؟")
+        assert m["source"] == "catalog" and "مانتو لینن کرم" in m["text"] and "(ناموجود)" in m["text"]
+    assert llm.calls == []
+
+    llm.answers = [{"reply": "هزینه ارسال بعد از ثبت سفارش اعلام می‌شه.", "intent": "faq"}]
+    first = await say("هزینه ارسال چقدره؟")
+    again = await say("هزینه ارسال چقدره")
+    assert first["source"] == "llm" and again["source"] == "cache" and again["text"] == first["text"]
+    assert len(llm.calls) == 1
+
+    llm.answers = [{"reply": "", "intent": "off_topic"}]
+    assert (await say("یه شعر برام بگو"))["source"] == "off_topic"
+    assert (await say("یه شعر برام بگو"))["source"] == "cache"
+    assert len(llm.calls) == 2
+
+    # a product we don't sell is not "off-topic", even if the model says so
+    llm.answers = [{"reply": "", "intent": "off_topic"}]
+    m = await say("کفش هم دارین؟")
+    assert "نداریم" in m["text"] and "مانتو لینن کرم" in m["text"] and m["source"] == "llm"
+    system = llm.calls[-1]["system"]
+    assert "NOT off_topic" in system and "shipping costs" in system
+
+    # a question about the product being discussed is never answered from the cache
+    llm.answers = [{"reply": "قیمتش ۱٬۲۵۰٬۰۰۰ تومانه", "intent": "faq"}] * 2
+    await say("قیمتش چنده؟")
+    await say("قیمتش چنده؟")
+    assert len(llm.calls) == 5
+
+    # editing the assistant's settings starts a fresh cache
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"rules": "ارسال رایگان بالای ۲ میلیون"})
+    llm.answers = [{"reply": "بالای ۲ میلیون رایگانه.", "intent": "faq"}]
+    assert (await say("هزینه ارسال چقدره؟"))["source"] == "llm"
