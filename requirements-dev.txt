@@ -1,3 +1,4 @@
 -r requirements.txt
 pytest==9.2.0
 pytest-asyncio==1.4.1
+moto[s3]==5.2.5  # S3 storage tests

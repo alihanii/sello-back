@@ -17,6 +17,20 @@ class Settings(BaseSettings):
     # Where the seller app runs; OAuth redirects (Instagram) come back here.
     frontend_base_url: str = "http://localhost:3000"
     media_dir: str = "./media"
+    # Images: "local" (files in media_dir) or "s3" (any S3-compatible storage: AWS, ArvanCloud, MinIO...).
+    storage: str = "local"
+    s3_endpoint_url: str = ""  # e.g. https://s3.ir-thr-at1.arvanstorage.ir; empty for AWS
+    s3_region: str = ""
+    s3_bucket: str = ""
+    s3_access_key: str = ""
+    s3_secret_key: str = ""
+    s3_prefix: str = ""  # optional folder inside the bucket
+    s3_addressing_style: str = "auto"  # auto | path | virtual
+    s3_acl: str = ""  # e.g. public-read when the provider needs it per object
+    # Public base address of the bucket (e.g. https://mybucket.s3.ir-thr-at1.arvanstorage.ir) when it is public;
+    # empty means a private bucket, and images are served through short-lived signed links.
+    s3_public_url: str = ""
+    s3_url_expire_seconds: int = 6 * 3600
     # SQLite file for az-iranian-bank-gateways' own table (the library runs on a headless Django).
     bank_db_path: str = "./bank.db"
 

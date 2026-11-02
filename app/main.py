@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
@@ -17,6 +17,7 @@ from app.routers import (
 )
 from app.seed import seed
 from app.services.chat_runtime import poller_loop
+from app.services.media import public_url, use_s3
 from app.services.proxy_pool import pool, pool_loop
 from app.services.worker import worker_loop
 
@@ -61,8 +62,16 @@ for r in (auth, stores, channels, products, operations, crawl, ai_products, insi
           notifications, chat):
     app.include_router(r.router, prefix="/api/v1")
 
-Path(settings.media_dir).mkdir(parents=True, exist_ok=True)
-app.mount("/media", StaticFiles(directory=settings.media_dir), name="media")
+if use_s3():
+    @app.get("/media/{key:path}", include_in_schema=False)
+    async def media_redirect(key: str):
+        url = public_url(f"/media/{key}")
+        if url.startswith("/media/"):
+            raise HTTPException(404, "فایل پیدا نشد.")
+        return RedirectResponse(url, status_code=302, headers={"Cache-Control": "public, max-age=300"})
+else:
+    Path(settings.media_dir).mkdir(parents=True, exist_ok=True)
+    app.mount("/media", StaticFiles(directory=settings.media_dir), name="media")
 
 
 @app.get("/api/health")

@@ -1,0 +1,75 @@
+# Every push to main: run the tests, build the backend image here, copy it to the server over SSH and restart.
+# The server doesn't build anything or pull from a registry, so it works on servers with limited internet.
+#
+# Repository secrets: SSH_HOST, SSH_USER, SSH_PRIVATE_KEY, optional SSH_PORT (default 22).
+# Repository variable (optional): DEPLOY_PATH (default /opt/sello).
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-server
+  cancel-in-progress: false
+
+env:
+  DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/sello' }}
+  BASE_IMAGES: postgres:16-alpine
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -q
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: SSH setup
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          printf 'Host server\n  HostName %s\n  User %s\n  Port %s\n  IdentityFile ~/.ssh/id_deploy\n  ServerAliveInterval 30\n' \
+            "$SSH_HOST" "$SSH_USER" "$SSH_PORT" > ~/.ssh/config
+          ssh server "mkdir -p '$DEPLOY_PATH' && docker version --format 'docker {{.Server.Version}}'"
+
+      - name: Build image
+        run: docker build -t sello-back:latest . && docker save sello-back:latest | gzip -1 > sello-back.tar.gz
+
+      - name: Ship base images the server doesn't have yet
+        run: |
+          missing=$(ssh server "for i in $BASE_IMAGES; do docker image inspect \$i >/dev/null 2>&1 || echo \$i; done")
+          if [ -n "$missing" ]; then
+            echo "Shipping: $missing"
+            for i in $missing; do docker pull "$i"; done
+            docker save $missing | gzip -1 | ssh server "gunzip | docker load"
+          fi
+
+      - name: Copy files and restart
+        run: |
+          scp deploy/docker-compose.yml deploy/nginx-sello.conf deploy/env.example sello-back.tar.gz "server:$DEPLOY_PATH/"
+          ssh server "set -e; cd '$DEPLOY_PATH'
+            test -f .env || { echo '::error::$DEPLOY_PATH/.env is missing: copy env.example to .env and fill it in'; exit 1; }
+            gunzip -c sello-back.tar.gz | docker load && rm sello-back.tar.gz
+            if docker image inspect sello-front:latest >/dev/null 2>&1; then docker compose up -d --remove-orphans
+            else docker compose up -d db backend; echo 'sello-front not deployed yet: run its deploy workflow'; fi
+            docker image prune -f >/dev/null
+            for i in \$(seq 1 30); do docker compose exec -T backend python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/api/health')\" 2>/dev/null && { echo backend healthy; exit 0; }; sleep 2; done
+            docker compose logs --tail 80 backend; exit 1"

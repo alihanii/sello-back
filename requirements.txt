@@ -10,6 +10,7 @@ httpx==0.28.1
 python-multipart==0.0.32
 python-dateutil==2.9.0.post0
 Pillow==13.0.0
+boto3==1.43.123  # S3-compatible image storage (SELLO_STORAGE=s3)
 socksio==1.0.0  # SOCKS proxies for Instagram and AI keys
 az-iranian-bank-gateways>=2.3.0  # bank gateways (runs on a headless Django; see app/services/bank.py)
 pypdf==6.17.0  # text from PDF files for the chat FAQ import
