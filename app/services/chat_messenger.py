@@ -7,8 +7,6 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
-import httpx
-
 from app.core.security import decrypt_credentials
 from app.models import ChatBot
 from app.platforms.base import PlatformError
@@ -43,8 +41,7 @@ async def get_updates(bot: ChatBot, offset: int, timeout: int = 25) -> list[dict
     adapter = ADAPTERS[bot.platform]
     url = f"{adapter.base_url}/bot{bot_token(bot)}/getUpdates"
     body = {"offset": offset, "timeout": timeout, "limit": 50, "allowed_updates": ALLOWED_UPDATES}
-    async with httpx.AsyncClient(timeout=timeout + 15) as client:
-        resp = await client.post(url, json=body)
+    resp = await adapter.http("POST", url, json=body, timeout=timeout + 15)
     try:
         data = resp.json()
     except ValueError:
@@ -86,9 +83,8 @@ async def download(bot: ChatBot, file_id: str) -> tuple[bytes, str]:
     info = await call(bot, "getFile", {"file_id": file_id}, token=token)
     if int(info.get("file_size") or 0) > MAX_PHOTO_BYTES:
         raise PlatformError("حجم عکس بیش از ۱۰ مگابایت است.", "image_too_large")
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.get(f"{adapter.file_base_url}/file/bot{token}/{info['file_path']}")
-        resp.raise_for_status()
+    resp = await adapter.http("GET", f"{adapter.file_base_url}/file/bot{token}/{info['file_path']}")
+    resp.raise_for_status()
     return resp.content, info["file_path"].rsplit("/", 1)[-1]
 
 

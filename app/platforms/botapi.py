@@ -9,6 +9,7 @@ import httpx
 from app.core.security import decrypt_credentials
 from app.models import Channel, Product, Store
 from app.platforms.base import EDIT_PRODUCT, RECONNECT, CrawledItem, PlatformError, PublishResult
+from app.services import proxy_pool
 from app.services.media import read_local
 from app.services.text import MAX_CAPTION_CHARS, caption_for
 
@@ -31,12 +32,18 @@ class BotApiAdapter:
             raise PlatformError("توکن ربات ذخیره نشده است.", "missing_token", RECONNECT)
         return token
 
+    async def http(self, method: str, url: str, *, timeout: float = 60, **kw) -> httpx.Response:
+        """Telegram goes through the admin's smart proxies (filtered in Iran); Bale is reached directly."""
+        if self.platform in proxy_pool.PURPOSES:
+            return await proxy_pool.request(self.platform, method, url, timeout=timeout, **kw)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            return await client.request(method, url, **kw)
+
     async def _call(self, token: str, method: str, data: dict[str, Any] | None = None,
                     files: dict[str, Any] | None = None) -> Any:
         url = f"{self.base_url}/bot{token}/{method}"
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
-                resp = await client.post(url, data=data, files=files) if files else await client.post(url, json=data or {})
+            resp = await self.http("POST", url, data=data, files=files) if files else await self.http("POST", url, json=data or {})
         except httpx.HTTPError as exc:
             raise PlatformError(f"ارتباط با {self.label_fa} برقرار نشد.", "network", detail=str(exc)) from exc
         try:
@@ -242,9 +249,8 @@ class BotApiAdapter:
     async def download_file(self, channel: Channel, file_id: str) -> tuple[bytes, str]:
         token = self._token(channel)
         info = await self._call(token, "getFile", {"file_id": file_id})
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.get(f"{self.file_base_url}/file/bot{token}/{info['file_path']}")
-            resp.raise_for_status()
+        resp = await self.http("GET", f"{self.file_base_url}/file/bot{token}/{info['file_path']}")
+        resp.raise_for_status()
         return resp.content, info["file_path"].rsplit("/", 1)[-1]
 
 

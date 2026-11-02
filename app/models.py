@@ -600,3 +600,22 @@ class AiOrder(TimestampMixin, Base):
     is_test: Mapped[bool] = mapped_column(Boolean, default=False)
     extras: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict, nullable=True)  # {label: text or image url}
     tracking_code: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)  # "S4829173", told to the customer
+
+
+# ---------- outbound proxies ----------
+
+
+class ProxyNode(TimestampMixin, Base):
+    """One proxy in the admin's list: a v2ray share link (vless/vmess/trojan/ss, run through a local Xray core)
+    or a plain socks/http proxy. `purposes` says which traffic may use it (telegram, instagram); `health`
+    keeps the last check per purpose: {purpose: {ok, latency_ms, error, checked_at}}."""
+
+    __tablename__ = "proxy_nodes"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), default="")
+    protocol: Mapped[str] = mapped_column(String(20))
+    address: Mapped[str] = mapped_column(String(255), default="")  # host:port, for display
+    link_encrypted: Mapped[str] = mapped_column(Text)
+    purposes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    health: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
