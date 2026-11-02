@@ -137,3 +137,13 @@ async def test_chat_uses_category():
         await db.flush()  # column defaults
         prompt = chat_engine.static_prompt(store, agent, [], await categories.category_names(db, store.id))
         assert "CATEGORIES" in prompt and "هودی" in prompt and "ماگ" in prompt
+
+
+def test_catalog_overview_lists_categories():
+    from app.models import Product
+    from app.services.chat_engine import catalog_overview
+
+    rows = [Product(id=i, title=t, price=1000, stock_qty=1, status="ready", category=c)
+            for i, (t, c) in enumerate([("هودی طوسی", "هودی"), ("هودی مشکی", "هودی"), ("ماگ", "ماگ")], 1)]
+    text = catalog_overview(rows, True)
+    assert "دسته‌ها: هودی، ماگ" in text and "هودی طوسی" in text
