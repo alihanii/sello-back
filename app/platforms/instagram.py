@@ -18,6 +18,7 @@ from app.core.config import settings
 from app.core.security import decrypt_credentials, encrypt_credentials
 from app.models import Channel, Product, Store
 from app.platforms.base import EDIT_PRODUCT, RECONNECT, CrawledItem, PlatformError, PublishResult
+from app.services import proxy_pool
 from app.services.images import public_jpeg
 from app.services.integrations import INSTAGRAM_SCOPES, instagram_app
 from app.services.text import caption_for
@@ -51,10 +52,10 @@ class InstagramAdapter:
 
     async def _http(self, app: dict[str, Any], method: str, url: str, **kw) -> dict[str, Any]:
         try:
-            async with httpx.AsyncClient(timeout=60, proxy=app.get("proxy") or None) as client:
-                resp = await client.request(method, url, **kw)
+            resp = await proxy_pool.request("instagram", method, url, fallback_proxy=app.get("proxy") or "", timeout=60, **kw)
         except httpx.HTTPError as exc:
-            hint = "" if app.get("proxy") else " دامنه‌های اینستاگرام در ایران فیلتر است؛ ادمین باید پروکسی سرور را تنظیم کند."
+            hint = ("" if proxy_pool.uses_proxy("instagram", app.get("proxy") or "") else
+                    " دامنه‌های اینستاگرام در ایران فیلتر است؛ ادمین باید در پنل ادمین › پروکسی‌ها پروکسی بدهد.")
             raise PlatformError("ارتباط با اینستاگرام برقرار نشد." + hint, "network", SETTINGS_HELP, str(exc)) from exc
         try:
             data = resp.json() if resp.content else {}

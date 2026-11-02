@@ -13,10 +13,11 @@ from app.core.config import settings
 from app.core.db import init_db
 from app.routers import (
     admin, auth, billing, channels, chat, crawl, insights, notifications, ai_products, operations, payments, products,
-    stores,
+    proxies, stores,
 )
 from app.seed import seed
 from app.services.chat_runtime import poller_loop
+from app.services.proxy_pool import pool, pool_loop
 from app.services.worker import worker_loop
 
 logging.basicConfig(level=logging.INFO)
@@ -30,11 +31,13 @@ async def lifespan(_: FastAPI):
     task = asyncio.create_task(worker_loop(stop)) if settings.worker_enabled else None
     chat = (asyncio.create_task(poller_loop(stop))
             if settings.worker_enabled and settings.chat_transport == "polling" else None)
+    proxies = asyncio.create_task(pool_loop(stop)) if settings.worker_enabled else None
     yield
     stop.set()
-    for t in (task, chat):
+    for t in (task, chat, proxies):
         if t:
             await t
+    await pool.shutdown()
 
 
 app = FastAPI(title="Sello API", version="0.1.0", lifespan=lifespan)
@@ -54,7 +57,7 @@ async def validation_error(_: Request, exc: RequestValidationError):
     return JSONResponse(status_code=422, content={"detail": {"message": "اطلاعات ارسالی کامل یا معتبر نیست.", "fields": fields}})
 
 
-for r in (auth, stores, channels, products, operations, crawl, ai_products, insights, billing, payments, admin,
+for r in (auth, stores, channels, products, operations, crawl, ai_products, insights, billing, payments, proxies, admin,
           notifications, chat):
     app.include_router(r.router, prefix="/api/v1")
 
