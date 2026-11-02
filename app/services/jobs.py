@@ -112,6 +112,9 @@ AI_ONLY_PHOTOS = 1
 AI_ONLY_PHOTO_SIDE = 512
 AI_ONLY_MAX_TOKENS = 800
 AI_ONLY_PARALLEL = 4
+# Thinking is billed as output and these are extraction/copywriting tasks: a cap turns it off on Gemini Flash.
+AUTO_BATCH_TOKENS_PER_POST = 600
+PRODUCT_MAX_TOKENS = 2048
 
 
 def clean_attributes(raw: Any) -> dict[str, str]:
@@ -211,6 +214,7 @@ async def _extract(items: list[CrawledItem], mode: str, store_id: int,
         try:
             res = await ai.generate_json(
                 task="caption_extract", store_id=store_id, system=ai.CAPTION_EXTRACT_SYSTEM,
+                max_tokens=AUTO_BATCH_TOKENS_PER_POST * len(batch),
                 prompt=json.dumps({"posts": [{"message_id": b.external_id, "caption": b.caption} for b in batch]},
                                   ensure_ascii=False))
         except ai.AIError as exc:
@@ -420,7 +424,8 @@ async def generate_product(ctx: OpContext, ref: AiProductRequest) -> Product:
                          "shop_categories": shop_categories[:categories.PROMPT_LIMIT]}, ensure_ascii=False)
     async with ctx.step("generate", "ساخت محصول با هوش مصنوعی", request={"images": len(images)}) as s:
         result = await ai.generate_json(task="product_generate", system=ai.PRODUCT_FROM_PHOTO_SYSTEM,
-                                        prompt=prompt, images=images, store_id=store.id)
+                                        prompt=prompt, images=images, store_id=store.id,
+                                        max_tokens=PRODUCT_MAX_TOKENS, image_res="medium")
         s.response = result
     product = Product(store_id=store.id, title=normalize_fa(result.get("title") or "محصول جدید")[:300],
                       description=normalize_fa(result.get("description", "")), price=ref.price or int(result.get("price") or 0),

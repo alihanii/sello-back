@@ -125,11 +125,13 @@ def provider_proxy(provider: AiProvider) -> str:
 async def _call(
     provider: AiProvider, model: str, system: str, prompt: str, images: list[tuple[bytes, str]], temperature: float,
     json_mode: bool = True, max_tokens: int | None = None, meta: dict[str, Any] | None = None,
-    low_res: bool = False,
+    low_res: bool = False, image_res: str = "",
 ) -> tuple[str, int, int]:
     """Returns (text, input_tokens, output_tokens). `meta`, when given, receives `cached_tokens` (the part of the
     input the provider served from its prompt cache). `max_tokens` caps the answer (the chat assistant).
-    `low_res` asks for the provider's cheapest image reading (crawl: colour and shape are enough)."""
+    `low_res` asks for the provider's cheapest image reading (crawl: colour and shape are enough); `image_res`
+    "low" is the same, "medium" is half of Gemini's default image tokens (product photos: text on a label stays legible)."""
+    image_res = "low" if low_res else image_res
     key = _api_key(provider)
     kind, base = _wire(provider, model)
     meta = meta if meta is not None else {}
@@ -139,8 +141,8 @@ async def _call(
             parts += [{"inlineData": {"mimeType": m, "data": base64.b64encode(d).decode()}} for d, m in images]
             gen: dict[str, Any] = {"temperature": temperature,
                                    **({"responseMimeType": "application/json"} if json_mode else {})}
-            if low_res and images:
-                gen["mediaResolution"] = "MEDIA_RESOLUTION_LOW"
+            if image_res in ("low", "medium") and images:
+                gen["mediaResolution"] = f"MEDIA_RESOLUTION_{image_res.upper()}"
             if max_tokens:
                 gen["maxOutputTokens"] = max_tokens
                 if "flash" in model.lower():
@@ -185,7 +187,7 @@ async def _call(
             content: list[dict[str, Any]] = [{"type": "text", "text": text}]
             content += [
                 {"type": "image_url", "image_url": {"url": f"data:{m};base64,{base64.b64encode(d).decode()}",
-                                                    **({"detail": "low"} if low_res else {})}}
+                                                    **({"detail": "low"} if image_res == "low" else {})}}
                 for d, m in images
             ]
             req = {
@@ -397,10 +399,11 @@ async def ai_available(task: str = "caption_extract") -> bool:
 
 async def generate_json(
     *, task: str, system: str, prompt: str, images: list[tuple[bytes, str]] | None = None, store_id: int | None = None,
-    max_tokens: int | None = None, low_res_images: bool = False,
+    max_tokens: int | None = None, low_res_images: bool = False, image_res: str = "",
 ) -> dict[str, Any]:
-    """`max_tokens` caps the answer, and on Gemini Flash also turns thinking off (billed as output)."""
-    extra = {k: v for k, v in (("max_tokens", max_tokens), ("low_res", low_res_images)) if v}
+    """`max_tokens` caps the answer, and on Gemini Flash also turns thinking off (billed as output).
+    `image_res` ("low" | "medium") reads the photos with fewer tokens; `low_res_images` is the same as "low"."""
+    extra = {k: v for k, v in (("max_tokens", max_tokens), ("low_res", low_res_images), ("image_res", image_res)) if v}
     candidates = await _route(task)
     if not candidates:
         raise AIError(await route_problem(task), code="ai_not_configured")
@@ -428,9 +431,12 @@ async def generate_json(
 
 
 async def generate_text(
-    *, task: str, system: str, prompt: str, images: list[tuple[bytes, str]] | None = None, store_id: int | None = None
+    *, task: str, system: str, prompt: str, images: list[tuple[bytes, str]] | None = None, store_id: int | None = None,
+    max_tokens: int | None = None,
 ) -> str:
-    """Plain-text answer (e.g. an English image-edit prompt), with the same routing, fallback and logging."""
+    """Plain-text answer (e.g. an English image-edit prompt), with the same routing, fallback and logging.
+    `max_tokens` caps the answer, and on Gemini Flash also turns thinking off (billed as output)."""
+    extra = {"max_tokens": max_tokens} if max_tokens else {}
     candidates = await _route(task)
     if not candidates:
         raise AIError(await route_problem(task), code="ai_not_configured")
@@ -439,7 +445,7 @@ async def generate_text(
         started = time.monotonic()
         try:
             text, tin, tout = await _retry_busy(
-                lambda: _call(provider, model, system, prompt, images or [], temp, json_mode=False))
+                lambda: _call(provider, model, system, prompt, images or [], temp, json_mode=False, **extra))
             if not text.strip():
                 raise AIError("مدل پاسخ خالی داد.", code="ai_empty")
             await _log(provider, task, model, store_id, ok=True, is_fallback=is_fallback,

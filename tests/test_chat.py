@@ -1031,3 +1031,15 @@ async def test_order_tracking_code_and_status_without_the_model(client, monkeypa
     orders = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
     rows = orders.get("items", orders) if isinstance(orders, dict) else orders
     assert rows[0]["tracking_code"] == code
+
+
+async def test_name_phone_and_address_on_one_line(client):
+    agent = chat_engine.ChatAgent(required_fields={})
+    for text, name, address in (
+            ("سارا محمدی ۰۹۱۲۳۴۵۶۷۸۹ تهران خیابان ولیعصر کوچه بهار پلاک ۱۲", "سارا محمدی", "تهران خیابان ولیعصر کوچه بهار پلاک ۱۲"),
+            ("شیراز، بلوار زند، کوچه ۸ پلاک ۴ - 0935 111 2233 - مریم رضایی", "مریم رضایی", "شیراز، بلوار زند، کوچه ۸ پلاک ۴"),
+            ("علی کریمی، ۰۹۱۲۱۱۱۲۲۳۳، قم صفاییه", "علی کریمی", "قم صفاییه")):
+        state = {"order": {"items": [{"product_id": 1, "qty": 1}]}}
+        chat_engine.parse_contact(agent, state, text)
+        assert (state["order"]["name"], state["order"]["address"]) == (name, address), text
+        assert state["order"]["phone"].startswith("09")
