@@ -209,7 +209,7 @@ async def search_products(db: AsyncSession, store_id: int, query: str, recent: l
     scored: list[tuple[float, int]] = []
     for p in rows:
         title = words(p.title)
-        other = words(" ".join([p.category_hint, p.brand, " ".join(p.tags or []),
+        other = words(" ".join([p.category_hint, p.category or "", p.brand, " ".join(p.tags or []),
                                 " ".join(f"{k} {v}" for k, v in (p.attributes or {}).items())]))
         score = 3 * _overlap(q, title) + _overlap(q, other)
         if p.sku and norm(p.sku) and norm(p.sku) in qn.split():

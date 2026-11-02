@@ -14,7 +14,7 @@ from app.models import (
 )
 from app.platforms.base import CrawledItem, EDIT_PRODUCT, PlatformError
 from app.platforms.registry import get_adapter
-from app.services import ai
+from app.services import ai, categories
 from app.services.media import read_local, save_bytes
 from app.services import instagram_crawl as ig
 from app.services.integrations import instagram_crawler
@@ -101,8 +101,10 @@ async def run_publish(ctx: OpContext) -> None:
 
 # ---------- crawl ----------
 
-async def _extract(items: list[CrawledItem], mode: str, store_id: int) -> tuple[dict[str, dict], list[str]]:
+async def _extract(items: list[CrawledItem], mode: str, store_id: int,
+                   shop_categories: list[str] | None = None) -> tuple[dict[str, dict], list[str]]:
     """Regex first; LLM for posts the rules couldn't complete (platform-wrappers approach)."""
+    shop_categories = list(shop_categories or [])
     out: dict[str, dict] = {}
     pending: list[CrawledItem] = []
     notes: list[str] = []
@@ -126,8 +128,9 @@ async def _extract(items: list[CrawledItem], mode: str, store_id: int) -> tuple[
                     res = await ai.generate_json(
                         task="caption_extract", store_id=store_id,
                         system=ai.CAPTION_EXTRACT_FULL_SYSTEM if mode == "llm" else ai.CAPTION_EXTRACT_SYSTEM,
-                        prompt=json.dumps({"posts": [{"message_id": b.external_id, "caption": b.caption} for b in batch]},
-                                          ensure_ascii=False))
+                        prompt=json.dumps({"posts": [{"message_id": b.external_id, "caption": b.caption} for b in batch],
+                                           **({"shop_categories": shop_categories[:categories.PROMPT_LIMIT]}
+                                              if mode == "llm" else {})}, ensure_ascii=False))
                 except ai.AIError as exc:
                     notes.append(exc.message_fa)
                     continue
@@ -142,6 +145,11 @@ async def _extract(items: list[CrawledItem], mode: str, store_id: int) -> tuple[
                             "attributes": row.get("attributes") or {}, "method": "llm"})
                         if mode == "llm" and row.get("category_hint"):
                             out[mid]["category_hint"] = normalize_fa(str(row["category_hint"]))[:200]
+                        if mode == "llm" and row.get("category"):
+                            category = categories.match(row["category"], shop_categories)
+                            out[mid]["category"] = category
+                            if category not in shop_categories:  # later posts in this crawl reuse it
+                                shop_categories.append(category)
     return out, notes
 
 
@@ -152,7 +160,8 @@ async def ingest_items(ctx: OpContext, *, store: Store, items: list[CrawledItem]
     db, op = ctx.db, ctx.op
     counts = {"seen": len(items), "created": 0, "updated": 0, "duplicate": 0, "skipped": 0, "failed": 0, "inbox": 0}
     async with ctx.step("extract", f"استخراج دیتای {len(items)} آیتم", request={"mode": mode}) as s:
-        extracted, notes = await _extract(items, mode, store.id)
+        shop_categories = await categories.category_names(db, store.id) if mode == "llm" else []
+        extracted, notes = await _extract(items, mode, store.id, shop_categories)
         s.response = {"methods": {k: v.get("method") for k, v in extracted.items()}, "notes": notes}
         s.message_fa = " ".join(notes)
 
@@ -190,6 +199,7 @@ async def ingest_items(ctx: OpContext, *, store: Store, items: list[CrawledItem]
             prod = Product(store_id=store.id, title=data["title"], description=data.get("description", ""),
                            price=data.get("price") or 0, stock_qty=data.get("quantity") or 0, sku=data.get("sku", ""),
                            brand=data.get("brand", ""), category_hint=data.get("category_hint", ""),
+                           category=data.get("category", ""),
                            attributes=data.get("attributes") or {}, source="crawl", created_by="crawler",
                            status="draft" if to_inbox else "ready",
                            tags=[h.lstrip("#") for h in data.get("hashtags", [])][:8],
@@ -311,7 +321,9 @@ async def generate_product(ctx: OpContext, ref: AiProductRequest) -> Product:
     photo_role = ("The attached photo is a DESIGN/artwork the seller prints on the product, not the product itself; "
                   "describe the product from the seller's note, with this design on it."
                   if (op.payload or {}).get("photo_kind") == "design" else "")
-    prompt = json.dumps({"seller_note": ref.note, "photo_role": photo_role, "price": ref.price}, ensure_ascii=False)
+    shop_categories = await categories.category_names(db, store.id)
+    prompt = json.dumps({"seller_note": ref.note, "photo_role": photo_role, "price": ref.price,
+                         "shop_categories": shop_categories[:categories.PROMPT_LIMIT]}, ensure_ascii=False)
     async with ctx.step("generate", "ساخت محصول با هوش مصنوعی", request={"images": len(images)}) as s:
         result = await ai.generate_json(task="product_generate", system=ai.PRODUCT_FROM_PHOTO_SYSTEM,
                                         prompt=prompt, images=images, store_id=store.id)
@@ -319,6 +331,7 @@ async def generate_product(ctx: OpContext, ref: AiProductRequest) -> Product:
     product = Product(store_id=store.id, title=normalize_fa(result.get("title") or "محصول جدید")[:300],
                       description=normalize_fa(result.get("description", "")), price=ref.price or int(result.get("price") or 0),
                       stock_qty=ref.stock_qty or parse_number(str(result.get("quantity") or 0)), brand=result.get("brand", ""), category_hint=result.get("category_hint", ""),
+                      category=categories.match(result.get("category"), shop_categories),
                       attributes=result.get("attributes") or {}, tags=(result.get("tags") or [])[:8], source="ai",
                       created_by="ai", status="draft",
                       source_ref={"ai_request_id": ref.id, "field_sources": result.get("field_sources", {})})

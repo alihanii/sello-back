@@ -88,7 +88,9 @@ class Product(TimestampMixin, Base):
     compare_at_price: Mapped[int] = mapped_column(BigInteger, default=0)
     stock_qty: Mapped[int] = mapped_column(Integer, default=0)
     brand: Mapped[str] = mapped_column(String(120), default="")
-    category_hint: Mapped[str] = mapped_column(String(200), default="")
+    category_hint: Mapped[str] = mapped_column(String(200), default="")  # AI's free-text product type (search)
+    # The shop's category for this product ("پوشاک زنانه"). Nullable so older databases get the column added.
+    category: Mapped[str | None] = mapped_column(String(120), default="", nullable=True, index=True)
     attributes: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     source: Mapped[str] = mapped_column(String(10), default="manual")  # manual | crawl | ai
     source_ref: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
