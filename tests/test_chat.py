@@ -1043,3 +1043,129 @@ async def test_name_phone_and_address_on_one_line(client):
         chat_engine.parse_contact(agent, state, text)
         assert (state["order"]["name"], state["order"]["address"]) == (name, address), text
         assert state["order"]["phone"].startswith("09")
+
+
+async def _notes(sid):
+    from sqlalchemy import select
+    from app.core.db import SessionLocal
+    from app.models import Notification
+    async with SessionLocal() as db:
+        return [n.title_fa for n in (await db.execute(select(Notification).where(Notification.store_id == sid)
+                                                      .order_by(Notification.id))).scalars()]
+
+
+async def test_second_order_after_a_confirmed_one_runs_the_order_steps(client, monkeypatch):
+    """ali's chat: order #1 paid and confirmed by the seller, then "a hoodie too, 2XL, you choose": the model wrote
+    «ثبت شد» and nothing was saved. Now the summary (with the earlier contact details) and the yes create order #2."""
+    h, sid, llm, p1, p2 = await _setup(client, monkeypatch, "09125550041")
+
+    async def say(text):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
+
+    await _order_ready(client, h, sid, llm, p1)
+    assert (await say("بله"))["source"] == "order"
+    assert (await say("فیش ۱۲۸۲۹۲۹۸۲۸۲۹۲"))["source"] == "receipt"
+    rows = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
+    rows = rows.get("items", rows) if isinstance(rows, dict) else rows
+    r = await client.patch(f"/ai-orders/{rows[0]['id']}", headers=h, json={"status": "confirmed"})
+    assert r.status_code == 200, r.text
+
+    llm.answers = [{"reply": "ست هودی رو براتون در نظر گرفتم. سایز ۲XL ثبت شد.", "intent": "order",
+                    "order_action": "update", "order": {"items": [{"product_id": p1["id"], "qty": 1, "variant": "2XL"}]}}]
+    m = await say("خودت انتخاب کن")
+    assert "خلاصهٔ سفارشت" in m["text"] and "ثبت شد" not in m["text"]
+    assert "سارا کریمی" in m["text"] and "شیراز" in m["text"] and "2XL" in m["text"]
+    m = await say("بله")
+    assert m["source"] == "order" and "ثبت شد" in m["text"] and "6037991234567890" in m["text"]
+    rows = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
+    rows = rows.get("items", rows) if isinstance(rows, dict) else rows
+    assert len(rows) == 2
+
+    # "ثبت شد" with no item at all is not left standing either
+    llm.answers = [{"reply": "سفارشتون ثبت شد.", "intent": "order"}]
+    assert "ثبت شد" not in (await say("یه دونه دیگه هم میخوام"))["text"]
+
+
+async def test_a_new_customer_whose_order_the_model_claims_gets_asked_for_details(client, monkeypatch):
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550042")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        "orders_enabled": True, "payment": {"card_number": "6037991234567890"}})
+
+    async def say(text):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
+
+    await say("سلام")
+    llm.answers = [{"reply": "سایز L ثبت شد.", "intent": "order", "order_action": "update",
+                    "order": {"items": [{"product_id": p1["id"], "qty": 1, "variant": "L"}]}}]
+    m = await say("L بزار برام")
+    assert "ثبت شد" not in m["text"] and "نام و نام خانوادگی" in m["text"] and "آدرس کامل" in m["text"]
+    n = len(llm.calls)
+    m = await say("سید علی هانی\n۰۹۱۲۳۳۳۴۴۵۵\nقم دورشهر کوچه ۲ کد پستی هم ۲۲۲۳۳۴۵۶۱۲")
+    assert "خلاصهٔ سفارشت" in m["text"] and "۲۲۲۳۳۴۵۶۱۲" in m["text"] and len(llm.calls) == n
+
+
+def test_postal_code_stays_in_the_address():
+    agent = chat_engine.ChatAgent(required_fields={})
+    for text, address in (
+            ("سید علی هانی\n۰۹۱۲۳۳۳۴۴۵۵\nقم دورشهر کوچه ۲ کد پستی هم ۲۲۲۳۳۴۵۶۱۲", "قم دورشهر کوچه ۲ کد پستی هم ۲۲۲۳۳۴۵۶۱۲"),
+            ("علی ۰۹۱۲۱۱۱۲۲۳۳ قم صفاییه کدپستی 3713645891", "قم صفاییه کدپستی 3713645891")):
+        state = {"order": {"items": [{"product_id": 1, "qty": 1}]}}
+        chat_engine.parse_contact(agent, state, text)
+        assert state["order"]["address"] == address and state["order"]["phone"] in ("09123334455", "09121112233")
+
+
+def test_abuse_words():
+    for bad in ("کسکش", "خفه شو بابا", "مرتیکه جاکش", "خر خودتی", "بیشعورا", "کس ننه"):
+        assert chat_engine.is_abusive(bad), bad
+    for ok in ("کسی هست جواب بده؟", "خرید کنم", "چرم گوساله داره؟", "هیچ کس جواب نمیده", "خریدم", "کیف چرم",
+               "کرم پودر دارید", "اینو با کسب و کارم میخوام", "طرح حیوانات"):
+        assert not chat_engine.is_abusive(ok), ok
+
+
+async def test_swearing_is_reported_and_complaints_go_to_the_admin(client, monkeypatch):
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550043")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True})
+
+    async def say(text):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
+
+    await say("سلام")
+    n = len(llm.calls)
+    m = await say("مرتیکه کسکش جواب بده")
+    assert m["intent"] == "abuse" and "محترمانه" in m["text"] and len(llm.calls) == n
+    await say("کثافت")  # a second one within minutes: answered, not reported again
+    notes = await _notes(sid)
+    assert sum("فحاشی" in t for t in notes) == 1
+    # one the list misses: the model marks it
+    llm.answers = [{"reply": "", "intent": "abuse"}]
+    assert (await say("خیلی بی‌مصرفی"))["intent"] == "abuse"
+
+    # a complaint the FAQ can't settle: the admin is told and takes the chat
+    llm.answers = [{"reply": "متاسفم", "intent": "handoff", "handoff": True, "handoff_reason": "complaint"}]
+    m = await say("دو هفته‌ست منتظرم هیچکس جواب درست نمیده")
+    assert m["source"] == "handoff" and "ادمین" in m["text"]
+    assert any("شکایت" in t for t in await _notes(sid))
+    conv = (await client.get(f"/stores/{sid}/chat/test", headers=h)).json()
+    assert conv["state"] is not None
+
+    # the model answered as a product question, but it's plainly a complaint
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"reset": True})
+    await say("سلام")
+    llm.answers = [{"reply": "این مانتو لینن کرمه.", "intent": "product"}]
+    assert (await say("مانتو که فرستادین پاره رسید"))["source"] == "handoff"
+
+
+async def test_a_long_faq_is_sent_a_few_entries_at_a_time(client, monkeypatch):
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550044")
+    faqs = [{"q": f"سوال شماره {i} دربارهٔ موضوع {i}", "a": "جواب طولانی " * 20} for i in range(12)]
+    faqs.append({"q": "ارسال با چی انجام میشه؟", "a": "ارسال فقط با تیپاکس، دوشنبه و چهارشنبه."})
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True, "faqs": faqs})
+
+    async def say(text):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
+
+    await say("سلام")
+    await say("کی برام ارسال میشه به دستم میرسه")
+    call = llm.calls[-1]
+    assert "تیپاکس" in call["prompt"] and "تیپاکس" not in call["system"]
+    assert "جواب طولانی" not in call["system"] and call["prompt"].count("جواب طولانی جواب") <= chat_engine.FAQ_PER_TURN
