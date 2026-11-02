@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ORM(BaseModel):
@@ -75,6 +75,7 @@ class ProductIn(BaseModel):
     sku: str = ""
     brand: str = ""
     category_hint: str = ""
+    category: str = Field("", max_length=120)
     attributes: dict[str, Any] = {}
     tags: list[str] = []
     status: str = "ready"
@@ -90,6 +91,7 @@ class ProductPatch(BaseModel):
     sku: str | None = None
     brand: str | None = None
     category_hint: str | None = None
+    category: str | None = Field(None, max_length=120)
     attributes: dict[str, Any] | None = None
     tags: list[str] | None = None
     status: str | None = None
@@ -107,6 +109,7 @@ class ProductOut(ORM):
     stock_qty: int
     brand: str
     category_hint: str
+    category: str = ""
     attributes: dict[str, Any]
     source: str
     source_ref: dict[str, Any]
@@ -117,6 +120,11 @@ class ProductOut(ORM):
     updated_at: datetime
     images: list[ImageOut] = []
     listings: list[ListingOut] = []
+
+    @field_validator("category", mode="before")
+    @classmethod
+    def _no_null_category(cls, v):
+        return v or ""
 
 
 class StepOut(ORM):

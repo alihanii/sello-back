@@ -22,7 +22,7 @@ COLUMNS: list[tuple[str, str, tuple[str, ...], str]] = [
     ("sku", "کد کالا", ("کد", "sku", "code", "شناسه"), "HD-001"),
     ("compare_at_price", "قیمت قبل از تخفیف", ("قیمت قبل", "compare_at_price", "old_price"), "990000"),
     ("brand", "برند", ("brand",), ""),
-    ("category_hint", "دسته", ("دسته‌بندی", "دسته بندی", "category"), "پوشاک"),
+    ("category", "دسته‌بندی", ("دسته", "دسته بندی", "category"), "هودی"),
     ("description", "توضیحات", ("توضیح", "description"), "جنس پنبه، سایز L و XL"),
     ("tags", "برچسب‌ها", ("برچسب", "تگ", "tags"), "هودی، زمستانه"),
     ("images", "لینک عکس‌ها", ("لینک عکس", "عکس", "تصویر", "images", "image", "image_url"), ""),
@@ -165,7 +165,7 @@ def clean_row(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
                 errors.append(f"«{label}» عدد معتبر نیست: {raw[key]}")
             else:
                 data[key] = n
-    for key in ("sku", "brand", "category_hint", "description"):
+    for key in ("sku", "brand", "category", "description"):
         if key in raw:
             v = raw[key]
             data[key] = str(int(v) if isinstance(v, float) and v.is_integer() else v).strip()

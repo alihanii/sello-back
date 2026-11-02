@@ -4,6 +4,8 @@ import io
 import httpx
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response, StreamingResponse
+from typing import Literal
+
 from pydantic import BaseModel, Field
 from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import selectinload
@@ -14,7 +16,8 @@ from app.schemas import OperationOut, ProductIn, ProductOut, ProductPatch
 from app.services.ops import queue_publish
 from app.services.media import ALLOWED, save_bytes
 from app.services.ops import record_event
-from app.services import product_import
+from app.services.text import normalize_fa
+from app.services import categories, product_import
 from app.services.plans import check_limit, limits_for
 
 router = APIRouter(tags=["products"])
@@ -29,32 +32,54 @@ async def _get(db, user, product_id: int) -> Product:
     return p
 
 
+class ProductFilters(BaseModel):
+    """The product list's filters; bulk actions reuse them for "every product matching this filter"."""
+    q: str = ""
+    source: str = ""
+    status: str = ""
+    stock: str = ""
+    tag: str = ""
+    category: str | None = None  # "" (sent as "-" in the query string) = products without a category
+    published_in: int | None = None
+    not_published_in: int | None = None
+
+
+def _filtered(store_id: int, f: ProductFilters):
+    stmt = select(Product).where(Product.store_id == store_id)
+    stmt = stmt.where(Product.status == f.status) if f.status else stmt.where(Product.status != "archived")
+    if f.q:
+        like = f"%{f.q}%"
+        stmt = stmt.where(or_(Product.title.ilike(like), Product.sku.ilike(like), Product.description.ilike(like)))
+    if f.source:
+        stmt = stmt.where(Product.source == f.source)
+    if f.stock == "out":
+        stmt = stmt.where(Product.stock_qty <= 0)
+    elif f.stock == "low":
+        stmt = stmt.where(Product.stock_qty > 0, Product.stock_qty <= 3)
+    if f.tag:
+        stmt = stmt.where(cast(Product.tags, String).like(f'%"{f.tag}"%'))
+    if f.category is not None:
+        stmt = (stmt.where(or_(Product.category.is_(None), Product.category == "")) if f.category == ""
+                else stmt.where(Product.category == f.category))
+    pub = select(ChannelListing.product_id).where(ChannelListing.status == "published")
+    if f.published_in:
+        stmt = stmt.where(Product.id.in_(pub.where(ChannelListing.channel_id == f.published_in)))
+    if f.not_published_in:
+        stmt = stmt.where(Product.id.not_in(pub.where(ChannelListing.channel_id == f.not_published_in)))
+    return stmt
+
+
 @router.get("/stores/{store_id}/products")
 async def list_products(
     store_id: int, user: CurrentUser, db: DB,
-    q: str = "", source: str = "", status: str = "", stock: str = "", tag: str = "",
+    q: str = "", source: str = "", status: str = "", stock: str = "", tag: str = "", category: str | None = None,
     published_in: int | None = None, not_published_in: int | None = None,
     page: int = 1, size: int = Query(25, le=200), sort: str = "-created_at",
 ):
     await get_store_for(db, user, store_id)
-    stmt = select(Product).where(Product.store_id == store_id)
-    stmt = stmt.where(Product.status == status) if status else stmt.where(Product.status != "archived")
-    if q:
-        like = f"%{q}%"
-        stmt = stmt.where(or_(Product.title.ilike(like), Product.sku.ilike(like), Product.description.ilike(like)))
-    if source:
-        stmt = stmt.where(Product.source == source)
-    if stock == "out":
-        stmt = stmt.where(Product.stock_qty <= 0)
-    elif stock == "low":
-        stmt = stmt.where(Product.stock_qty > 0, Product.stock_qty <= 3)
-    if tag:
-        stmt = stmt.where(cast(Product.tags, String).like(f'%"{tag}"%'))
-    pub = select(ChannelListing.product_id).where(ChannelListing.status == "published")
-    if published_in:
-        stmt = stmt.where(Product.id.in_(pub.where(ChannelListing.channel_id == published_in)))
-    if not_published_in:
-        stmt = stmt.where(Product.id.not_in(pub.where(ChannelListing.channel_id == not_published_in)))
+    stmt = _filtered(store_id, ProductFilters(
+        q=q, source=source, status=status, stock=stock, tag=tag, category="" if category == "-" else (category or None),
+        published_in=published_in, not_published_in=not_published_in))
     total = await db.scalar(select(func.count()).select_from(stmt.subquery()))
     col = {"created_at": Product.created_at, "price": Product.price, "stock": Product.stock_qty,
            "title": Product.title}.get(sort.lstrip("-"), Product.created_at)
@@ -64,11 +89,19 @@ async def list_products(
     return {"items": [ProductOut.model_validate(p) for p in items], "total": total, "page": page, "size": size}
 
 
+@router.get("/stores/{store_id}/product-categories")
+async def list_categories(store_id: int, user: CurrentUser, db: DB):
+    """The categories in use, most used first, for the category picker and the list filter."""
+    await get_store_for(db, user, store_id)
+    return await categories.store_categories(db, store_id)
+
+
 @router.post("/stores/{store_id}/products", response_model=ProductOut)
 async def create_product(store_id: int, body: ProductIn, user: CurrentUser, db: DB):
     await get_store_for(db, user, store_id)
     await check_limit(db, user, "products")
     data = body.model_dump(exclude={"images"})
+    data["category"] = categories.clean(data.get("category"))
     p = Product(store_id=store_id, source="manual", created_by="user", **data)
     db.add(p)
     await db.flush()
@@ -89,6 +122,8 @@ async def update_product(product_id: int, body: ProductPatch, user: CurrentUser,
     p = await _get(db, user, product_id)
     data = body.model_dump(exclude_unset=True)
     images = data.pop("images", None)
+    if "category" in data:
+        data["category"] = categories.clean(data["category"])
     for k, v in data.items():
         setattr(p, k, v)
     if images is not None:
@@ -161,21 +196,97 @@ async def publish(product_id: int, body: PublishIn, user: CurrentUser, db: DB):
     return (await db.execute(select(Operation).where(Operation.id.in_(op_ids)))).scalars().all()
 
 
+class PriceEdit(BaseModel):
+    mode: Literal["set", "percent", "amount"]  # new price | ±percent | ±Toman
+    value: float
+    round_to: int = Field(0, ge=0)  # e.g. 1000: round the result to the nearest thousand Toman
+
+
+class StockEdit(BaseModel):
+    mode: Literal["set", "add"]  # "add" with a negative value subtracts
+    value: int
+
+
+class AttributeEdit(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    value: str = ""
+    remove: bool = False
+
+
+class BulkEdit(BaseModel):
+    price: PriceEdit | None = None
+    stock: StockEdit | None = None
+    category: str | None = Field(None, max_length=120)  # "" clears it
+    attribute: AttributeEdit | None = None
+
+
 class BulkIn(BaseModel):
-    product_ids: list[int]
-    action: str  # publish | tag | untag | archive | status
+    product_ids: list[int] = []
+    # Instead of ids: every product matching the list's filters (the "select all N products" checkbox).
+    filters: ProductFilters | None = None
+    action: str  # publish | tag | untag | archive | status | edit
     channel_ids: list[int] = []
     tag: str = ""
     status: str = ""
     show_price: bool | None = None
+    edit: BulkEdit | None = None
+
+
+BULK_MAX = 5000
+
+
+def _new_price(price: int, e: PriceEdit) -> int:
+    if e.mode == "set":
+        new = e.value
+    elif e.mode == "percent":
+        new = price * (1 + e.value / 100)
+    else:
+        new = price + e.value
+    if e.round_to:
+        new = round(new / e.round_to) * e.round_to
+    return max(0, int(round(new)))
+
+
+def _apply_edit(p: Product, e: BulkEdit) -> bool:
+    """Applies the manual bulk edit to one product; True when something changed."""
+    before = (p.price, p.stock_qty, p.category, dict(p.attributes or {}))
+    if e.price:
+        p.price = _new_price(p.price, e.price)
+    if e.stock:
+        p.stock_qty = max(0, e.stock.value if e.stock.mode == "set" else p.stock_qty + e.stock.value)
+    if e.category is not None:
+        p.category = categories.clean(e.category)
+    if e.attribute:
+        name = normalize_fa(e.attribute.name).strip()
+        attrs = dict(p.attributes or {})  # a new dict, so the JSON column is marked dirty
+        if e.attribute.remove:
+            attrs.pop(name, None)
+        else:
+            attrs[name] = normalize_fa(e.attribute.value).strip()
+        p.attributes = attrs
+    return (p.price, p.stock_qty, p.category, dict(p.attributes or {})) != before
 
 
 @router.post("/stores/{store_id}/products/bulk")
 async def bulk(store_id: int, body: BulkIn, user: CurrentUser, db: DB):
     await get_store_for(db, user, store_id)
-    products = (await db.execute(select(Product).where(Product.store_id == store_id, Product.id.in_(body.product_ids))
-                                 .options(selectinload(Product.images)))).scalars().all()
-    queued = 0
+    if body.filters is not None:
+        stmt = _filtered(store_id, body.filters)
+    else:
+        stmt = select(Product).where(Product.store_id == store_id, Product.id.in_(body.product_ids))
+    if body.action == "edit":
+        e = body.edit
+        if not e or (e.price is None and e.stock is None and e.category is None and e.attribute is None):
+            raise HTTPException(422, "هیچ تغییری انتخاب نشده.")
+        if e.price and e.price.mode == "set" and e.price.value < 0:
+            raise HTTPException(422, "قیمت نمی‌تواند منفی باشد.")
+        if e.stock and e.stock.mode == "set" and e.stock.value < 0:
+            raise HTTPException(422, "موجودی نمی‌تواند منفی باشد.")
+    total = await db.scalar(select(func.count()).select_from(stmt.subquery()))
+    if total > BULK_MAX:
+        raise HTTPException(422, f"در هر بار حداکثر {BULK_MAX} محصول را می‌شود تغییر داد؛ با فیلتر محدودترش کن.")
+    products = (await db.execute(stmt.options(selectinload(Product.images), selectinload(Product.listings)))).scalars().all()
+    queued = changed = 0
     for p in products:
         if body.action == "publish":
             for cid in body.channel_ids:
@@ -191,8 +302,13 @@ async def bulk(store_id: int, body: BulkIn, user: CurrentUser, db: DB):
             p.status = "archived"
         elif body.action == "status" and body.status in ("draft", "ready"):
             p.status = body.status
+        elif body.action == "edit" and _apply_edit(p, body.edit):
+            changed += 1
+            for l in p.listings:  # same as a single edit: published posts now differ from the product
+                if l.status == "published":
+                    l.status = "out_of_sync"
     await db.commit()
-    return {"ok": True, "affected": len(products), "queued": queued}
+    return {"ok": True, "affected": len(products), "queued": queued, "changed": changed}
 
 
 @router.get("/stores/{store_id}/products.csv")
@@ -202,9 +318,9 @@ async def export_csv(store_id: int, user: CurrentUser, db: DB):
     buf = io.StringIO()
     buf.write("﻿")
     w = csv.writer(buf)
-    w.writerow(["id", "sku", "title", "price", "stock", "source", "status", "tags"])
+    w.writerow(["id", "sku", "title", "category", "price", "stock", "source", "status", "tags"])
     for p in rows:
-        w.writerow([p.id, p.sku, p.title, p.price, p.stock_qty, p.source, p.status, " ".join(p.tags or [])])
+        w.writerow([p.id, p.sku, p.title, p.category or "", p.price, p.stock_qty, p.source, p.status, " ".join(p.tags or [])])
     return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv",
                              headers={"Content-Disposition": f"attachment; filename=products-{store_id}.csv"})
 
@@ -259,7 +375,7 @@ class ImportItem(BaseModel):
     stock_qty: int | None = Field(None, ge=0)
     sku: str = ""
     brand: str | None = None
-    category_hint: str | None = None
+    category: str | None = None
     description: str | None = None
     tags: list[str] | None = None
     images: list[str] = []
@@ -298,6 +414,8 @@ async def import_products(store_id: int, body: ImportIn, user: CurrentUser, db: 
     async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0 SelloBot/1.0"}) as client:
         for it in body.items:
             fields = it.model_dump(exclude={"images"}, exclude_none=True)
+            if "category" in fields:
+                fields["category"] = categories.clean(fields["category"])
             pid = known.get(it.sku) if it.sku else None
             if pid:
                 p = await db.get(Product, pid)

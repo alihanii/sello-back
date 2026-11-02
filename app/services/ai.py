@@ -680,10 +680,13 @@ do NOT invent data that is not in the caption."""
 
 # "AI only" crawl mode: the same fields plus the product category and a fuller set of details, like AI product creation.
 CAPTION_EXTRACT_FULL_SYSTEM = """You extract structured product fields from social post captions (usually Persian).
-Respond ONLY with JSON: {"posts":[{"message_id":"<copy>","title":"<short title>","description":"<text without price/stock lines>","price":<int Toman, 0 if missing>,"quantity":<int, 0 if missing>,"category_hint":"<Persian product type, e.g. ماگ سرامیکی, هودی, کیف دوشی>","attributes":{"<Persian name>":"<value>"}}]}
+Respond ONLY with JSON: {"posts":[{"message_id":"<copy>","title":"<short title>","description":"<text without price/stock lines>","price":<int Toman, 0 if missing>,"quantity":<int, 0 if missing>,"category_hint":"<Persian product type, e.g. ماگ سرامیکی, هودی, کیف دوشی>","category":"<shop category>","attributes":{"<Persian name>":"<value>"}}]}
 Rules: one object per input post, preserve message_id; numbers are integers; parse Persian digits:
 «۴ میلیون تومان» = 4000000, «۲۵۰ هزار» = 250000, «۲۰ تا» = 20.
 category_hint: what the product IS, in a few Persian words, from the caption; empty if the caption doesn't say.
+category: the product's TYPE in 1-2 Persian words, e.g. هودی, تیشرت, کفش, مانتو, شال, کیف, ماگ, بشقاب.
+Not a broad section (NOT پوشاک مردانه, ظروف آشپزخانه) and no colour/material/size/model (هودی, not هودی مشکی نخی).
+If shop_categories in the input has the same type, copy it EXACTLY (same spelling); otherwise write the new type.
 attributes: every concrete detail the caption states (جنس, رنگ, سایز, ابعاد, وزن, مدل, کشور سازنده, گارانتی …), one key per detail,
 several values joined with «، ». Only what the caption says: do NOT invent data that is not in the caption."""
 
@@ -698,11 +701,14 @@ Brand only if it is written on the product or in the seller's note.
 image_category: how the main photo should be staged: "flat_clothing" (garment without a person), "modeled_clothing"
 (garment that must be shown worn: chador, abaya, manteau, dress), "footwear", or "general" (everything else).
 Respond ONLY with JSON:
-{"title":"...","description":"...","category_hint":"<Persian product type, e.g. ماگ سرامیکی>","brand":"","price":<int or 0>,
+{"title":"...","description":"...","category_hint":"<Persian product type, e.g. ماگ سرامیکی>","category":"<shop category>","brand":"","price":<int or 0>,
  "quantity":<int stock count the seller stated, else 0>,
  "attributes":{"<Persian name>":"value"},"tags":["..."],"image_category":"general",
  "field_sources":{"title":"image|note|guess","description":"...","attributes":"...","price":"..."}}
 Price and quantity are plain integers in Toman: «۴ میلیون تومان» = 4000000, «۲۵۰ هزار» = 250000, «۲۰ تا» = 20.
-Do not invent prices or technical specs you cannot see or read; leave price 0 and omit unknown attributes."""
+Do not invent prices or technical specs you cannot see or read; leave price 0 and omit unknown attributes.
+category: the product's TYPE in 1-2 Persian words, e.g. هودی, تیشرت, کفش, مانتو, شال, کیف, ماگ, بشقاب.
+Not a broad section (NOT پوشاک مردانه, ظروف آشپزخانه) and no colour/material/size/model (هودی, not هودی مشکی نخی).
+If shop_categories in the input has the same type, copy it EXACTLY (same spelling); otherwise write the new type."""
 
 
