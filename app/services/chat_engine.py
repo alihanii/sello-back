@@ -19,6 +19,7 @@ from app.models import (
     AiOrder, ChatAgent, ChatConversation, ChatMessage, ChatReference, Product, ProductImage, Store, User,
 )
 from app.services import ai
+from app.services.categories import category_names
 from app.services.text import fa_number, normalize_fa, to_en_digits
 
 TEHRAN = timezone(timedelta(hours=3, minutes=30))  # Iran has no DST since 2022; avoids tzdata on Windows
@@ -203,15 +204,17 @@ async def search_products(db: AsyncSession, store_id: int, query: str, recent: l
     names_one = any(_overlap(words(query), words(p.title)) for p in rows)
     if last and (_SIMILAR.search(query) or not names_one):
         # "similar?", "موجوده؟": search with the product being talked about, so its siblings come up too
-        query = f"{query} {last.title} {last.category_hint} {' '.join(last.tags or [])}"
+        query = f"{query} {last.title} {last.category or ''} {last.category_hint} {' '.join(last.tags or [])}"
     q = words(query)
     qn = norm(query)
     scored: list[tuple[float, int]] = []
     for p in rows:
         title = words(p.title)
-        other = words(" ".join([p.category_hint, p.category or "", p.brand, " ".join(p.tags or []),
+        other = words(" ".join([p.category_hint, p.brand, " ".join(p.tags or []),
                                 " ".join(f"{k} {v}" for k, v in (p.attributes or {}).items())]))
-        score = 3 * _overlap(q, title) + _overlap(q, other)
+        # The seller's category ("هودی") counts double: "هودی دارین؟" should bring the shop's hoodies,
+        # including ones whose title doesn't say هودی.
+        score = 3 * _overlap(q, title) + 2 * _overlap(q, words(p.category or "")) + _overlap(q, other)
         if p.sku and norm(p.sku) and norm(p.sku) in qn.split():
             score += 10
         if f"#{p.id}" in query or re.search(rf"(?<!\d){p.id}(?!\d)", qn) and "کد" in qn:
@@ -286,7 +289,8 @@ def product_card(p: Product, photos: int = 0, exact_stock: bool = True, full: bo
     desc = re.sub(r"\s+", " ", p.description or "")[:160] if full else ""
     pics = f" | {fa_number(photos)} عکس" if photos else ""
     code = f" (کد {p.sku})" if p.sku else ""
-    return (f"#{p.id} | {p.title[:90]}{code} | {money(p.price)} | {stock}{pics}" + (f" | {attrs}" if attrs else "")
+    cat = f" | دسته: {p.category}" if p.category else ""
+    return (f"#{p.id} | {p.title[:90]}{code}{cat} | {money(p.price)} | {stock}{pics}" + (f" | {attrs}" if attrs else "")
             + (f" | {desc}" if desc else ""))
 
 
@@ -309,7 +313,7 @@ judge whether a size fits a height/weight unless a size chart or the details say
 stock: say so, offer a similar item. Never hand off for a normal question.
 WHICH PRODUCT: "this/همین/اون" = LAST PRODUCT. If several fit or it's vague, ask ONE short question with up to 3
 names (intent "clarify").
-SIMILAR / "what else": same type as LAST PRODUCT, closest price first, 1-3 names with price; none -> say so.
+SIMILAR / "what else": same type (دسته) as LAST PRODUCT, closest price first, 1-3 names with price; none -> say so.
 VARIANTS: colours/sizes are in product details; asked one not listed -> say so and list the listed ones. Orders:
 chosen options in item.variant ("نارنجی، XL"); same product_id for another colour.
 PHOTOS: customer asks to see -> put that product's id in "images" (only products with "عکس"), short reply.
@@ -335,7 +339,7 @@ CATALOG_ON = ("on: the products relevant to each message are under PRODUCTS (new
 CATALOG_OFF = "not shared; do not discuss specific prices, ask the admin"
 
 
-def static_prompt(store: Store, agent: ChatAgent, refs: list[ChatReference]) -> str:
+def static_prompt(store: Store, agent: ChatAgent, refs: list[ChatReference], categories: list[str] | None = None) -> str:
     """The cacheable prefix: identical across every turn of this store until the seller edits settings."""
     req = [k for k, label in (("name", "name"), ("phone", "mobile"), ("address", "full address"))
            if (agent.required_fields or {}).get(k, True)]
@@ -344,6 +348,8 @@ def static_prompt(store: Store, agent: ChatAgent, refs: list[ChatReference]) -> 
              f"ASSISTANT NAME: {agent.assistant_name or 'دستیار ' + store.name}",
              f"TONE: {TONES['formal'] if any('شما' in r for r in policy(agent)['rules']) else TONES.get(agent.tone, TONES['friendly'])}",
              f"CATALOG: {CATALOG_ON if agent.catalog_enabled else CATALOG_OFF}",
+             *([f"CATEGORIES (what the shop sells; answer «what do you have?» with these): {'، '.join(categories[:40])}"]
+               if agent.catalog_enabled and categories else []),
              f"ORDERS: {'enabled; REQUIRED: ' + ', '.join(req or ['nothing']) if agent.orders_enabled else 'disabled'}"]
     extra = order_fields(agent) if agent.orders_enabled else []
     if extra:
@@ -724,7 +730,8 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                                                           ChatMessage.role.in_(["customer", "ai", "seller"]))
                                 .order_by(ChatMessage.id.desc()).limit(HISTORY_MESSAGES + len(pending)))).scalars().all()
     history = [m for m in reversed(history) if m.id not in pending_ids][-HISTORY_MESSAGES:]
-    system = static_prompt(store, agent, list(refs))
+    shop_categories = await category_names(db, store.id) if agent.catalog_enabled else []
+    system = static_prompt(store, agent, list(refs), shop_categories)
     prompt = dynamic_prompt(text, history, products, state, open_now, agent.catalog_enabled, photos,
                             policy(agent)["stock"] == "exact")
     try:
