@@ -684,9 +684,9 @@ Respond ONLY with JSON: {"posts":[{"message_id":"<copy>","title":"<short title>"
 Rules: one object per input post, preserve message_id; numbers are integers; parse Persian digits:
 «۴ میلیون تومان» = 4000000, «۲۵۰ هزار» = 250000, «۲۰ تا» = 20.
 category_hint: what the product IS, in a few Persian words, from the caption; empty if the caption doesn't say.
-category: which section of THIS shop the product belongs to: a short, general Persian name (1-3 words, e.g. پوشاک زنانه,
-ظروف آشپزخانه, اکسسوری), broader than category_hint. If shop_categories in the input has one that fits, copy it EXACTLY;
-otherwise write a new general name. Never a colour/size/model-level name.
+category: the product's TYPE in 1-2 Persian words, e.g. هودی, تیشرت, کفش, مانتو, شال, کیف, ماگ, بشقاب.
+Not a broad section (NOT پوشاک مردانه, ظروف آشپزخانه) and no colour/material/size/model (هودی, not هودی مشکی نخی).
+If shop_categories in the input has the same type, copy it EXACTLY (same spelling); otherwise write the new type.
 attributes: every concrete detail the caption states (جنس, رنگ, سایز, ابعاد, وزن, مدل, کشور سازنده, گارانتی …), one key per detail,
 several values joined with «، ». Only what the caption says: do NOT invent data that is not in the caption."""
 
@@ -707,8 +707,8 @@ Respond ONLY with JSON:
  "field_sources":{"title":"image|note|guess","description":"...","attributes":"...","price":"..."}}
 Price and quantity are plain integers in Toman: «۴ میلیون تومان» = 4000000, «۲۵۰ هزار» = 250000, «۲۰ تا» = 20.
 Do not invent prices or technical specs you cannot see or read; leave price 0 and omit unknown attributes.
-category: which section of THIS shop the product belongs to: a short, general Persian name (1-3 words, e.g. پوشاک زنانه,
-ظروف آشپزخانه, اکسسوری), broader than category_hint. If shop_categories in the input has one that fits, copy it EXACTLY;
-otherwise write a new general name. Never a colour/size/model-level name."""
+category: the product's TYPE in 1-2 Persian words, e.g. هودی, تیشرت, کفش, مانتو, شال, کیف, ماگ, بشقاب.
+Not a broad section (NOT پوشاک مردانه, ظروف آشپزخانه) and no colour/material/size/model (هودی, not هودی مشکی نخی).
+If shop_categories in the input has the same type, copy it EXACTLY (same spelling); otherwise write the new type."""
 
 

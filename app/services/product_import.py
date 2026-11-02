@@ -22,7 +22,7 @@ COLUMNS: list[tuple[str, str, tuple[str, ...], str]] = [
     ("sku", "کد کالا", ("کد", "sku", "code", "شناسه"), "HD-001"),
     ("compare_at_price", "قیمت قبل از تخفیف", ("قیمت قبل", "compare_at_price", "old_price"), "990000"),
     ("brand", "برند", ("brand",), ""),
-    ("category", "دسته‌بندی", ("دسته", "دسته بندی", "category"), "پوشاک مردانه"),
+    ("category", "دسته‌بندی", ("دسته", "دسته بندی", "category"), "هودی"),
     ("description", "توضیحات", ("توضیح", "description"), "جنس پنبه، سایز L و XL"),
     ("tags", "برچسب‌ها", ("برچسب", "تگ", "tags"), "هودی، زمستانه"),
     ("images", "لینک عکس‌ها", ("لینک عکس", "عکس", "تصویر", "images", "image", "image_url"), ""),

@@ -6,7 +6,7 @@ from tests.conftest import drain, login
 
 
 def test_match_reuses_the_same_name_written_differently():
-    shop = ["پوشاک زنانه", "ظروف آشپزخانه"]
+    shop = ["پوشاک زنانه", "ماگ"]
     assert categories.match("پوشاك  زنانه", shop) == "پوشاک زنانه"  # Arabic ک, double space
     assert categories.match("پوشاک‌زنانه", shop) == "پوشاک زنانه"  # half-space
     assert categories.match(" اکسسوری ", shop) == "اکسسوری"
@@ -17,37 +17,37 @@ async def test_ai_fills_category_from_the_shop_list(client, monkeypatch):
     h = await login(client, "09127770001")
     sid = (await client.post("/stores", json={"name": "دسته‌ها"}, headers=h)).json()["id"]
     r = await client.post(f"/stores/{sid}/products", headers=h,
-                          json={"title": "بشقاب", "category": " ظروف آشپزخانه ", "price": 100})
-    assert r.json()["category"] == "ظروف آشپزخانه"
+                          json={"title": "بشقاب", "category": " ماگ ", "price": 100})
+    assert r.json()["category"] == "ماگ"
 
     prompts = []
 
     async def fake(*, task, system, prompt, images=None, store_id=None, **kw):
         prompts.append(json.loads(prompt))
         return {"title": "ماگ سرامیکی سفید", "description": "ماگ", "category_hint": "ماگ سرامیکی",
-                "category": "ظروف آشپزخانه", "attributes": {}}
+                "category": "ماگ", "attributes": {}}
 
     monkeypatch.setattr(ai, "generate_json", fake)
     op = (await client.post(f"/stores/{sid}/ai-products", headers=h, json={"note": "ماگ سفید"})).json()
     await drain()
     op = (await client.get(f"/operations/{op['id']}", headers=h)).json()
     assert op["status"] == "succeeded", op
-    assert prompts[-1]["shop_categories"] == ["ظروف آشپزخانه"]
+    assert prompts[-1]["shop_categories"] == ["ماگ"]
     prod = (await client.get(f"/products/{op['result']['product_id']}", headers=h)).json()
-    assert prod["category"] == "ظروف آشپزخانه" and prod["category_hint"] == "ماگ سرامیکی"
+    assert prod["category"] == "ماگ" and prod["category_hint"] == "ماگ سرامیکی"
 
     cats = (await client.get(f"/stores/{sid}/product-categories", headers=h)).json()
-    assert cats == [{"name": "ظروف آشپزخانه", "count": 2}]
-    listed = (await client.get(f"/stores/{sid}/products", params={"category": "ظروف آشپزخانه"}, headers=h)).json()
+    assert cats == [{"name": "ماگ", "count": 2}]
+    listed = (await client.get(f"/stores/{sid}/products", params={"category": "ماگ"}, headers=h)).json()
     assert listed["total"] == 2
     assert (await client.get(f"/stores/{sid}/products", params={"category": "-"}, headers=h)).json()["total"] == 0
 
 
 async def test_crawl_ai_mode_fills_category(monkeypatch):
     async def fake(*, task, system, prompt, store_id=None, **kw):
-        assert json.loads(prompt)["shop_categories"] == ["پوشاک مردانه"]
-        return {"posts": [{"message_id": "1", "title": "هودی", "category": "پوشاك مردانه"},
-                          {"message_id": "2", "title": "ماگ", "category": "ظروف"}]}
+        assert json.loads(prompt)["shop_categories"] == ["هودی"]
+        return {"posts": [{"message_id": "1", "title": "هودی", "category": "هودي"},
+                          {"message_id": "2", "title": "ماگ", "category": "ماگ"}]}
 
     async def on(task):
         return True
@@ -55,8 +55,8 @@ async def test_crawl_ai_mode_fills_category(monkeypatch):
     monkeypatch.setattr(ai, "ai_available", on)
     monkeypatch.setattr(ai, "generate_json", fake)
     items = [CrawledItem(external_id="1", caption="هودی"), CrawledItem(external_id="2", caption="ماگ")]
-    out, _ = await jobs._extract(items, "llm", 1, ["پوشاک مردانه"])
-    assert out["1"]["category"] == "پوشاک مردانه" and out["2"]["category"] == "ظروف"
+    out, _ = await jobs._extract(items, "llm", 1, ["هودی"])
+    assert out["1"]["category"] == "هودی" and out["2"]["category"] == "ماگ"
 
 
 async def test_bulk_edit_selected_and_all_matching(client):
