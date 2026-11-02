@@ -228,7 +228,9 @@ async def answer(conv_id: int, *, send: bool = True) -> list[ChatMessage]:
                                      intent=r.intent, usage=r.usage))
         if result.notify_admin:
             for note in result.notify_admin:
-                await notify(db, conv.store_id, "chat", note[:200], "", link=_conv_link(conv))
+                # The first line is the title; the rest (e.g. what the customer chose) goes in the body.
+                title, _, body = note.partition("\n")
+                await notify(db, conv.store_id, "chat", title[:200], body[:2000], link=_conv_link(conv))
         await db.commit()
         if send and not conv.is_test and conv.bot_id:
             bot = await db.get(ChatBot, conv.bot_id)

@@ -858,3 +858,41 @@ async def test_repeated_questions_cost_no_tokens(client, monkeypatch):
     await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"rules": "ارسال رایگان بالای ۲ میلیون"})
     llm.answers = [{"reply": "بالای ۲ میلیون رایگانه.", "intent": "faq"}]
     assert (await say("هزینه ارسال چقدره؟"))["source"] == "llm"
+
+
+async def test_orders_off_hands_the_buyer_to_the_admin(client, monkeypatch):
+    """AI ordering off: "shall I send it?" + "yes" passes the chat to the admin with the choice, no loop."""
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550032")
+
+    async def say(text):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
+
+    await say("سلام")
+    system_seen = []
+    llm.answers = [{"reply": "عالیه، سایز XL هودی طوسی رو براتون ارسال کنم؟", "intent": "product", "products": [p1["id"]],
+                    "order": {"items": [{"product_id": p1["id"], "qty": 1, "variant": "XL"}]}, "order_action": "update"}]
+    await say("مانتو لینن کرم XL")
+    system_seen.append(llm.calls[-1]["system"])
+    n = len(llm.calls)
+    m = await say("اره")
+    assert m["source"] == "handoff" and "همکارم" in m["text"] and len(llm.calls) == n
+    assert "never take or register orders" in system_seen[0]
+    convs = (await client.get(f"/stores/{sid}/chat/conversations", headers=h)).json()
+    assert convs  # the conversation exists; the admin note carries the choice
+    from app.core.db import SessionLocal
+    from app.models import Notification
+    from sqlalchemy import select
+    async with SessionLocal() as db:
+        notes = [x.title_fa + x.body_fa for x in (await db.execute(select(Notification).where(
+            Notification.store_id == sid))).scalars()]
+    assert any("مانتو لینن کرم" in t and "XL" in t for t in notes), notes
+
+    # the model says the customer wants to buy: same hand-over
+    llm.answers = [{"reply": "", "intent": "order", "order": {"items": [{"product_id": p1["id"], "qty": 1}]},
+                    "order_action": "confirm"}]
+    m = await say("همینو می‌خوام بخرم")
+    assert m["source"] == "handoff" and m["intent"] == "order"
+
+    assert (await say("ادمین اصلی کجاس"))["source"] == "handoff"
+    llm.answers = [{"reply": "باشه 🌸", "intent": "product"}]
+    assert (await say("باشه"))["source"] == "llm"  # "ok" is not "thanks"

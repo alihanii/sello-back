@@ -46,6 +46,7 @@ UNSUPPORTED_TEXT = "فعلاً فقط پیام متنی رو می‌تونم ب�
 PHOTO_TEXT = "عکس رسید 🙏 لطفاً اسم یا کد محصولی که می‌خوای رو بنویس تا راهنماییت کنم."
 RECEIPT_TEXT = "✅ اطلاعات پرداخت سفارش #{order} دریافت شد. بعد از بررسی، نتیجه رو همین‌جا خبر می‌دیم 🌸"
 CANCELLED_TEXT = "سفارش لغو شد. اگه چیز دیگه‌ای خواستی در خدمتم 🌸"
+ORDER_HANDOFF_TEXT = "عالیه 🌸 سفارشت رو به همکارم دادم؛ همین‌جا برای ثبت نهایی، پرداخت و ارسال بهت پیام می‌ده 🙏"
 AI_UNAVAILABLE_TEXT = "پیامت رسید 🙏 همکارم به‌زودی جواب می‌ده."
 
 TONES = {
@@ -56,10 +57,10 @@ TONES = {
 
 _GREET_WORD = r"(سلام|سلم|سلاماً?|درود|هلو|hi|hello|salam|وقت(تون|ت)?\s*بخیر|صبح\s*بخیر|عصر\s*بخیر|شب\s*بخیر|خسته\s*نباشید|علیک|عزیز)"
 _GREETING = re.compile(rf"^{_GREET_WORD}([\s!.؟?،,🌸🙏😊]*{_GREET_WORD})*[\s!.؟?،,🌸🙏😊]*$", re.I)
-_THANKS = re.compile(r"^(مرسی|ممنون(م)?|متشکر(م)?|سپاس(گزارم)?|تشکر|thanks?|thx|مچکرم|دستت\s*درد\s*نکنه|عالی|اوکی|باشه|ok)[\s!.؟?،,🌸🙏😊❤️]*$", re.I)
+_THANKS = re.compile(r"^(مرسی|ممنون(م)?|متشکر(م)?|سپاس(گزارم)?|تشکر|thanks?|thx|مچکرم|دستت\s*درد\s*نکنه)[\s!.؟?،,🌸🙏😊❤️]*$", re.I)
 _YES = re.compile(r"^(بله|آره|اره|آری|بلی|اوکی|ok|yes|تایید|تأیید|تایید\s*می\s*کنم|تأیید\s*می‌?کنم|ثبت\s*کن|درسته|صحیحه|حتما|حتماً|قبول)[\s!.،,🙏👍]*$", re.I)
 _YES_WORDS = {"بله", "آره", "اره", "آری", "بلی", "اوکی", "ok", "yes", "تایید", "تأیید", "درسته", "درست", "صحیحه",
-              "حتما", "حتماً", "قبول", "ثبت", "کن", "کنید", "کنین", "می", "میکنم", "می‌کنم", "مرسی", "ممنون", "عالیه",
+              "حتما", "حتماً", "قبول", "ثبت", "کن", "حله", "بفرست", "بفرستید", "ارسال", "بزن", "بریم", "اوکیه", "کنید", "کنین", "می", "میکنم", "می‌کنم", "مرسی", "ممنون", "عالیه",
               "باشه", "همین", "خوبه", "اوکیه", "لطفا", "لطفاً", "پس", "دیگه", "هست", "است", "تاییده", "تأییده", "یس"}
 
 
@@ -67,7 +68,7 @@ def is_yes(text: str) -> bool:
     """"بله تایید", "آره درسته", "اوکی ثبت کن": every word is a yes/filler word and at least one is a real yes."""
     ws = [w for w in re.sub(r"[^\w\s‌]", " ", squeeze(text).lower()).replace("‌", " ").split() if w]
     return bool(ws) and len(ws) <= 6 and all(w in _YES_WORDS for w in ws) and bool(_YES.match(ws[0]) or any(
-        w in {"بله", "آره", "اره", "تایید", "تأیید", "درسته", "ok", "اوکی", "قبول", "ثبت", "باشه"} for w in ws))
+        w in {"بله", "آره", "اره", "تایید", "تأیید", "درسته", "ok", "اوکی", "قبول", "ثبت", "باشه", "حله", "بریم"} for w in ws))
 
 
 _PAID = re.compile(r"(پیگیری|رهگیری|پرداخت|واریز|کارت\s*به\s*کارت|فیش|تراکنش|ارجاع)")
@@ -75,7 +76,7 @@ _PAID = re.compile(r"(پیگیری|رهگیری|پرداخت|واریز|کارت
 
 _NO = re.compile(r"^(نه|خیر|لغو|کنسل|no|نمی\s*خوام|نمی‌خوام|منصرف\s*شدم)[\s!.،,]*$", re.I)
 _PERSON = r"(ادمین|اپراتور|پشتیبان(ی)?|کارشناس|مسئول\s*فروش|فروشنده|مدیر|آدم\s*واقعی|انسان\s*واقعی|یه?\s*آدم)"
-_HUMAN = re.compile(rf"({_PERSON}.{{0,25}}(صحبت|حرف|وصل|چت|تماس|بده|بدین|بدید|می\s*‌?خوام|میخوام|جواب\s*بده|بیاد)"
+_HUMAN = re.compile(rf"({_PERSON}.{{0,25}}(صحبت|حرف|وصل|چت|تماس|بده|بدین|بدید|می\s*‌?خوام|میخوام|جواب\s*بده|بیاد|کجا\S*)"
                     rf"|(صحبت|حرف|وصل\S*)\s*(کنم|بشم|کن|کنید|کنین|بزنم)?\s*(با|به)\s*{_PERSON}"
                     rf"|^{_PERSON}[\s!.؟?،,🙏]*(لطفا|لطفاً|کجاست|کجایی)?[\s!.؟?،,🙏]*$)")
 _STOPWORDS = set("""از به با در که این آن را و یا برای تا هم یه یک چه چی چند چطور کدوم کدام دارید داری دارین هست است
@@ -326,7 +327,7 @@ PHOTOS: customer asks to see -> put that product's id in "images" (only products
 ORDERS (if enabled): collect items (product_id, qty, variant) and REQUIRED fields only (never postal code or
 anything else), 1-2 questions at a time, put what you know in "order" — always the full current list of items,
 each line once. A change ("make it XXL", "remove X") touches only the item the customer means. All known and customer wants to finish -> order_action "confirm" (shop shows summary
-and payment; never write card numbers or totals). Cancel -> "cancel". Orders disabled -> admin takes it here.
+and payment; never write card numbers or totals). Cancel -> "cancel". Orders disabled -> see ORDERS.
 REFS: a reference that answers (e.g. size chart) -> its id in "refs".
 SELLER RULES and STOCK beat TONE (e.g. "always شما" = formal address, no عزیزم). When the customer swaps to another
 product, keep the size/colour they already chose unless they change it.
@@ -342,6 +343,9 @@ Reply with ONE JSON object, "reply" first, omit empty fields:
 
 CATALOG_ON = ("on: the products relevant to each message are under PRODUCTS (newest if none fit). Never say you "
               "can't see products; if the wanted one isn't there, ask for its name/type/colour")
+ORDERS_OFF = ("disabled: you never take or register orders (never say ثبت شد/ثبت می‌کنم/ارسال می‌کنم). Help choose the "
+              "product, colour and size and put them in \"order\" items; when the customer wants to buy, set "
+              "order_action \"confirm\" — the shop passes the chat to the admin, who takes the order")
 CATALOG_OFF = "not shared; do not discuss specific prices, ask the admin"
 
 
@@ -356,7 +360,7 @@ def static_prompt(store: Store, agent: ChatAgent, refs: list[ChatReference], cat
              f"CATALOG: {CATALOG_ON if agent.catalog_enabled else CATALOG_OFF}",
              *([f"CATEGORIES (what the shop sells; answer «what do you have?» with these): {'، '.join(categories[:40])}"]
                if agent.catalog_enabled and categories else []),
-             f"ORDERS: {'enabled; REQUIRED: ' + ', '.join(req or ['nothing']) if agent.orders_enabled else 'disabled'}"]
+             f"ORDERS: {'enabled; REQUIRED: ' + ', '.join(req or ['nothing']) if agent.orders_enabled else ORDERS_OFF}"]
     extra = order_fields(agent) if agent.orders_enabled else []
     if extra:
         parts.append("EXTRA ORDER FIELDS (this shop's own; ask for each before confirming; text answers go in "
@@ -762,6 +766,11 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
             result.replies += sent
             return done()
 
+    # 4c. Orders are the admin's (AI ordering off) and the customer said yes to "shall I send it?": hand over.
+    if state.pop("buy_offer", None) and not agent.orders_enabled and is_yes(text):
+        await order_handoff(db, conv, store, state, result)
+        return done()
+
     # 5. Asking for a human: no model needed.
     if _HUMAN.search(text) and len(words(text)) <= 8:
         result.replies.append(Reply(HANDOFF_TEXT, source="handoff", intent="handoff"))
@@ -884,14 +893,19 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         return done()
 
     action = str(out.get("order_action") or "none")
-    if agent.orders_enabled:
-        if action == "cancel":
-            state.pop("order", None)
-            state.pop("awaiting", None)
-        else:
-            state["order"] = await _merge_order(db, store.id, agent, state, out.get("order"))
-            if not state["order"]:
-                state.pop("order")
+    if action == "cancel":
+        state.pop("order", None)
+        state.pop("awaiting", None)
+    else:
+        # With AI ordering off this is only a note of what they chose, for the admin who takes the order.
+        state["order"] = await _merge_order(db, store.id, agent, state, out.get("order"))
+        if not state["order"]:
+            state.pop("order")
+    if not agent.orders_enabled and action == "confirm":
+        # The customer wants to buy and orders are the admin's: hand over with what they chose, no loop of
+        # "shall I send it?".
+        await order_handoff(db, conv, store, state, result, usage)
+        return done()
 
     if policy(agent)["stock"] == "available":
         reply_text = hide_stock_counts(reply_text)
@@ -903,6 +917,8 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
             state["awaiting"] = "confirm"
             reply.text = "خلاصهٔ سفارشت:\n" + order_summary(order, lines, total) + "\n\nتأیید می‌کنی؟ (بله / خیر)"
             reply.intent = "order"
+    if not agent.orders_enabled and _BUY_OFFER.search(reply.text):
+        state["buy_offer"] = True  # a plain "yes" next hands the chat to the admin
     reason = str(out.get("handoff_reason") or "")
     # The assistant keeps the chat unless the customer really wants a person (or is complaining about an order).
     handoff = bool(out.get("handoff") or intent == "handoff") and (reason in ("asked_human", "complaint")
@@ -955,6 +971,27 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
             result.replies.append(Reply(HANDOFF_TEXT, source="handoff", intent="handoff", usage=usage))
         result.notify_admin.append(f"🙋 گفتگو با {conv.customer_name or 'مشتری'} به ادمین نیاز دارد: «{text[:120]}»")
     return done()
+
+
+_BUY_OFFER = re.compile(r"(ثبت|ارسال|سفارش|بفرستم|بفرستیم|بخری|برات\s*بذارم|کنار\s*بذارم)[^؟?]*[؟?]")
+
+
+async def order_handoff(db: AsyncSession, conv: ChatConversation, store: Store, state: dict[str, Any],
+                        result: TurnResult, usage: dict[str, Any] | None = None) -> None:
+    """AI ordering is off: the customer is ready to buy, so the admin takes it from here, with their choice."""
+    order = state.pop("order", None) or {}
+    state.pop("buy_offer", None)
+    lines, total = await priced_lines(db, store.id, order.get("items") or [])
+    if not lines:
+        last = (state.get("recent_products") or [None])[-1]
+        p = await db.get(Product, last) if last else None
+        if p and p.store_id == store.id:
+            lines, total = [{"title": p.title, "qty": 1, "unit_price": int(p.price or 0), "variant": ""}], int(p.price or 0)
+    conv.status = "needs_human"
+    result.replies.append(Reply(ORDER_HANDOFF_TEXT, source="handoff", intent="order", usage=usage or {}))
+    chosen = ("\n" + order_summary(order, lines, total)) if lines else ""
+    result.notify_admin.append(f"🛍 {conv.customer_name or 'یک مشتری'} می‌خواهد سفارش بدهد (سفارش‌گیری AI خاموش است؛ "
+                               f"خودت ثبتش کن):{chosen}")
 
 
 _STOCK_COUNT = re.compile(
