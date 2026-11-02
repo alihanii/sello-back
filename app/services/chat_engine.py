@@ -920,6 +920,11 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                                     intent="product"))
         return done()
 
+    # 7d. Simple questions about the product being talked about, and the first order steps: answered in code.
+    if quick := await quick_answer(db, conv, store, agent, state, text):
+        result.replies += quick
+        return done()
+
     # 7c. The same general question asked before (shipping, payment, "write me a poem"…): the earlier answer.
     refs = (await db.execute(select(ChatReference).where(ChatReference.store_id == store.id)
                              .order_by(ChatReference.id))).scalars().all()
@@ -1508,6 +1513,188 @@ def parse_contact(agent: ChatAgent, state: dict[str, Any], text: str) -> None:
             order["name"] = lines[0][:100]  # "علی رضایی\nقم، خیابان …"
             rest = "\n".join(x for x in loose if x != lines[0])
         capture_contact(agent, state, rest)
+
+
+# ---------- simple turns in code (no model): sizes, stock/price, "I want to order", the chosen size ----------
+
+# Words that carry no meaning of their own in these short questions. A message made only of these (plus the
+# question's own key words) is about the product being talked about, never about another one.
+_FILLER = set("""رو را و هم اینو اونو این اون همین همون ش اش هاش هاشو اشو شو چیه چیا چیاست چیان هست هستش هستن داره دارین
+داری دارید داریم چه چی چند چنده چقدر چقدره کدوما کدوم لطف لطفا لطفاً میکنی میکنید میکنین می‌کنی می‌کنید بگو بگید بگین
+بگی بفرمایید بفرما میشه می‌شه مرسی ممنون سلام خب خوب پس عزیزم آیا ایا براش براشون واسش هاش ها های بندی بندیش
+موجودش قیمتش جان""".split())
+_SIZE_ASK = {"سایز", "سایزبندی", "سایزا", "سایزاش", "سایزهاش", "سایزش", "سایزاشو", "سایزبندیش", "سایزهای"}
+_COLOR_ASK = {"رنگ", "رنگبندی", "رنگا", "رنگاش", "رنگهاش", "رنگش", "رنگای", "رنگهای", "رنگاشو", "رنگبندیش"}
+_STOCK_ASK = {"موجود", "موجوده", "موجودش", "موجودی", "دارین", "داری", "دارید", "هست", "هستش"}
+_PRICE_ASK = {"قیمت", "قیمتش", "قیمتشو", "چنده", "چقدره", "چند", "چقدر"}
+_ORDER_LEAD = {"خب", "خوب", "پس", "باشه", "اوکی", "عالیه", "من", "همینو", "اینو", "همونو", "این", "همین", "همون", "رو", "را",
+               "لطفا", "لطفاً", "دیگه", "اره", "آره", "بله"}
+_ORDER_PHRASES = {"میخوام", "میخوامش", "میخوام سفارش بدم", "میخوام سفارش بزنم", "میخوام سفارش ثبت کنم", "میخوام ثبت کنم",
+                  "میخوام ثبتش کنم", "میخوام بخرم", "میخوام بخرمش", "میخواستم سفارش بدم", "میخواستم بخرم",
+                  "سفارش بدم", "سفارش میدم", "ثبتش کن", "ثبت کن", "ثبتش کنید", "ثبت کنید", "بخرمش", "میخرمش", "میخرم"}
+
+
+def is_order_ask(text: str) -> bool:
+    """"خب می‌خوام سفارش بدم", "همینو می‌خوام", "ثبتش کن" — and nothing else in the message."""
+    s = re.sub(r"(?<!\S)می (?=\S)", "می", " ".join(_tokens(text)))
+    toks = s.split()
+    while toks and toks[0] in _ORDER_LEAD:
+        toks = toks[1:]
+    return " ".join(toks) in _ORDER_PHRASES
+
+
+_SIZE_KEY = re.compile(r"(سایز|اندازه|size)", re.I)
+_COLOR_KEY = re.compile(r"(رنگ|color|colour)", re.I)
+
+
+def _tokens(text: str) -> list[str]:
+    return [w for w in norm(squeeze(text)).replace("‌", " ").split() if w]
+
+
+def _opt(value: str) -> str:
+    v = norm(to_en_digits(value)).replace(" ", "")
+    return {"xxl": "2xl", "xxxl": "3xl", "xxxxl": "4xl", "ایکس": "x"}.get(v, v)
+
+
+def variant_options(p: Product) -> dict[str, list[str]]:
+    """The product's sizes and colours as lists ("L، XL، 2XL" → [L, XL, 2XL]); a range ("۳۸ تا ۴۴") stays one item."""
+    out: dict[str, list[str]] = {}
+    for k, v in (p.attributes or {}).items():
+        kind = "size" if _SIZE_KEY.search(str(k)) else "color" if _COLOR_KEY.search(str(k)) else ""
+        if not kind or kind in out or not str(v).strip():
+            continue
+        parts = [x.strip() for x in re.split(r"[،,/|؛;]|\s+و\s+|\s+-\s+", str(v)) if x.strip()]
+        if len(parts) == 1 and " " in parts[0] and not re.search(r"\sتا\s", parts[0]) and len(parts[0].split()) <= 8 \
+                and all(len(x) <= 4 for x in parts[0].split()):
+            parts = parts[0].split()  # "S M L XL"
+        out[kind] = [x[:30] for x in parts][:15]
+    return out
+
+
+def match_option(text: str, options: list[str]) -> str:
+    """The listed option the customer named ("۳۸", "2xl", "مشکی"), or "" when none is clearly named."""
+    toks = {_opt(t) for t in _tokens(text)}
+    joined = _opt(text)
+    for o in options:
+        rng = re.match(r"^\s*(\d+)\s*تا\s*(\d+)\s*$", to_en_digits(o))
+        if rng:
+            lo, hi = int(rng.group(1)), int(rng.group(2))
+            nums = [int(t) for t in toks if t.isdigit()]
+            if len(nums) == 1 and lo <= nums[0] <= hi:
+                return str(nums[0])
+            continue
+        if _opt(o) in toks or (len(_opt(o)) >= 3 and _opt(o) == joined):
+            return o
+    return ""
+
+
+def _only(text: str, keys: set[str]) -> bool:
+    """Every word is a key word or filler, and at least one key word is there."""
+    toks = _tokens(text)
+    return bool(toks) and len(toks) <= 7 and any(t in keys for t in toks) and all(t in keys or t in _FILLER for t in toks)
+
+
+async def quick_answer(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent, state: dict[str, Any],
+                       text: str) -> list[Reply]:
+    """Fixed, true answers about the product being talked about (LAST PRODUCT), and the order steps up to the
+    summary: the questions that took a model call each in ali's chat ("سایزبندی؟", "موجوده؟", "می‌خوام سفارش بدم",
+    "۳۸"). Anything that doesn't clearly fit goes to the model as before."""
+    waiting = state.pop("awaiting_variant", None)
+    last = (state.get("recent_products") or [None])[-1]
+    if not agent.catalog_enabled or not last or not text or "\n" in text.strip():
+        return []
+    p = await db.get(Product, last)
+    if not p or p.store_id != store.id or p.status == "archived":
+        return []
+    opts = variant_options(p)
+    title = p.title[:80]
+    # The shop's own extra order fields (a design to print…) need the model's questions; so does adding to an open order.
+    ordering = (agent.orders_enabled and not order_fields(agent)
+                and not await open_order(db, store.id, state.get("order_id")))
+
+    # The size/colour the customer picks after "which size?": straight on to the details or the summary.
+    if waiting == p.id and ordering and p.stock_qty > 0:
+        chosen = {k: match_option(text, v) for k, v in opts.items() if len(v) > 1}
+        if chosen and all(chosen.values()) and len(_tokens(text)) <= 4:
+            chosen.update({k: v[0] for k, v in opts.items() if len(v) == 1})
+            variant = "، ".join(chosen[k] for k in ("color", "size") if chosen.get(k))
+            state["order"] = {**(state.get("order") or {}), "items": [{"product_id": p.id, "qty": 1, "variant": variant}]}
+            return [await order_next_step(db, conv, store, agent, state)]
+
+    # "سایزبندی؟", "رنگاش چیه؟"
+    for kind, keys, label in (("size", _SIZE_ASK, "سایزبندی"), ("color", _COLOR_ASK, "رنگ‌بندی")):
+        if _only(text, keys | {"بندی"}) and not (_only(text, _PRICE_ASK | _STOCK_ASK)):
+            if not opts.get(kind):
+                return []  # not written: the model says so and asks something useful
+            replies = [Reply(f"{label} «{title}»: {'، '.join(opts[kind])} 🌸 "
+                             + ("کدومش رو برات ثبت کنم؟" if ordering and p.stock_qty > 0 else "کدومش مدنظرته؟"),
+                             source="canned", intent="product")]
+            if ordering and p.stock_qty > 0:
+                state["awaiting_variant"] = p.id
+            if kind == "size":
+                # The shop's size chart, if it has one and the customer hasn't said no to it.
+                refs = (await db.execute(select(ChatReference).where(ChatReference.store_id == store.id))).scalars().all()
+                declined = set(state.get("declined_refs") or []) | set(state.get("refs_sent") or [])
+                chart = [r.id for r in refs if r.id not in declined and ref_asked(text, r)][:1]
+                if chart:
+                    replies += await ref_replies(db, store.id, chart, list(refs))
+                    state["refs_sent"] = sorted(set(state.get("refs_sent") or []) | set(chart))
+            return replies
+
+    # "موجوده؟", "قیمتش چنده؟", "این رو موجود داری؟" (an out-of-stock one goes to the model, which offers another)
+    if p.stock_qty > 0 and _only(text, _STOCK_ASK | _PRICE_ASK):
+        asks_price = any(t in _PRICE_ASK for t in _tokens(text))
+        stock = "موجوده" if not asks_price or any(t in _STOCK_ASK for t in _tokens(text)) else ""
+        price = f"قیمتش {money(p.price)}ه" if p.price else ""
+        if asks_price and not p.price:
+            return []
+        body = " و ".join(x for x in (stock, price) if x)
+        sizes = opts.get("size") or []
+        nxt = (f"سایزت رو بگو تا ثبت کنم ({'، '.join(sizes[:8])})." if ordering and len(sizes) > 1 else
+               "ثبتش کنم؟" if ordering else "سؤال دیگه‌ای درباره‌اش داری؟")
+        if ordering and len(sizes) > 1:
+            state["awaiting_variant"] = p.id
+        return [Reply(f"بله، «{title}» {body} 🌸 {nxt}" if stock else f"«{title}» {body} 🌸 {nxt}",
+                      source="canned", intent="product")]
+
+    # "می‌خوام سفارش بدم" / "همینو می‌خوام" about the product being talked about
+    if ordering and p.stock_qty > 0 and is_order_ask(text) and not (state.get("order") or {}).get("items"):
+        need = [k for k, v in opts.items() if len(v) > 1]
+        if need:
+            state["awaiting_variant"] = p.id
+            names = {"size": "سایز", "color": "رنگ"}
+            ask = " و ".join(f"{names[k]} ({'، '.join(opts[k][:8])})" for k in ("size", "color") if k in need)
+            return [Reply(f"حتماً 🌸 برای «{title}» {ask} رو بگو تا ثبت کنم.", source="canned", intent="order")]
+        variant = "، ".join(v[0] for k, v in opts.items() if len(v) == 1)
+        state["order"] = {**(state.get("order") or {}), "items": [{"product_id": p.id, "qty": 1, "variant": variant}]}
+        return [await order_next_step(db, conv, store, agent, state)]
+    return []
+
+
+async def order_next_step(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent,
+                          state: dict[str, Any]) -> Reply:
+    """Items are chosen: the shop's contact form (or the missing fields), or straight to the summary when an earlier
+    order already gave the details."""
+    order = dict(state.get("order") or {})
+    if prev := await last_order(db, conv):
+        for k, v in (("name", prev.customer_name), ("phone", prev.customer_phone), ("address", prev.customer_address)):
+            if v and not order.get(k):
+                order[k] = v
+    state["order"] = order
+    missing = _missing_fields(agent, order)
+    if not missing:
+        lines, total = await priced_lines(db, store.id, order["items"])
+        state.pop("collecting", None)
+        state["awaiting"] = "confirm"
+        return Reply("خلاصهٔ سفارشت:\n" + order_summary(order, lines, total) + "\n\nتأیید می‌کنی؟ (بله / خیر)",
+                     source="order", intent="order")
+    state["collecting"] = True
+    form = str((agent.payment or {}).get("order_form") or "").strip()
+    if form and {"name", "phone", "address"} & set(missing):
+        state["form_sent"] = True
+        return Reply(form[:1000], source="order", intent="order")
+    return Reply("عالیه 🌸 برای ثبت سفارش لطفاً " + "، ".join(FIELD_NAMES.get(m, m) for m in missing)
+                 + " رو توی یک پیام بفرست.", source="order", intent="order")
 
 
 async def create_order(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent,

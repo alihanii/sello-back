@@ -1169,3 +1169,53 @@ async def test_a_long_faq_is_sent_a_few_entries_at_a_time(client, monkeypatch):
     call = llm.calls[-1]
     assert "تیپاکس" in call["prompt"] and "تیپاکس" not in call["system"]
     assert "جواب طولانی" not in call["system"] and call["prompt"].count("جواب طولانی جواب") <= chat_engine.FAQ_PER_TURN
+
+
+async def test_simple_product_turns_and_first_order_steps_need_no_model(client, monkeypatch):
+    """ali's chat again: «سایزبندی؟», «موجوده؟», «میخوام سفارش بدم», «۳۸» each took a model call; now code answers."""
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550045")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        "enabled": True, "orders_enabled": True, "payment": {"card_number": "6037991234567890"}})
+    jeans = (await client.post(f"/stores/{sid}/products", headers=h, json={
+        "title": "شلوار جین مام فیت زنانه طوسی", "price": 3000000, "stock_qty": 5,
+        "attributes": {"سایز": "۳۱، ۳۲، ۳۳، ۳۴، ۳۶، ۳۸", "رنگ": "طوسی"}})).json()
+
+    async def say(text):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
+
+    await say("سلام")
+    llm.answers = [{"reply": "بله، شلوار جین مام فیت موجوده.", "intent": "product", "products": [jeans["id"]]}]
+    await say("شلوار جین مام فیت دارین")
+    n = len(llm.calls)
+
+    m = await say("سایز بندی رو لطف میکنی؟")
+    assert m["source"] == "canned" and "۳۸" in m["text"] and "۳۱" in m["text"]
+    m = await say("موجوده؟")
+    assert m["source"] == "canned" and "موجوده" in m["text"] and "۳٬۰۰۰٬۰۰۰" in m["text"]
+    m = await say("قیمتش چنده")
+    assert "۳٬۰۰۰٬۰۰۰" in m["text"]
+    m = await say("خب میخوام سفارش بدم")
+    assert "سایز" in m["text"] and "۳۸" in m["text"]
+    m = await say("۳۸")
+    assert "نام و نام خانوادگی" in m["text"]
+    m = await say("سید علی هانی\n۰۹۱۲۳۳۳۴۴۵۵\nقم دورشهر کوچه ۲ کد پستی ۲۲۲۳۳۴۵۶۱۲")
+    assert "خلاصهٔ سفارشت" in m["text"] and "(طوسی، ۳۸)" in m["text"] and "۲۲۲۳۳۴۵۶۱۲" in m["text"]
+    assert (await say("بله"))["source"] == "order"
+    assert len(llm.calls) == n  # none of these reached the model
+
+    # anything else still goes to the model
+    for text in ("این مردونه مگه نیست؟", "سایز ۴۰ دارید؟", "میخوام شلوار مردونه ببینم", "هودی دارین؟"):
+        await say(text)
+    assert len(llm.calls) == n + 4
+
+
+def test_order_asks_and_variant_options():
+    for t in ("خب میخوام سفارش بدم", "همینو می‌خوام", "ثبتش کن", "اوکی می خوام بخرمش"):
+        assert chat_engine.is_order_ask(t), t
+    for t in ("میخوام یه سفارش دیگه هم ثبت کنم", "میخوام شلوار مردونه ببینم", "سفارشم کی میرسه"):
+        assert not chat_engine.is_order_ask(t), t
+    p = chat_engine.Product(attributes={"سایز": "L، XL، XXL", "رنگ": "مشکی و سفید"})
+    o = chat_engine.variant_options(p)
+    assert o == {"size": ["L", "XL", "XXL"], "color": ["مشکی", "سفید"]}
+    assert chat_engine.match_option("2xl", o["size"]) == "XXL" and chat_engine.match_option("xl", o["size"]) == "XL"
+    assert chat_engine.match_option("۴۰", ["۳۸ تا ۴۴"]) == "40" and chat_engine.match_option("۵۰", ["۳۸ تا ۴۴"]) == ""
