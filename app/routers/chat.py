@@ -21,7 +21,7 @@ from app.services import chat_runtime as rt
 from app.services import chat_faq
 from app.services.ai import AIError, route_problem
 from app.services.chat_engine import (
-    MAX_ANSWER_RULES, MAX_ORDER_FIELDS, order_fields, policy,
+    MAX_ANSWER_RULES, MAX_ORDER_FIELDS, due_toman, order_fields, policy,
     DEFAULT_AWAY, DEFAULT_OFF_TOPIC, DEFAULT_WELCOME, chat_limit, get_agent, month_ai_messages,
 )
 
@@ -83,7 +83,7 @@ async def get_agent_settings(store_id: int, user: CurrentUser, db: DB):
     return _agent_out(agent, store)
 
 
-PAYMENT_KEYS = ("card_number", "sheba", "holder", "link", "note", "require_receipt")
+PAYMENT_KEYS = ("card_number", "sheba", "holder", "link", "note", "require_receipt", "order_form")
 
 
 @router.put("/stores/{store_id}/chat/agent")
@@ -505,7 +505,7 @@ def _order_out(o: AiOrder) -> dict[str, Any]:
             "customer_username": o.customer_username, "items": o.items, "total_toman": o.total_toman, "note": o.note,
             "status": o.status, "payment_ref": o.payment_ref, "receipt_url": o.receipt_url,
             "receipt_text": o.receipt_text, "seller_note": o.seller_note, "is_test": o.is_test,
-            "extras": o.extras or {},
+            "extras": o.extras or {}, "due_toman": 0 if o.status in ("confirmed", "rejected", "cancelled") else due_toman(o),
             "created_at": o.created_at, "updated_at": o.updated_at}
 
 
@@ -605,6 +605,8 @@ async def update_order(order_id: int, body: OrderPatch, user: CurrentUser, db: D
                 p = await db.get(Product, it.get("product_id") or 0) if it.get("product_id") else None
                 if p and p.store_id == o.store_id:
                     p.stock_qty = max(0, p.stock_qty - int(it.get("qty") or 0))
+        if body.status == "confirmed":
+            o.items = [{**i, "paid": True} for i in o.items or []]  # the seller says it's paid
         o.status = body.status
         conv = await db.get(ChatConversation, o.conversation_id)
         if conv:

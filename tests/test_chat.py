@@ -896,3 +896,92 @@ async def test_orders_off_hands_the_buyer_to_the_admin(client, monkeypatch):
     assert (await say("ادمین اصلی کجاس"))["source"] == "handoff"
     llm.answers = [{"reply": "باشه 🌸", "intent": "product"}]
     assert (await say("باشه"))["source"] == "llm"  # "ok" is not "thanks"
+
+
+async def test_adding_to_a_paid_order_asks_only_for_the_rest(client, monkeypatch):
+    """ali's chat: ordered, sent the receipt, then "add another hoodie" — the bot must ask for the new amount only."""
+    h, sid, llm, p1, p2 = await _setup(client, monkeypatch, "09125550033")
+
+    async def say(text):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
+
+    await _order_ready(client, h, sid, llm, p1)
+    assert (await say("بله"))["source"] == "order"
+    assert (await say("56455561561561"))["source"] == "receipt"
+
+    llm.answers = [{"reply": "", "intent": "order", "order_action": "confirm",
+                    "order": {"items": [{"product_id": p1["id"], "qty": 1, "variant": "M"}]}}]
+    m = await say("همون مدل سایز M رو هم اضافه کن")
+    assert "PLACED ORDER #" in llm.calls[-1]["prompt"] and "paid" in llm.calls[-1]["prompt"]
+    assert "اضافه به سفارش" in m["text"] and "۱٬۲۵۰٬۰۰۰" in m["text"] and "سارا" not in m["text"]
+    m = await say("بله")
+    assert "اضافه شد" in m["text"] and "۱٬۲۵۰٬۰۰۰" in m["text"] and "2,500" not in m["text"]
+
+    # "thanks" while the addition is unpaid: a payment reminder, not just "you're welcome"
+    m = await say("مرسی")
+    assert "پرداخت" in m["text"] and "۱٬۲۵۰٬۰۰۰" in m["text"]
+
+    orders = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
+    rows = orders.get("items", orders) if isinstance(orders, dict) else orders
+    o = rows[0]
+    assert len(o["items"]) == 2 and [i["paid"] for i in o["items"]] == [True, False]
+    assert o["total_toman"] == 2500000 and o["due_toman"] == 1250000 and o["status"] == "awaiting_payment"
+
+    assert (await say("کد پیگیری ۷۷۸۸۹۹۰۰"))["source"] == "receipt"
+    rows = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
+    rows = rows.get("items", rows) if isinstance(rows, dict) else rows
+    assert rows[0]["due_toman"] == 0 and all(i["paid"] for i in rows[0]["items"])
+
+
+async def test_order_form_and_address_is_not_off_topic(client, monkeypatch):
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550034")
+    form = "برای ثبت سفارش این‌ها رو بفرست 🌸\nنام:\nموبایل:\nآدرس:"
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        "orders_enabled": True, "payment": {"card_number": "6037991234567890", "order_form": form}})
+
+    async def say(text):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
+
+    await say("سلام")
+    llm.answers = [{"reply": "عالیه، لطفاً نام و شماره تماستون رو بفرمایید.", "intent": "order", "order_action": "update",
+                    "order": {"items": [{"product_id": p1["id"], "qty": 1, "variant": "XL"}]}}]
+    assert (await say("اره همینو میخوام"))["text"] == form
+    n = len(llm.calls)
+    # the filled-in form is read in code: summary with no model call
+    m = await say("نام: علی رضایی\nموبایل: ۰۹۱۲۳۳۳۳۴۳۴\nآدرس: قم خیابان صفاییه کوچه ۱۲")
+    assert len(llm.calls) == n and "خلاصهٔ سفارشت" in m["text"]
+    assert "علی رضایی" in m["text"] and "09123333434" in m["text"] and "قم خیابان صفاییه" in m["text"]
+    assert (await say("بله"))["source"] == "order"
+
+
+async def test_contact_details_one_by_one_without_the_model(client, monkeypatch):
+    """ali's chat without a form: the phone, then the address that the model had called off-topic."""
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550035")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        "orders_enabled": True, "payment": {"card_number": "6037991234567890"}})
+
+    async def say(text):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
+
+    await say("سلام")
+    llm.answers = [{"reply": "عالیه. لطفا نام و شماره تماستون رو بفرمایید.", "intent": "order", "order_action": "update",
+                    "order": {"items": [{"product_id": p1["id"], "qty": 1, "variant": "2XL"}]}}]
+    await say("اره")
+    n = len(llm.calls)
+    m = await say("09123333434")
+    assert "نام و نام خانوادگی" in m["text"] and "آدرس کامل" in m["text"]
+    m = await say("علی")
+    assert "آدرس کامل" in m["text"] and "نام" not in m["text"]
+    m = await say("قم حشیسب ب شسیب سشیب")
+    assert "خلاصهٔ سفارشت" in m["text"] and "👤 علی" in m["text"] and "📍 قم حشیسب" in m["text"]
+    assert len(llm.calls) == n
+
+    # a question in the middle still goes to the model
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"reset": True})
+    await say("سلام")
+    llm.answers = [{"reply": "لطفاً آدرس رو بفرستید.", "intent": "order", "order_action": "update",
+                    "order": {"items": [{"product_id": p1["id"], "qty": 1}], "name": "علی", "phone": "09123333434"}}]
+    await say("ثبت کن")
+    n = len(llm.calls)
+    await say("هزینه ارسال به قم چقدره؟")
+    assert len(llm.calls) == n + 1

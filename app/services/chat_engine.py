@@ -328,6 +328,9 @@ ORDERS (if enabled): collect items (product_id, qty, variant) and REQUIRED field
 anything else), 1-2 questions at a time, put what you know in "order" — always the full current list of items,
 each line once. A change ("make it XXL", "remove X") touches only the item the customer means. All known and customer wants to finish -> order_action "confirm" (shop shows summary
 and payment; never write card numbers or totals). Cancel -> "cancel". Orders disabled -> see ORDERS.
+PLACED ORDER: the customer already ordered. Adding to it -> order.items = ONLY the new items, order_action "confirm"
+once each has its options (contact details are known; never ask them again). "همون/همین مدل" = its product.
+Name, phone or address while ordering is never off_topic.
 REFS: a reference that answers (e.g. size chart) -> its id in "refs".
 SELLER RULES and STOCK beat TONE (e.g. "always شما" = formal address, no عزیزم). When the customer swaps to another
 product, keep the size/colour they already chose unless they change it.
@@ -399,8 +402,12 @@ def _one_line(text: str) -> str:
 
 def dynamic_prompt(text: str, history: list[ChatMessage], products: list[Product], state: dict[str, Any],
                    open_now: bool, catalog: bool = False, photos: dict[int, int] | None = None,
-                   exact_stock: bool = True) -> str:
+                   exact_stock: bool = True, placed: AiOrder | None = None) -> str:
     lines = []
+    if placed:
+        items = "؛ ".join(f"#{i.get('product_id')} {i['title'][:60]}" + (f" ({i['variant']})" if i.get("variant") else "")
+                         + f" ×{i['qty']} " + ("paid" if i.get("paid") else "unpaid") for i in placed.items or [])
+        lines.append(f"PLACED ORDER #{placed.id} ({placed.status}): {items}")
     if not open_now:
         lines.append("NOW: outside working hours; orders are reviewed when the shop opens.")
     if catalog and not products:
@@ -555,9 +562,11 @@ def order_summary(order: dict[str, Any], lines: list[dict[str, Any]], total: int
     return f"{items}\n💰 جمع: {money(total)}" + (f"\n{extras}" if extras else "") + (f"\n{who}" if who else "")
 
 
-def payment_text(agent: ChatAgent, order: AiOrder) -> str:
+def payment_text(agent: ChatAgent, order: AiOrder, added: bool = False) -> str:
     pay = agent.payment or {}
-    rows = [f"✅ سفارش #{fa_number(order.id)} ثبت شد.", f"مبلغ قابل پرداخت: {money(order.total_toman)}"]
+    rows = [f"✅ به سفارش #{fa_number(order.id)} اضافه شد." if added else f"✅ سفارش #{fa_number(order.id)} ثبت شد.",
+            f"مبلغ قابل پرداخت{' (فقط اقلام جدید)' if added and due_toman(order) < order.total_toman else ''}: "
+            f"{money(due_toman(order))}"]
     if pay.get("card_number"):
         rows.append(f"💳 شماره کارت: {ltr(pay['card_number'])}")
     if pay.get("holder"):
@@ -641,6 +650,8 @@ async def _merge_order(db: AsyncSession, store_id: int, agent: ChatAgent, state:
             order["extras"] = extras
     for k in ("name", "phone", "address", "note"):
         v = str(update.get(k) or "").strip()
+        if k == "name" and v and v == str(update.get("address") or order.get("address") or "").strip():
+            continue  # the model sometimes copies the address into the name
         if v:
             order[k] = to_en_digits(v)[:30] if k == "phone" else v[:500]
     return order
@@ -683,6 +694,7 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                 order.receipt_text = text[:500]
                 order.payment_ref = re.sub(r"\s|-", "", ref.group()) if ref else order.payment_ref
                 order.status = "payment_submitted"
+                mark_paid(order)
                 state.pop("awaiting", None)
                 result.order_id = order.id
                 result.replies.append(Reply(RECEIPT_TEXT.format(order=fa_number(order.id)), source="receipt", intent="order"))
@@ -723,11 +735,17 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         ref = re.search(r"\d[\d\s-]{4,}\d", to_en_digits(text))
         paid = bool(photo or (ref and _PAID.search(text)))
         if is_yes(text) or paid:
-            order = await create_order(db, conv, store, agent, state)
+            adding = await open_order(db, store.id, state.get("add_to"))
+            order = (await add_to_order(db, adding, state) if adding else
+                     await create_order(db, conv, store, agent, state))
             if order:
                 result.order_id = order.id
-                result.notify_admin.append(f"🛍 سفارش جدید #{order.id} با AI: {money(order.total_toman)} — "
-                                           f"{order.customer_name or conv.customer_name or 'مشتری'}")
+                if adding:
+                    result.notify_admin.append(f"➕ به سفارش #{order.id} اقلام جدید اضافه شد؛ مبلغ اضافه "
+                                               f"{money(due_toman(order))} — {order.customer_name or 'مشتری'}")
+                else:
+                    result.notify_admin.append(f"🛍 سفارش جدید #{order.id} با AI: {money(order.total_toman)} — "
+                                               f"{order.customer_name or conv.customer_name or 'مشتری'}")
                 if paid and order.status == "awaiting_payment":
                     # Paid before saying yes ("کارت به کارت کردم، کد پیگیری …"): the order and the receipt together.
                     if photo:
@@ -735,16 +753,26 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                     order.receipt_text = text[:500]
                     order.payment_ref = re.sub(r"\s|-", "", ref.group()) if ref else ""
                     order.status = "payment_submitted"
+                    mark_paid(order)
                     state.pop("awaiting", None)
                     result.replies.append(Reply(RECEIPT_TEXT.format(order=fa_number(order.id)), source="receipt",
                                                 intent="order"))
                     result.notify_admin.append(f"🧾 فیش/کد پرداخت سفارش #{order.id} هم رسید.")
                 else:
-                    result.replies.append(Reply(payment_text(agent, order), source="order", intent="order"))
+                    result.replies.append(Reply(payment_text(agent, order, added=bool(adding)), source="order",
+                                                intent="order"))
                 return done()
         if _NO.match(text):
             state.pop("awaiting", None)
             state.pop("order", None)
+            if state.pop("add_to", None):
+                # Only the addition is dropped; the placed order stays as it was.
+                prev = await open_order(db, store.id, state.get("order_id"))
+                if prev and prev.status == "awaiting_payment" and (agent.payment or {}).get("require_receipt", True):
+                    state["awaiting"] = "receipt"
+                result.replies.append(Reply("باشه، چیزی اضافه نشد 🌸 سفارش قبلی‌ت سر جاشه.", source="canned",
+                                            intent="order"))
+                return done()
             result.replies.append(Reply(CANCELLED_TEXT, source="canned", intent="order"))
             return done()
         state.pop("awaiting", None)  # anything else: the customer is changing the order; let the model handle it
@@ -771,6 +799,23 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         await order_handoff(db, conv, store, state, result)
         return done()
 
+    # 4d. Waiting for name/phone/address: read in code, and the summary goes out without the model.
+    if (state.get("collecting") and agent.orders_enabled and (state.get("order") or {}).get("items") and not photo
+            and not state.get("awaiting") and looks_like_contact(text, _missing_fields(agent, state["order"]))):
+        parse_contact(agent, state, text)
+        missing = _missing_fields(agent, state["order"])
+        if missing:
+            result.replies.append(Reply("ممنون 🌸 لطفاً " + "، ".join(FIELD_NAMES.get(m, m) for m in missing)
+                                        + " رو هم بفرست.", source="order", intent="order"))
+            return done()
+        lines, total = await priced_lines(db, store.id, state["order"]["items"])
+        if lines:
+            state.pop("collecting", None)
+            state["awaiting"] = "confirm"
+            result.replies.append(Reply("خلاصهٔ سفارشت:\n" + order_summary(state["order"], lines, total)
+                                        + "\n\nتأیید می‌کنی؟ (بله / خیر)", source="order", intent="order"))
+            return done()
+
     # 5. Asking for a human: no model needed.
     if _HUMAN.search(text) and len(words(text)) <= 8:
         result.replies.append(Reply(HANDOFF_TEXT, source="handoff", intent="handoff"))
@@ -783,6 +828,13 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         result.replies.append(Reply("سلام 🌸 بفرمایید، در خدمتم.", source="canned", intent="greeting"))
         return done()
     if _THANKS.match(text):
+        owed = await open_order(db, store.id, state.get("order_id"))
+        if owed and owed.status == "awaiting_payment" and due_toman(owed):
+            # Thanks with money still owed: remind them how to finish, not just "you're welcome".
+            result.replies.append(Reply(
+                f"خواهش می‌کنم 🌸 فقط یادت نره مبلغ {money(due_toman(owed))} سفارش #{fa_number(owed.id)} رو پرداخت "
+                "کنی و عکس فیش یا کد پیگیریش رو همین‌جا بفرستی.", source="canned", intent="order"))
+            return done()
         result.replies.append(Reply("خواهش می‌کنم 🌸 اگه سؤال دیگه‌ای داشتی بپرس.", source="canned", intent="greeting"))
         return done()
 
@@ -845,8 +897,9 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                                                           ChatMessage.role.in_(["customer", "ai", "seller"]))
                                 .order_by(ChatMessage.id.desc()).limit(HISTORY_MESSAGES + len(pending)))).scalars().all()
     history = [m for m in reversed(history) if m.id not in pending_ids][-HISTORY_MESSAGES:]
+    placed = await open_order(db, store.id, state.get("order_id")) if agent.orders_enabled else None
     prompt = dynamic_prompt(text, history, products, state, open_now, agent.catalog_enabled, photos,
-                            policy(agent)["stock"] == "exact")
+                            policy(agent)["stock"] == "exact", placed)
     try:
         out, usage = await ai.generate_chat(system=system, prompt=prompt, store_id=store.id, max_tokens=MAX_OUTPUT_TOKENS)
         if mixed_language(str(out.get("reply") or ""), text, products, store):
@@ -880,6 +933,14 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
     if shown:
         state["recent_products"] = (list(state.get("recent_products") or []) + shown)[-4:]
 
+    if intent == "off_topic" and agent.orders_enabled and (state.get("order") or {}).get("items"):
+        # Mid-order, "قم، خیابان …" is the address, not off-topic: keep it and carry on with the order.
+        capture_contact(agent, state, text)
+        missing = _missing_fields(agent, state["order"])
+        intent, out = "order", {**out, "order_action": "confirm", "order": None, "products": []}
+        reply_text = ("ممنون 🌸 لطفاً " + "، ".join(FIELD_NAMES.get(m, m) for m in missing) + " رو هم بفرست."
+                      if missing else "")
+        state["collecting"] = True
     if intent == "off_topic" and _SHOPPING_ASK.search(text):
         # "کفش هم دارین؟" is a shopping question about something the shop doesn't sell, not off-topic.
         result.replies.append(Reply(not_carried(rows), source="llm", intent="product", usage=usage))
@@ -911,12 +972,39 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         reply_text = hide_stock_counts(reply_text)
     reply = Reply(reply_text[:1500], source="llm", intent=intent, usage=usage)
     order = state.get("order") or {}
+    if agent.orders_enabled and placed and order.get("items"):
+        # Adding to a placed order: its contact details carry over, nothing is asked twice.
+        for k, v in (("name", placed.customer_name), ("phone", placed.customer_phone),
+                     ("address", placed.customer_address)):
+            if v and not order.get(k):
+                order[k] = v
+        if placed.extras:
+            order["extras"] = {**placed.extras, **(order.get("extras") or {})}
+        state["order"] = order
     if agent.orders_enabled and action == "confirm" and order.get("items") and not _missing_fields(agent, order):
         lines, total = await priced_lines(db, store.id, order["items"])
         if lines:
             state["awaiting"] = "confirm"
-            reply.text = "خلاصهٔ سفارشت:\n" + order_summary(order, lines, total) + "\n\nتأیید می‌کنی؟ (بله / خیر)"
+            if placed:
+                state["add_to"] = placed.id
+                items = "\n".join(f"▫️ {i['title']}" + (f" ({i['variant']})" if i.get("variant") else "")
+                                  + f" × {fa_number(i['qty'])} = {money(i['unit_price'] * i['qty'])}" for i in lines)
+                reply.text = (f"اضافه به سفارش #{fa_number(placed.id)}:\n{items}\n💰 مبلغ این اضافه: {money(total)}"
+                              "\n\nتأیید می‌کنی؟ (بله / خیر)")
+            else:
+                state.pop("add_to", None)
+                reply.text = "خلاصهٔ سفارشت:\n" + order_summary(order, lines, total) + "\n\nتأیید می‌کنی؟ (بله / خیر)"
             reply.intent = "order"
+    form = str((agent.payment or {}).get("order_form") or "").strip()
+    if (agent.orders_enabled and form and order.get("items") and not state.get("awaiting") and not state.get("form_sent")
+            and {"name", "phone", "address"} & set(_missing_fields(agent, order)) and _ASKS_CONTACT.search(reply.text)):
+        # The seller's own fixed "send us these" message, once per order, instead of asking one by one.
+        reply.text, reply.intent = form[:1000], "order"
+        state["form_sent"] = True
+    if (agent.orders_enabled and order.get("items") and not state.get("awaiting")
+            and {"name", "phone", "address"} & set(_missing_fields(agent, order))
+            and (_ASKS_CONTACT.search(reply.text) or state.get("form_sent"))):
+        state["collecting"] = True  # the next message with the details is read in code (4d), no model
     if not agent.orders_enabled and _BUY_OFFER.search(reply.text):
         state["buy_offer"] = True  # a plain "yes" next hands the chat to the admin
     reason = str(out.get("handoff_reason") or "")
@@ -1083,12 +1171,128 @@ async def product_photos(db: AsyncSession, products: list[Product], ids: Any, te
     return out
 
 
+OPEN_ORDER = ("awaiting_payment", "payment_submitted")  # the customer can still add to these
+FIELD_NAMES = {"name": "نام و نام خانوادگی", "phone": "شماره موبایل", "address": "آدرس کامل"}
+_ASKS_CONTACT = re.compile(r"(نام|اسم|شماره|تلفن|موبایل|تماس|آدرس|ادرس|نشانی)")
+_PHONE = re.compile(r"(?:\+?98|0)?9\d{9}")
+
+
+async def open_order(db: AsyncSession, store_id: int, order_id: Any) -> AiOrder | None:
+    o = await db.get(AiOrder, int(order_id)) if str(order_id or "").isdigit() else None
+    return o if o and o.store_id == store_id and o.status in OPEN_ORDER else None
+
+
+def due_toman(order: AiOrder) -> int:
+    """What is still to pay: the lines without a payment yet (older orders count as one payment)."""
+    old = order.status != "awaiting_payment"  # lines from before per-line payment follow the order's status
+    return sum(int(i.get("unit_price") or 0) * int(i.get("qty") or 1) for i in order.items or []
+               if not i.get("paid", old))
+
+
+def mark_paid(order: AiOrder) -> None:
+    order.items = [{**i, "paid": True} for i in order.items or []]  # a new list, so the JSON change is saved
+
+
+async def add_to_order(db: AsyncSession, order: AiOrder, state: dict[str, Any]) -> AiOrder | None:
+    lines, total = await priced_lines(db, order.store_id, (state.get("order") or {}).get("items") or [])
+    if not lines:
+        return None
+    order.items = list(order.items or []) + [{**ln, "paid": False} for ln in lines]
+    order.total_toman = int(order.total_toman or 0) + total
+    order.status = "awaiting_payment"
+    state.pop("order", None)
+    state.pop("add_to", None)
+    state.pop("form_sent", None)
+    state["order_id"] = order.id
+    state["awaiting"] = "receipt"
+    state["recent_products"] = ([i["product_id"] for i in lines if i.get("product_id")] or
+                                list(state.get("recent_products") or []))[-4:]
+    return order
+
+
+def capture_contact(agent: ChatAgent, state: dict[str, Any], text: str) -> None:
+    """The model missed a plain contact message mid-order: a phone number, or else the address/name it was asked."""
+    order = dict(state.get("order") or {})
+    missing = _missing_fields(agent, order)
+    phone = _PHONE.search(to_en_digits(text).replace(" ", "").replace("-", ""))
+    rest = text.strip()
+    if phone and "phone" in missing:
+        order["phone"] = phone.group()
+        rest = re.sub(r"[+\d۰-۹\s-]{10,}", " ", rest).strip()
+    short_name = len(words(rest)) <= 3 and not re.search(r"[\d۰-۹،,]", rest)
+    if rest and "name" in missing and ("address" not in missing or short_name):
+        order["name"] = rest[:100]
+    elif rest and "address" in missing:
+        order["address"] = rest[:500]
+    state["order"] = order
+
+
+_LABELS = (("phone", re.compile(r"(شماره|موبایل|تلفن|تماس|همراه)")), ("address", re.compile(r"(آدرس|ادرس|نشانی)")),
+           ("name", re.compile(r"(نام|اسم)")))
+_NOT_CONTACT = re.compile(r"[؟?]|(چنده|چقدر|قیمت|موجود|دارین|دارید|عکس|سایز|رنگ|لغو|کنسل|نمی\s*‌?خوام|نمیخوام|"
+                          r"باشه|صبر|بعدا|بعداً|چطور|کی\s|کجا|مرسی|ممنون|اضافه|عوض|تغییر|بجا|به\s*جا|^\s*نه\b|^\s*خیر\b)")
+
+
+def looks_like_contact(text: str, missing: list[str] | tuple = ()) -> bool:
+    """While the shop waits for name/phone/address: is this message those details (not a question)?"""
+    t = text.strip()
+    if not t or _NOT_CONTACT.search(t) and not _PHONE.search(to_en_digits(t).replace(" ", "")):
+        return False
+    if _GREETING.match(t) or _THANKS.match(t) or is_yes(t) or _NO.match(t):
+        return False
+    if "name" in missing and 1 <= len(t.split()) <= 3 and not re.search(r"[\d۰-۹]", t):
+        return True  # "علی", "سارا کریمی"
+    return bool(_PHONE.search(to_en_digits(t).replace(" ", "").replace("-", "")) or ":" in t or "\n" in t
+                or len(t) >= 8 and len(words(t)) >= 2)
+
+
+def parse_contact(agent: ChatAgent, state: dict[str, Any], text: str) -> None:
+    """Name, phone and address in code, from the filled-in form ("نام: …") or plain lines; the model isn't needed."""
+    order = dict(state.get("order") or {})
+    extras = dict(order.get("extras") or {})
+    text_fields = {f["label"]: f for f in order_fields(agent) if f["kind"] == "text"}
+    loose = []
+    for line in [x.strip(" -•▫️") for x in text.splitlines() if x.strip()]:
+        label, sep, value = line.partition(":") if ":" in line else line.partition("：")
+        value = value.strip()
+        if sep and value:
+            key = next((k for k, rx in _LABELS if rx.search(label)), None)
+            field_ = next((f for f in text_fields if f in label or label.strip() in f), None)
+            if key == "phone" and _PHONE.search(to_en_digits(value).replace(" ", "").replace("-", "")):
+                order["phone"] = _PHONE.search(to_en_digits(value).replace(" ", "").replace("-", "")).group()
+                continue
+            if key in ("name", "address"):
+                order[key] = value[:100 if key == "name" else 500]
+                continue
+            if field_:
+                extras[field_] = value[:300]
+                continue
+        loose.append(line)
+    if extras:
+        order["extras"] = extras
+    state["order"] = order
+    if loose:
+        rest = "\n".join(loose)
+        lines = [x for x in loose if not _PHONE.search(to_en_digits(x).replace(" ", "").replace("-", ""))]
+        missing = _missing_fields(agent, order)
+        if len(lines) >= 2 and "name" in missing and len(words(lines[0])) <= 4 and not re.search(r"\d", lines[0]):
+            order["name"] = lines[0][:100]  # "علی رضایی\nقم، خیابان …"
+            rest = "\n".join(x for x in loose if x != lines[0])
+        capture_contact(agent, state, rest)
+
+
 async def create_order(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent,
                        state: dict[str, Any]) -> AiOrder | None:
     order_state = state.get("order") or {}
     lines, total = await priced_lines(db, store.id, order_state.get("items") or [])
     if not lines:
         return None
+    lines = [{**ln, "paid": False} for ln in lines]
+    state.pop("form_sent", None)
+    state.pop("collecting", None)
+    state.pop("add_to", None)
+    state["recent_products"] = ([i["product_id"] for i in lines if i.get("product_id")] or
+                                list(state.get("recent_products") or []))[-4:]
     order = AiOrder(store_id=store.id, conversation_id=conv.id, platform=conv.platform,
                     customer_name=order_state.get("name") or conv.customer_name,
                     customer_phone=order_state.get("phone", ""), customer_address=order_state.get("address", ""),
