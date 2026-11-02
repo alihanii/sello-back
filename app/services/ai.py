@@ -678,17 +678,22 @@ Respond ONLY with JSON: {"posts":[{"message_id":"<copy>","title":"<short title>"
 Rules: one object per input post, preserve message_id; numbers are integers; parse Persian digits;
 do NOT invent data that is not in the caption."""
 
-# "AI only" crawl mode: the same fields plus the product category and a fuller set of details, like AI product creation.
-CAPTION_EXTRACT_FULL_SYSTEM = """You extract structured product fields from social post captions (usually Persian).
+# "AI only" crawl mode: one post at a time with its photos, the same fields plus the product category and a fuller
+# set of details, like AI product creation.
+CAPTION_EXTRACT_FULL_SYSTEM = """You extract structured product fields from a social shop post (usually Persian).
+You get the post's caption and, when it has them, its photos (attached).
 Respond ONLY with JSON: {"posts":[{"message_id":"<copy>","title":"<short title>","description":"<text without price/stock lines>","price":<int Toman, 0 if missing>,"quantity":<int, 0 if missing>,"category_hint":"<Persian product type, e.g. ماگ سرامیکی, هودی, کیف دوشی>","category":"<shop category>","attributes":{"<Persian name>":"<value>"}}]}
 Rules: one object per input post, preserve message_id; numbers are integers; parse Persian digits:
 «۴ میلیون تومان» = 4000000, «۲۵۰ هزار» = 250000, «۲۰ تا» = 20.
-category_hint: what the product IS, in a few Persian words, from the caption; empty if the caption doesn't say.
+title: what the product IS + its key feature (type, material, colour, model); use the photos when the caption is short.
+category_hint: what the product IS, in a few Persian words; empty if neither the caption nor the photos show it.
 category: the product's TYPE in 1-2 Persian words, e.g. هودی, تیشرت, کفش, مانتو, شال, کیف, ماگ, بشقاب.
 Not a broad section (NOT پوشاک مردانه, ظروف آشپزخانه) and no colour/material/size/model (هودی, not هودی مشکی نخی).
 If shop_categories in the input has the same type, copy it EXACTLY (same spelling); otherwise write the new type.
-attributes: every concrete detail the caption states (جنس, رنگ, سایز, ابعاد, وزن, مدل, کشور سازنده, گارانتی …), one key per detail,
-several values joined with «، ». Only what the caption says: do NOT invent data that is not in the caption."""
+attributes: ALWAYS fill this object with every concrete detail the caption states or the photos clearly show
+(جنس, رنگ, سایز, ابعاد, وزن, مدل, طرح, کشور سازنده, گارانتی, text printed on labels …), one key per detail,
+several values joined with «، ». Colours and patterns visible in the photos count; things that are not clear
+(exact material, size, weight, brand) are omitted. Never invent data. Use {} only if there is truly no detail."""
 
 PRODUCT_FROM_PHOTO_SYSTEM = """You are the product copywriter of an Iranian online shop. Write in Persian.
 You get: optional product photos and an optional short note from the seller.

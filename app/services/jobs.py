@@ -1,6 +1,9 @@
 """Operation handlers the worker runs: connect, health_check, publish, crawl, ai_product."""
 
+import asyncio
 import json
+import mimetypes
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from sqlalchemy import select
@@ -101,9 +104,53 @@ async def run_publish(ctx: OpContext) -> None:
 
 # ---------- crawl ----------
 
+ImageLoader = Callable[[CrawledItem], Awaitable[list[tuple[bytes, str]]]]
+AI_ONLY_PHOTOS = 3  # photos per post sent to the AI in "AI only" mode
+AI_ONLY_PARALLEL = 4
+
+
+def clean_attributes(raw: Any) -> dict[str, str]:
+    """AI attributes as {name: value} strings. Accepts a dict or a list of {name, value} pairs; drops empty values."""
+    if isinstance(raw, list):
+        raw = {str(r.get("name") or r.get("key") or ""): r.get("value") for r in raw if isinstance(r, dict)}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        if isinstance(v, (list, tuple)):
+            v = "، ".join(str(x).strip() for x in v if x not in (None, ""))
+        name, value = normalize_fa(str(k)).strip(), normalize_fa("" if v is None else str(v)).strip()
+        if name and value:
+            out[name] = value
+    return out
+
+
+def _apply_ai_row(out: dict[str, dict], row: dict, mode: str, shop_categories: list[str]) -> None:
+    mid = str(row.get("message_id"))
+    if mid not in out or not row.get("title"):
+        return
+    out[mid].update({
+        "title": normalize_fa(row["title"])[:300],
+        "description": normalize_fa(row.get("description", "")),
+        "price": parse_number(str(row.get("price", 0))) or out[mid]["price"],
+        "quantity": parse_number(str(row.get("quantity", 0))) or out[mid]["quantity"],
+        "attributes": clean_attributes(row.get("attributes")) or out[mid].get("attributes") or {},
+        "method": "llm"})
+    if mode == "llm" and row.get("category_hint"):
+        out[mid]["category_hint"] = normalize_fa(str(row["category_hint"]))[:200]
+    if mode == "llm" and row.get("category"):
+        category = categories.match(row["category"], shop_categories)
+        out[mid]["category"] = category
+        if category not in shop_categories:  # later posts in this crawl reuse it
+            shop_categories.append(category)
+
+
 async def _extract(items: list[CrawledItem], mode: str, store_id: int,
-                   shop_categories: list[str] | None = None) -> tuple[dict[str, dict], list[str]]:
-    """Regex first; LLM for posts the rules couldn't complete (platform-wrappers approach)."""
+                   shop_categories: list[str] | None = None,
+                   load_images: ImageLoader | None = None) -> tuple[dict[str, dict], list[str]]:
+    """Regex first; LLM for posts the rules couldn't complete (platform-wrappers approach).
+    "AI only" (llm) reads each post on its own with its photos, like AI product creation, so details that are only
+    in the photo (colour, material, size label) reach the attributes too."""
     shop_categories = list(shop_categories or [])
     out: dict[str, dict] = {}
     pending: list[CrawledItem] = []
@@ -118,38 +165,50 @@ async def _extract(items: list[CrawledItem], mode: str, store_id: int,
         out[it.external_id] = {**parsed, "method": "regex"}
         if mode == "llm" or (mode == "auto" and not parsed["complete"]):
             pending.append(it)
-    if pending and mode != "regex":
-        if not await ai.ai_available("caption_extract"):
-            notes.append("هوش مصنوعی تنظیم نشده؛ فقط استخراج قاعده‌محور انجام شد.")
-        else:
-            for i in range(0, len(pending), 20):
-                batch = pending[i:i + 20]
+    if not pending or mode == "regex":
+        return out, notes
+    if not await ai.ai_available("caption_extract"):
+        notes.append("هوش مصنوعی تنظیم نشده؛ فقط استخراج قاعده‌محور انجام شد.")
+        return out, notes
+    if mode == "llm":
+        gate = asyncio.Semaphore(AI_ONLY_PARALLEL)
+
+        async def one(it: CrawledItem) -> None:
+            async with gate:
+                images: list[tuple[bytes, str]] = []
+                if load_images and it.image_urls:
+                    try:
+                        images = (await load_images(it))[:AI_ONLY_PHOTOS]
+                    except Exception:  # noqa: BLE001 - the caption alone still gives a product
+                        images = []
                 try:
                     res = await ai.generate_json(
-                        task="caption_extract", store_id=store_id,
-                        system=ai.CAPTION_EXTRACT_FULL_SYSTEM if mode == "llm" else ai.CAPTION_EXTRACT_SYSTEM,
-                        prompt=json.dumps({"posts": [{"message_id": b.external_id, "caption": b.caption} for b in batch],
-                                           **({"shop_categories": shop_categories[:categories.PROMPT_LIMIT]}
-                                              if mode == "llm" else {})}, ensure_ascii=False))
+                        task="caption_extract", store_id=store_id, system=ai.CAPTION_EXTRACT_FULL_SYSTEM,
+                        images=images,
+                        prompt=json.dumps({"posts": [{"message_id": it.external_id, "caption": it.caption,
+                                                      "photos": len(images)}],
+                                           "shop_categories": shop_categories[:categories.PROMPT_LIMIT]},
+                                          ensure_ascii=False))
                 except ai.AIError as exc:
                     notes.append(exc.message_fa)
-                    continue
+                    return
                 for row in res.get("posts", []):
-                    mid = str(row.get("message_id"))
-                    if mid in out and row.get("title"):
-                        out[mid].update({
-                            "title": normalize_fa(row["title"])[:300],
-                            "description": normalize_fa(row.get("description", "")),
-                            "price": parse_number(str(row.get("price", 0))) or out[mid]["price"],
-                            "quantity": parse_number(str(row.get("quantity", 0))) or out[mid]["quantity"],
-                            "attributes": row.get("attributes") or {}, "method": "llm"})
-                        if mode == "llm" and row.get("category_hint"):
-                            out[mid]["category_hint"] = normalize_fa(str(row["category_hint"]))[:200]
-                        if mode == "llm" and row.get("category"):
-                            category = categories.match(row["category"], shop_categories)
-                            out[mid]["category"] = category
-                            if category not in shop_categories:  # later posts in this crawl reuse it
-                                shop_categories.append(category)
+                    _apply_ai_row(out, row, mode, shop_categories)
+
+        await asyncio.gather(*(one(it) for it in pending))
+        return out, list(dict.fromkeys(notes))
+    for i in range(0, len(pending), 20):
+        batch = pending[i:i + 20]
+        try:
+            res = await ai.generate_json(
+                task="caption_extract", store_id=store_id, system=ai.CAPTION_EXTRACT_SYSTEM,
+                prompt=json.dumps({"posts": [{"message_id": b.external_id, "caption": b.caption} for b in batch]},
+                                  ensure_ascii=False))
+        except ai.AIError as exc:
+            notes.append(exc.message_fa)
+            continue
+        for row in res.get("posts", []):
+            _apply_ai_row(out, row, mode, shop_categories)
     return out, notes
 
 
@@ -159,9 +218,34 @@ async def ingest_items(ctx: OpContext, *, store: Store, items: list[CrawledItem]
     """`fetch_image(url) -> (bytes, content_type)` copies remote photos (Instagram links expire) to our media."""
     db, op = ctx.db, ctx.op
     counts = {"seen": len(items), "created": 0, "updated": 0, "duplicate": 0, "skipped": 0, "failed": 0, "inbox": 0}
+    fetched: dict[str, tuple[bytes, str, str]] = {}  # url -> (bytes, filename, content type); AI and save share one download
+
+    async def fetch(url: str) -> tuple[bytes, str, str] | None:
+        if url not in fetched:
+            if url.startswith("botfile:") and channel:
+                blob, name = await get_adapter(channel.platform).download_file(channel, url.removeprefix("botfile:"))
+                fetched[url] = (blob, name, "")
+            elif fetch_image and url.startswith("http"):
+                blob, ctype = await fetch_image(url)
+                fetched[url] = (blob, "", ctype or "")
+            else:
+                return None
+        return fetched[url]
+
+    async def load_images(it: CrawledItem) -> list[tuple[bytes, str]]:
+        photos = []
+        for url in it.image_urls[:AI_ONLY_PHOTOS]:
+            try:
+                got = await fetch(url)
+            except Exception:  # noqa: BLE001, S112 - one missing photo shouldn't drop the others
+                continue
+            if got:
+                photos.append((got[0], got[2] or mimetypes.guess_type(got[1])[0] or "image/jpeg"))
+        return photos
+
     async with ctx.step("extract", f"استخراج دیتای {len(items)} آیتم", request={"mode": mode}) as s:
         shop_categories = await categories.category_names(db, store.id) if mode == "llm" else []
-        extracted, notes = await _extract(items, mode, store.id, shop_categories)
+        extracted, notes = await _extract(items, mode, store.id, shop_categories, load_images=load_images)
         s.response = {"methods": {k: v.get("method") for k, v in extracted.items()}, "notes": notes}
         s.message_fa = " ".join(notes)
 
@@ -209,12 +293,9 @@ async def ingest_items(ctx: OpContext, *, store: Store, items: list[CrawledItem]
             await product_code.apply_default_code(db, prod, it.caption or "")
             for pos, url in enumerate(it.image_urls[:10]):
                 try:
-                    if url.startswith("botfile:") and channel:
-                        blob, name = await get_adapter(channel.platform).download_file(channel, url.removeprefix("botfile:"))
-                        url = save_bytes(store.id, blob, name)
-                    elif fetch_image and url.startswith("http"):
-                        blob, ctype = await fetch_image(url)
-                        url = save_bytes(store.id, blob, content_type=ctype)
+                    got = await fetch(url)
+                    if got:
+                        url = save_bytes(store.id, got[0], got[1], content_type=got[2])
                     db.add(ProductImage(product_id=prod.id, url=url, position=pos, origin_url=url))
                 except Exception:  # noqa: BLE001 - a missing photo shouldn't drop the product
                     row.error_fa = "بعضی عکس‌ها دریافت نشدند."

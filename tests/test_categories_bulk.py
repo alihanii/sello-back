@@ -45,9 +45,11 @@ async def test_ai_fills_category_from_the_shop_list(client, monkeypatch):
 
 async def test_crawl_ai_mode_fills_category(monkeypatch):
     async def fake(*, task, system, prompt, store_id=None, **kw):
-        assert json.loads(prompt)["shop_categories"] == ["هودی"]
-        return {"posts": [{"message_id": "1", "title": "هودی", "category": "هودي"},
-                          {"message_id": "2", "title": "ماگ", "category": "ماگ"}]}
+        data = json.loads(prompt)  # AI only: one post per call; new types join the list for later posts
+        assert data["shop_categories"][0] == "هودی"
+        rows = {"1": {"message_id": "1", "title": "هودی", "category": "هودي"},
+                "2": {"message_id": "2", "title": "ماگ", "category": "ماگ"}}
+        return {"posts": [rows[p["message_id"]] for p in data["posts"]]}
 
     async def on(task):
         return True
