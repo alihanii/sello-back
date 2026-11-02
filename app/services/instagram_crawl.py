@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import httpx
 
 from app.platforms.base import PlatformError
+from app.services import proxy_pool
 
 LIMIT = 25
 APIFY_ACTOR = "apify~instagram-scraper"
@@ -50,8 +51,8 @@ async def check_key(cfg: dict) -> tuple[bool, str]:
     if not cfg.get("token"):
         return False, "کلیدی ذخیره نشده است."
     try:
-        async with httpx.AsyncClient(timeout=30, proxy=cfg.get("proxy") or None) as client:
-            resp = await client.get("https://api.apify.com/v2/users/me", params={"token": cfg["token"]})
+        resp = await proxy_pool.request("instagram", "GET", "https://api.apify.com/v2/users/me", fallback_proxy=cfg.get("proxy") or "",
+                                        timeout=30, params={"token": cfg["token"]})
     except httpx.HTTPError:
         return False, "ارتباط با Apify برقرار نشد؛ اینترنت یا پروکسی را بررسی کن."
     if resp.status_code in (401, 403):
@@ -72,8 +73,8 @@ async def _apify(cfg: dict, username: str) -> list[IgPost]:
     body = {"directUrls": [f"https://www.instagram.com/{username}/"], "resultsType": "posts",
             "resultsLimit": LIMIT, "addParentData": False}
     try:
-        async with httpx.AsyncClient(timeout=300, proxy=cfg.get("proxy") or None) as client:
-            resp = await client.post(url, params={"token": cfg["token"]}, json=body)
+        resp = await proxy_pool.request("instagram", "POST", url, fallback_proxy=cfg.get("proxy") or "", timeout=300,
+                                        params={"token": cfg["token"]}, json=body)
     except httpx.HTTPError as exc:
         raise PlatformError("ارتباط با سرویس کرال اینستاگرام (Apify) برقرار نشد؛ اینترنت یا پروکسی را بررسی کن.",
                             "ig_crawler_network", detail=str(exc)[:300]) from exc
@@ -114,9 +115,8 @@ def parse_apify(r: dict) -> IgPost | None:
 
 async def download(url: str, proxy: str = "") -> tuple[bytes, str]:
     """Instagram CDN links expire within days, so photos are copied to our media folder."""
-    async with httpx.AsyncClient(timeout=60, follow_redirects=True, proxy=proxy or None) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
+    resp = await proxy_pool.request("instagram", "GET", url, fallback_proxy=proxy, timeout=60, follow_redirects=True)
+    resp.raise_for_status()
     if len(resp.content) > 10 * 1024 * 1024:
         raise ValueError("image too large")
     return resp.content, resp.headers.get("content-type", "image/jpeg").split(";")[0]

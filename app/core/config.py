@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     # Customer messages sent within this many seconds are answered together, in one model call.
     chat_debounce_seconds: float = 3.0
 
+    # Smart proxies (admin panel › proxies): v2ray links run through a local Xray core.
+    xray_path: str = "xray"  # binary name on PATH or a full path (xray.exe on Windows)
+    xray_dir: str = "./xray"  # generated config and log
+    proxy_check_seconds: float = 180
+
     worker_enabled: bool = True
     worker_concurrency: int = 4
     worker_poll_seconds: float = 1.0
