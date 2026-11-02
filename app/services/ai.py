@@ -125,9 +125,11 @@ def provider_proxy(provider: AiProvider) -> str:
 async def _call(
     provider: AiProvider, model: str, system: str, prompt: str, images: list[tuple[bytes, str]], temperature: float,
     json_mode: bool = True, max_tokens: int | None = None, meta: dict[str, Any] | None = None,
+    low_res: bool = False,
 ) -> tuple[str, int, int]:
     """Returns (text, input_tokens, output_tokens). `meta`, when given, receives `cached_tokens` (the part of the
-    input the provider served from its prompt cache). `max_tokens` caps the answer (the chat assistant)."""
+    input the provider served from its prompt cache). `max_tokens` caps the answer (the chat assistant).
+    `low_res` asks for the provider's cheapest image reading (crawl: colour and shape are enough)."""
     key = _api_key(provider)
     kind, base = _wire(provider, model)
     meta = meta if meta is not None else {}
@@ -137,6 +139,8 @@ async def _call(
             parts += [{"inlineData": {"mimeType": m, "data": base64.b64encode(d).decode()}} for d, m in images]
             gen: dict[str, Any] = {"temperature": temperature,
                                    **({"responseMimeType": "application/json"} if json_mode else {})}
+            if low_res and images:
+                gen["mediaResolution"] = "MEDIA_RESOLUTION_LOW"
             if max_tokens:
                 gen["maxOutputTokens"] = max_tokens
                 if "flash" in model.lower():
@@ -149,9 +153,10 @@ async def _call(
                     "systemInstruction": {"parts": [{"text": system}]}, "generationConfig": gen}
             url = f"{base}/v1beta/models/{model}:generateContent"
             resp = await client.post(url, headers={"x-goog-api-key": key}, json=body)
-            if resp.status_code == 400 and "thinkingConfig" in gen:
-                # Often a bare "Request contains an invalid argument." with no word about thinking.
-                gen.pop("thinkingConfig")
+            if resp.status_code == 400 and ("thinkingConfig" in gen or "mediaResolution" in gen):
+                # Often a bare "Request contains an invalid argument." with no word about which field.
+                gen.pop("thinkingConfig", None)
+                gen.pop("mediaResolution", None)
                 resp = await client.post(url, headers={"x-goog-api-key": key}, json=body)
             _raise_for(resp)
             data = resp.json()
@@ -179,7 +184,8 @@ async def _call(
             text = prompt + ("\n\nRespond with JSON only." if json_mode and kind == "openrouter" else "")
             content: list[dict[str, Any]] = [{"type": "text", "text": text}]
             content += [
-                {"type": "image_url", "image_url": {"url": f"data:{m};base64,{base64.b64encode(d).decode()}"}}
+                {"type": "image_url", "image_url": {"url": f"data:{m};base64,{base64.b64encode(d).decode()}",
+                                                    **({"detail": "low"} if low_res else {})}}
                 for d, m in images
             ]
             req = {
@@ -390,8 +396,11 @@ async def ai_available(task: str = "caption_extract") -> bool:
 
 
 async def generate_json(
-    *, task: str, system: str, prompt: str, images: list[tuple[bytes, str]] | None = None, store_id: int | None = None
+    *, task: str, system: str, prompt: str, images: list[tuple[bytes, str]] | None = None, store_id: int | None = None,
+    max_tokens: int | None = None, low_res_images: bool = False,
 ) -> dict[str, Any]:
+    """`max_tokens` caps the answer, and on Gemini Flash also turns thinking off (billed as output)."""
+    extra = {k: v for k, v in (("max_tokens", max_tokens), ("low_res", low_res_images)) if v}
     candidates = await _route(task)
     if not candidates:
         raise AIError(await route_problem(task), code="ai_not_configured")
@@ -399,7 +408,7 @@ async def generate_json(
     for provider, model, temp, is_fallback in candidates:
         started = time.monotonic()
         try:
-            text, tin, tout = await _retry_busy(lambda: _call(provider, model, system, prompt, images or [], temp))
+            text, tin, tout = await _retry_busy(lambda: _call(provider, model, system, prompt, images or [], temp, **extra))
             result = json.loads(_strip_fences(text))
             await _log(provider, task, model, store_id, ok=True, is_fallback=is_fallback,
                        latency_ms=int((time.monotonic() - started) * 1000), input_tokens=tin, output_tokens=tout)
@@ -678,17 +687,16 @@ Respond ONLY with JSON: {"posts":[{"message_id":"<copy>","title":"<short title>"
 Rules: one object per input post, preserve message_id; numbers are integers; parse Persian digits;
 do NOT invent data that is not in the caption."""
 
-# "AI only" crawl mode: the same fields plus the product category and a fuller set of details, like AI product creation.
-CAPTION_EXTRACT_FULL_SYSTEM = """You extract structured product fields from social post captions (usually Persian).
-Respond ONLY with JSON: {"posts":[{"message_id":"<copy>","title":"<short title>","description":"<text without price/stock lines>","price":<int Toman, 0 if missing>,"quantity":<int, 0 if missing>,"category_hint":"<Persian product type, e.g. ماگ سرامیکی, هودی, کیف دوشی>","category":"<shop category>","attributes":{"<Persian name>":"<value>"}}]}
-Rules: one object per input post, preserve message_id; numbers are integers; parse Persian digits:
-«۴ میلیون تومان» = 4000000, «۲۵۰ هزار» = 250000, «۲۰ تا» = 20.
-category_hint: what the product IS, in a few Persian words, from the caption; empty if the caption doesn't say.
-category: the product's TYPE in 1-2 Persian words, e.g. هودی, تیشرت, کفش, مانتو, شال, کیف, ماگ, بشقاب.
-Not a broad section (NOT پوشاک مردانه, ظروف آشپزخانه) and no colour/material/size/model (هودی, not هودی مشکی نخی).
-If shop_categories in the input has the same type, copy it EXACTLY (same spelling); otherwise write the new type.
-attributes: every concrete detail the caption states (جنس, رنگ, سایز, ابعاد, وزن, مدل, کشور سازنده, گارانتی …), one key per detail,
-several values joined with «، ». Only what the caption says: do NOT invent data that is not in the caption."""
+# "AI only" crawl mode: one post with its first photo. Kept short and without a description (we keep the seller's own
+# caption text), since this runs once per crawled post.
+CAPTION_EXTRACT_FULL_SYSTEM = """Extract product fields from a shop post: its caption (usually Persian) and maybe one photo.
+JSON only: {"posts":[{"message_id":"<copy>","title":"...","price":0,"quantity":0,"category_hint":"...","category":"...","attributes":{"<Persian name>":"<value>"}}]}
+title: product type + key feature (material, colour, model), from caption and photo; no price.
+price/quantity: integers, Toman; «۴ میلیون تومان»=4000000, «۲۵۰ هزار»=250000, «۲۰ تا»=20; 0 if missing.
+category_hint: what it is in a few Persian words. category: its type in 1-2 Persian words (هودی, کفش, ماگ), not a
+section and no colour/size; if shop_categories has it, copy that spelling exactly.
+attributes: every detail the caption states or the photo clearly shows (جنس, رنگ, سایز, ابعاد, وزن, مدل, طرح, گارانتی …),
+several values joined with «، ». Omit what is unclear; never invent."""
 
 PRODUCT_FROM_PHOTO_SYSTEM = """You are the product copywriter of an Iranian online shop. Write in Persian.
 You get: optional product photos and an optional short note from the seller.
