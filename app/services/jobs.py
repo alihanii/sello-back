@@ -14,7 +14,7 @@ from app.models import (
 )
 from app.platforms.base import CrawledItem, EDIT_PRODUCT, PlatformError
 from app.platforms.registry import get_adapter
-from app.services import ai, categories
+from app.services import ai, categories, product_code
 from app.services.media import read_local, save_bytes
 from app.services import instagram_crawl as ig
 from app.services.integrations import instagram_crawler
@@ -206,6 +206,7 @@ async def ingest_items(ctx: OpContext, *, store: Store, items: list[CrawledItem]
                            source_ref={**source_key, "external_id": it.external_id, "url": it.url})
             db.add(prod)
             await db.flush()
+            await product_code.apply_default_code(db, prod, it.caption or "")
             for pos, url in enumerate(it.image_urls[:10]):
                 try:
                     if url.startswith("botfile:") and channel:
@@ -337,6 +338,7 @@ async def generate_product(ctx: OpContext, ref: AiProductRequest) -> Product:
                       source_ref={"ai_request_id": ref.id, "field_sources": result.get("field_sources", {})})
     db.add(product)
     await db.flush()
+    await product_code.apply_default_code(db, product, ref.note or "")
     for pos, url in enumerate(ref.images[:10]):
         db.add(ProductImage(product_id=product.id, url=url, position=pos))
     ref.result_product_ids = [product.id]

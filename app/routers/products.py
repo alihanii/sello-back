@@ -17,7 +17,7 @@ from app.services.ops import queue_publish
 from app.services.media import ALLOWED, save_bytes
 from app.services.ops import record_event
 from app.services.text import normalize_fa
-from app.services import categories, product_import
+from app.services import categories, product_code, product_import
 from app.services.plans import check_limit, limits_for
 
 router = APIRouter(tags=["products"])
@@ -105,6 +105,7 @@ async def create_product(store_id: int, body: ProductIn, user: CurrentUser, db: 
     p = Product(store_id=store_id, source="manual", created_by="user", **data)
     db.add(p)
     await db.flush()
+    await product_code.apply_default_code(db, p)
     for i, url in enumerate(body.images):
         db.add(ProductImage(product_id=p.id, url=url, position=i))
     await record_event(db, store_id, "product_created")
@@ -429,8 +430,8 @@ async def import_products(store_id: int, body: ImportIn, user: CurrentUser, db: 
                 p = Product(store_id=store_id, source="manual", created_by="import", status="ready", **fields)
                 db.add(p)
                 await db.flush()
-                if it.sku:
-                    known[it.sku] = p.id
+                await product_code.apply_default_code(db, p)
+                known[p.sku] = p.id
                 created += 1
             if it.images:
                 start = await db.scalar(select(func.count()).select_from(ProductImage).where(ProductImage.product_id == p.id))
