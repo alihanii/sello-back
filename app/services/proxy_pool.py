@@ -197,8 +197,10 @@ class Pool:
         return out
 
     def active(self, purpose: str) -> int | None:
+        """The node requests for `purpose` use right now, if it passed its last check."""
         node_id, _ = self.routes(purpose)[0]
-        return node_id
+        n = self.nodes.get(node_id) if node_id is not None else None
+        return node_id if n and (n.health.get(purpose) or {}).get("ok") else None
 
     def report(self, node_id: int, purpose: str, ok: bool, latency_ms: int | None = None, error: str = "") -> None:
         n = self.nodes.get(node_id)
