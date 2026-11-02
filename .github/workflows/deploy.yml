@@ -1,4 +1,5 @@
-# Every push to main: run the tests, build the backend image here, copy it to the server over SSH and restart.
+# test + build: on every pull request and push to main (a failure stops here).
+# deploy: on push to main only, copy the built image to the server over SSH and restart.
 # The server doesn't build anything or pull from a registry, so it works on servers with limited internet.
 #
 # Repository secrets: SSH_HOST, SSH_USER, SSH_PRIVATE_KEY, optional SSH_PORT (default 22).
@@ -8,11 +9,12 @@ name: deploy
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 concurrency:
-  group: deploy-server
-  cancel-in-progress: false
+  group: ${{ github.event_name == 'pull_request' && format('build-{0}', github.ref) || 'deploy-server' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/sello' }}
@@ -30,11 +32,37 @@ jobs:
       - run: pip install -r requirements-dev.txt
       - run: python -m pytest -q
 
-  deploy:
+  build:
     needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t sello-back:latest .
+
+      - name: Save image
+        if: github.event_name != 'pull_request'
+        run: docker save sello-back:latest | gzip -1 > sello-back.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request'
+        with:
+          name: sello-back-image
+          path: sello-back.tar.gz
+          retention-days: 3
+          compression-level: 0
+
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sello-back-image
 
       - name: SSH setup
         env:
@@ -44,14 +72,11 @@ jobs:
           SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
         run: |
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
           ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
           printf 'Host server\n  HostName %s\n  User %s\n  Port %s\n  IdentityFile ~/.ssh/id_deploy\n  ServerAliveInterval 30\n' \
             "$SSH_HOST" "$SSH_USER" "$SSH_PORT" > ~/.ssh/config
           ssh server "mkdir -p '$DEPLOY_PATH' && docker version --format 'docker {{.Server.Version}}'"
-
-      - name: Build image
-        run: docker build -t sello-back:latest . && docker save sello-back:latest | gzip -1 > sello-back.tar.gz
 
       - name: Ship base images the server doesn't have yet
         run: |
