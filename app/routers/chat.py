@@ -505,7 +505,7 @@ def _order_out(o: AiOrder) -> dict[str, Any]:
             "customer_username": o.customer_username, "items": o.items, "total_toman": o.total_toman, "note": o.note,
             "status": o.status, "payment_ref": o.payment_ref, "receipt_url": o.receipt_url,
             "receipt_text": o.receipt_text, "seller_note": o.seller_note, "is_test": o.is_test,
-            "extras": o.extras or {}, "due_toman": 0 if o.status in ("confirmed", "rejected", "cancelled") else due_toman(o),
+            "extras": o.extras or {}, "tracking_code": o.tracking_code or "", "due_toman": 0 if o.status in ("confirmed", "rejected", "cancelled") else due_toman(o),
             "created_at": o.created_at, "updated_at": o.updated_at}
 
 

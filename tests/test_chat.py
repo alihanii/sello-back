@@ -1,5 +1,6 @@
 """Sales chat assistant: connections, the cheap no-model paths, one model call per turn, orders, takeover, usage."""
 
+import re
 import json
 
 import pytest
@@ -985,3 +986,48 @@ async def test_contact_details_one_by_one_without_the_model(client, monkeypatch)
     n = len(llm.calls)
     await say("هزینه ارسال به قم چقدره؟")
     assert len(llm.calls) == n + 1
+
+
+async def test_order_tracking_code_and_status_without_the_model(client, monkeypatch):
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550036")
+
+    async def say(text):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
+
+    # no order yet: a pre-purchase delivery question still goes to the assistant
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        "orders_enabled": True, "payment": {"card_number": "6037991234567890"}})
+    await say("سلام")
+    n = len(llm.calls)
+    await say("اگه الان خرید کنم کی میرسه؟")
+    assert len(llm.calls) == n + 1
+    m = await say("ی سفارش قبلا زدم وضعیتش چیه؟")
+    assert m["source"] == "status" and "کد رهگیری" in m["text"] and len(llm.calls) == n + 1
+    assert "Never say an order is placed" in llm.calls[-1]["system"]
+
+    await _order_ready(client, h, sid, llm, p1)
+    m = await say("بله")
+    code = re.search(r"S\d{7}", m["text"]).group()
+    n = len(llm.calls)
+    m = await say("وضعیت سفارشم رو بگو کجاس")
+    assert m["source"] == "status" and "منتظر پرداخت" in m["text"] and code in m["text"] and "مانتو لینن کرم" in m["text"]
+    assert "آبان" in m["text"] or "۱۴۰" in m["text"]
+    assert len(llm.calls) == n
+    # sending the tracking code while the receipt is awaited is a lookup, not a payment reference
+    m = await say(code)
+    assert m["source"] == "status"
+    assert (await say("کد پیگیری پرداخت ۵۵۱۲۰۹۸۸"))["source"] == "receipt"
+    assert "فیش رسیده" in (await say("سفارشم چی شد؟"))["text"]
+
+    # a new chat finds it only by the tracking code
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"reset": True})
+    await say("سلام")
+    m = await say("وضعیت سفارشم")
+    assert "S1234567" in m["text"]
+    m = await say(f"کدش {code}")
+    assert "فیش رسیده" in m["text"]
+    m = await say("S0000000")
+    assert "پیدا نکردم" in m["text"]
+    orders = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
+    rows = orders.get("items", orders) if isinstance(orders, dict) else orders
+    assert rows[0]["tracking_code"] == code

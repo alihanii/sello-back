@@ -599,3 +599,4 @@ class AiOrder(TimestampMixin, Base):
     seller_note: Mapped[str] = mapped_column(Text, default="")
     is_test: Mapped[bool] = mapped_column(Boolean, default=False)
     extras: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict, nullable=True)  # {label: text or image url}
+    tracking_code: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)  # "S4829173", told to the customer
