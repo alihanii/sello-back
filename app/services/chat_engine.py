@@ -1315,6 +1315,16 @@ def capture_contact(agent: ChatAgent, state: dict[str, Any], text: str) -> None:
     rest = text.strip()
     if phone and "phone" in missing:
         order["phone"] = phone.group()
+        # "سارا محمدی ۰۹۱۲… تهران، خیابان …" on one line: the short side of the number is the name, the other the address.
+        span = re.search(r"(?:(?:\+|00)?(?:98|۹۸)[\s-]?|[0۰])?[9۹](?:[\s-]*[\d۰-۹]){9}(?![\d۰-۹])", rest)
+        if span and "name" in missing and "address" in missing:
+            sides = rest[:span.start()].strip(" ،,.-"), rest[span.end():].strip(" ،,.-")
+            # Both could be a name ("تهران ونک"): the shorter side is the name, the longer the address.
+            for name, address in sorted((sides, sides[::-1]), key=lambda pair: len(pair[0].split())):
+                if name and address and len(name.split()) <= 4 and not re.search(r"[\d۰-۹،,]", name):
+                    order["name"], order["address"] = name[:100], address[:500]
+                    state["order"] = order
+                    return
         rest = re.sub(r"[+\d۰-۹\s-]{10,}", " ", rest).strip()
     short_name = len(words(rest)) <= 3 and not re.search(r"[\d۰-۹،,]", rest)
     if rest and "name" in missing and ("address" not in missing or short_name):

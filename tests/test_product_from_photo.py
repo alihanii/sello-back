@@ -62,8 +62,12 @@ async def test_raw_photo_becomes_product_with_clean_main_image(client, monkeypat
 
     calls = []
 
-    async def fake_call(provider, model, system, prompt, images, temperature, json_mode=True):
+    async def fake_call(provider, model, system, prompt, images, temperature, json_mode=True, **kw):
         calls.append((model, json_mode, len(images)))
+        # Thinking is off (a cap) for both steps, and the product photos are read at medium resolution.
+        assert kw.get("max_tokens")
+        if system == ai.PRODUCT_FROM_PHOTO_SYSTEM:
+            assert kw.get("image_res") == "medium"
         if json_mode:
             return ('{"title":"ماگ سرامیکی سفید","description":"ماگ سرامیکی ساده","category_hint":"ماگ",'
                     '"attributes":{"جنس":"سرامیک"},"image_category":"general"}'), 10, 5

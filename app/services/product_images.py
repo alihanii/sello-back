@@ -247,7 +247,7 @@ async def make_photo(ctx, *, store_id: int, title: str, note: str, category: str
                         request={"category": category, "has_photo": bool(loaded), "design": design}) as s:
         raw = await ai.generate_text(
             task="image_prompt" if await ai.has_route("image_prompt") else "vision",
-            system=PROMPT_BUILDER_SYSTEM, images=images, store_id=store_id,
+            system=PROMPT_BUILDER_SYSTEM, images=images, store_id=store_id, max_tokens=1500,
             prompt=_builder_input(title=title, note=note, category=category, has_photo=bool(loaded), design=design,
                                   no_people=no_people))
         prompt = _sanitize(raw)
@@ -294,7 +294,7 @@ async def _hide_people(ctx, store_id: int, loaded: tuple[bytes, str]) -> tuple[b
     try:
         async with ctx.step("image_people", "حذف آدم از عکس", request={"images": 1}) as s:
             res = await ai.generate_json(task="vision", system=PEOPLE_SYSTEM, prompt="Find the product and the people.",
-                                         images=[loaded], store_id=store_id)
+                                         images=[loaded], store_id=store_id, max_tokens=600)
             s.response = res
     except ai.AIError:
         return None
@@ -345,7 +345,7 @@ async def photo_kind(store_id: int, url: str) -> str:
         return "product"
     try:
         res = await ai.generate_json(task="vision", system=PHOTO_KIND_SYSTEM, prompt="Classify this image.",
-                                     images=[loaded], store_id=store_id)
+                                     images=[loaded], store_id=store_id, max_tokens=200, low_res_images=True)
     except ai.AIError:
         return "product"
     return "design" if res.get("kind") == "design" else "product"

@@ -133,7 +133,7 @@ async def test_admin_plans_and_ai_keys(client, monkeypatch):
 
     from app.services import ai
 
-    async def fake(provider, model, system, prompt, images, temperature):
+    async def fake(provider, model, system, prompt, images, temperature, **kw):
         return ('{"title":"کفش اسپرت مردانه مدل رانر","description":"راحت و سبک","price":0,'
                 '"attributes":{"جنس":"مش"},"tags":["کفش"],"field_sources":{"title":"note"}}', 1000, 500)
 

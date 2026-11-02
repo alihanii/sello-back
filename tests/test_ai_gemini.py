@@ -132,6 +132,20 @@ async def test_low_res_crawl_call_reads_photo_cheaply_and_falls_back(monkeypatch
     assert "mediaResolution" not in bodies[1]["generationConfig"]
 
 
+async def test_medium_res_halves_gemini_image_tokens(monkeypatch):
+    import json
+    bodies = []
+
+    def handler(req):
+        bodies.append(json.loads(req.content))
+        return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": "{}"}]}}]})
+
+    _patch(monkeypatch, handler, {})
+    await ai._call(_provider(), "gemini-3.6-flash", "s", "p", [(b"x", "image/jpeg")], 0, max_tokens=2048, image_res="medium")
+    gen = bodies[0]["generationConfig"]
+    assert gen["mediaResolution"] == "MEDIA_RESOLUTION_MEDIUM" and gen["thinkingConfig"] == {"thinkingLevel": "minimal"}
+
+
 async def test_low_res_openai_uses_low_detail(monkeypatch):
     import json
     seen = {}
