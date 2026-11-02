@@ -1,0 +1,49 @@
+# Production stack. Lives on the server in DEPLOY_PATH (default /opt/sello) next to .env;
+# the deploy workflows copy it there. Images are built in GitHub Actions and loaded with `docker load`,
+# so the server never needs to build or reach a registry for sello-back / sello-front.
+# Both apps listen on 127.0.0.1 only; the server's nginx (deploy/nginx-sello.conf) puts them on the web.
+name: sello
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sello
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: sello
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sello -d sello"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    image: sello-back:latest
+    pull_policy: never
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SELLO_ENV: prod
+      SELLO_DATABASE_URL: postgresql+asyncpg://sello:${POSTGRES_PASSWORD}@db:5432/sello
+      SELLO_MEDIA_DIR: /app/media
+      SELLO_BANK_DB_PATH: /app/data/bank.db
+    volumes:
+      - media:/app/media
+      - data:/app/data
+    ports: ["127.0.0.1:${BACKEND_PORT:-8100}:8000"]
+    depends_on:
+      db: {condition: service_healthy}
+
+  frontend:
+    image: sello-front:latest
+    pull_policy: never
+    restart: unless-stopped
+    ports: ["127.0.0.1:${FRONTEND_PORT:-3100}:3000"]
+    depends_on: [backend]
+
+volumes:
+  pgdata:
+  media:
+  data:

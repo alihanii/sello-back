@@ -2,22 +2,20 @@
 
 import io
 import uuid
-from pathlib import Path
 
 import httpx
 
-from app.core.config import settings
 from app.platforms.base import EDIT_PRODUCT, PlatformError
+from app.services.media import public_url, put, read_local
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
 
 async def load_bytes(url: str) -> bytes:
     if url.startswith("/media/"):
-        path = Path(settings.media_dir) / url.removeprefix("/media/")
-        if not path.is_file():
+        if not (local := read_local(url)):
             raise PlatformError("فایل عکس محصول پیدا نشد.", "image_missing", EDIT_PRODUCT)
-        data = path.read_bytes()
+        data = local[0]
     else:
         try:
             async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
@@ -58,8 +56,4 @@ async def jpeg_bytes(url: str) -> tuple[bytes, str]:
 async def public_jpeg(url: str) -> str:
     """Re-encode to JPEG under /media/out/ and return its public URL (Instagram fetches images itself)."""
     data, _ = await jpeg_bytes(url)
-    out = Path(settings.media_dir) / "out"
-    out.mkdir(parents=True, exist_ok=True)
-    name = f"{uuid.uuid4().hex}.jpg"
-    (out / name).write_bytes(data)
-    return f"{settings.public_base_url.rstrip('/')}/media/out/{name}"
+    return public_url(put(f"out/{uuid.uuid4().hex}.jpg", data, "image/jpeg"))

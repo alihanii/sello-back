@@ -2,15 +2,14 @@
 The seller creates a bot, adds it as admin of the channel, and gives us the token + channel."""
 
 import json
-from pathlib import Path
 from typing import Any
 
 import httpx
 
-from app.core.config import settings
 from app.core.security import decrypt_credentials
 from app.models import Channel, Product, Store
 from app.platforms.base import EDIT_PRODUCT, RECONNECT, CrawledItem, PlatformError, PublishResult
+from app.services.media import read_local
 from app.services.text import MAX_CAPTION_CHARS, caption_for
 
 MAX_ALBUM = 10
@@ -116,10 +115,9 @@ class BotApiAdapter:
 
     async def _image_bytes(self, url: str) -> tuple[bytes, str]:
         if url.startswith("/media/"):
-            path = Path(settings.media_dir) / url.removeprefix("/media/")
-            if not path.is_file():
+            if not (local := read_local(url)):
                 raise PlatformError("فایل عکس محصول پیدا نشد.", "image_missing", EDIT_PRODUCT)
-            data = path.read_bytes()
+            data = local[0]
         else:
             try:
                 async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
