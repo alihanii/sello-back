@@ -31,7 +31,8 @@ async def test_ai_only_mode_reads_each_post_with_its_photos(monkeypatch):
     """Telegram posts often put the details in the photo: AI only must see the photos and keep the attributes."""
     calls = []
 
-    async def fake(*, task, system, prompt, images=None, store_id=None):
+    async def fake(*, task, system, prompt, images=None, store_id=None, **kw):
+        assert kw == {"low_res_images": True, "max_tokens": jobs.AI_ONLY_MAX_TOKENS}
         import json
         posts = json.loads(prompt)["posts"]
         calls.append((posts, images))
@@ -60,3 +61,16 @@ async def test_ai_only_mode_reads_each_post_with_its_photos(monkeypatch):
 def test_clean_attributes():
     assert jobs.clean_attributes(None) == {} and jobs.clean_attributes("x") == {}
     assert jobs.clean_attributes({"رنگ": None, " جنس ": "نخ", "وزن": 200}) == {"جنس": "نخ", "وزن": "200"}
+
+
+async def test_ai_only_keeps_the_caption_as_description(monkeypatch):
+    """AI only doesn't pay for a rewritten description: the caption without its price line is kept."""
+    async def fake(**kw):
+        return {"posts": [{"message_id": "1", "title": "کیف چرم زنانه", "attributes": {"رنگ": "قهوه‌ای"}}]}
+
+    monkeypatch.setattr(ai, "ai_available", _ai_on)
+    monkeypatch.setattr(ai, "generate_json", fake)
+    out, _ = await jobs._extract([CrawledItem(external_id="1", caption="کیف زنانه\nچرم طبیعی\nقیمت: ۹۰۰ هزار تومان")],
+                                 "llm", 1)
+    assert out["1"]["title"] == "کیف چرم زنانه" and out["1"]["description"] == "کیف زنانه\nچرم طبیعی"
+    assert out["1"]["price"] == 900000

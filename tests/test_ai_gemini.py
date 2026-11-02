@@ -112,3 +112,34 @@ async def test_busy_503_is_retried_before_failing(monkeypatch):
     monkeypatch.setattr(ai, "BUSY_RETRY_DELAYS", (0.0, 0.0))
     text, _, _ = await ai._retry_busy(lambda: ai._call(_provider(), "gemini-3.6-flash", "s", "p", [], 0))
     assert text == '{"ok": true}' and len(hits) == 3
+
+
+async def test_low_res_crawl_call_reads_photo_cheaply_and_falls_back(monkeypatch):
+    """Crawl asks for low image resolution and no thinking; a gateway that rejects them gets the plain request."""
+    import json
+    bodies = []
+
+    def handler(req):
+        bodies.append(json.loads(req.content))
+        if len(bodies) == 1:
+            return httpx.Response(400, json={"error": {"message": "Request contains an invalid argument."}})
+        return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": "{}"}]}}]})
+
+    _patch(monkeypatch, handler, {})
+    await ai._call(_provider(), "gemini-2.5-flash", "s", "p", [(b"x", "image/jpeg")], 0, max_tokens=800, low_res=True)
+    gen = bodies[0]["generationConfig"]
+    assert gen["mediaResolution"] == "MEDIA_RESOLUTION_LOW" and gen["thinkingConfig"] == {"thinkingBudget": 0}
+    assert "mediaResolution" not in bodies[1]["generationConfig"]
+
+
+async def test_low_res_openai_uses_low_detail(monkeypatch):
+    import json
+    seen = {}
+
+    def handler(req):
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+
+    _patch(monkeypatch, handler, {})
+    await ai._call(_provider(kind="openai"), "gpt-4o-mini", "s", "p", [(b"x", "image/jpeg")], 0, low_res=True)
+    assert seen["body"]["messages"][1]["content"][1]["image_url"]["detail"] == "low"

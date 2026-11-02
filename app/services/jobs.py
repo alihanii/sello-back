@@ -18,6 +18,7 @@ from app.models import (
 from app.platforms.base import CrawledItem, EDIT_PRODUCT, PlatformError
 from app.platforms.registry import get_adapter
 from app.services import ai, categories, product_code
+from app.services.images import to_jpeg
 from app.services.media import read_local, save_bytes
 from app.services import instagram_crawl as ig
 from app.services.integrations import instagram_crawler
@@ -105,7 +106,11 @@ async def run_publish(ctx: OpContext) -> None:
 # ---------- crawl ----------
 
 ImageLoader = Callable[[CrawledItem], Awaitable[list[tuple[bytes, str]]]]
-AI_ONLY_PHOTOS = 3  # photos per post sent to the AI in "AI only" mode
+# "AI only" mode runs once per post, so it is kept cheap: the first photo only, small and read at low resolution,
+# a short answer with no description and no thinking.
+AI_ONLY_PHOTOS = 1
+AI_ONLY_PHOTO_SIDE = 512
+AI_ONLY_MAX_TOKENS = 800
 AI_ONLY_PARALLEL = 4
 
 
@@ -129,9 +134,14 @@ def _apply_ai_row(out: dict[str, dict], row: dict, mode: str, shop_categories: l
     mid = str(row.get("message_id"))
     if mid not in out or not row.get("title"):
         return
+    title = normalize_fa(row["title"])[:300]
+    description = row.get("description")
+    if description is None:  # AI only doesn't rewrite the text: keep the caption without its price/stock lines
+        first = out[mid].get("title", "")
+        description = "\n".join(x for x in (first if first != title else "", out[mid].get("description", "")) if x)
     out[mid].update({
-        "title": normalize_fa(row["title"])[:300],
-        "description": normalize_fa(row.get("description", "")),
+        "title": title,
+        "description": normalize_fa(description),
         "price": parse_number(str(row.get("price", 0))) or out[mid]["price"],
         "quantity": parse_number(str(row.get("quantity", 0))) or out[mid]["quantity"],
         "attributes": clean_attributes(row.get("attributes")) or out[mid].get("attributes") or {},
@@ -184,9 +194,8 @@ async def _extract(items: list[CrawledItem], mode: str, store_id: int,
                 try:
                     res = await ai.generate_json(
                         task="caption_extract", store_id=store_id, system=ai.CAPTION_EXTRACT_FULL_SYSTEM,
-                        images=images,
-                        prompt=json.dumps({"posts": [{"message_id": it.external_id, "caption": it.caption,
-                                                      "photos": len(images)}],
+                        images=images, low_res_images=True, max_tokens=AI_ONLY_MAX_TOKENS,
+                        prompt=json.dumps({"posts": [{"message_id": it.external_id, "caption": it.caption}],
                                            "shop_categories": shop_categories[:categories.PROMPT_LIMIT]},
                                           ensure_ascii=False))
                 except ai.AIError as exc:
@@ -240,7 +249,10 @@ async def ingest_items(ctx: OpContext, *, store: Store, items: list[CrawledItem]
             except Exception:  # noqa: BLE001, S112 - one missing photo shouldn't drop the others
                 continue
             if got:
-                photos.append((got[0], got[2] or mimetypes.guess_type(got[1])[0] or "image/jpeg"))
+                try:
+                    photos.append((to_jpeg(got[0], max_side=AI_ONLY_PHOTO_SIDE), "image/jpeg"))
+                except PlatformError:
+                    photos.append((got[0], got[2] or mimetypes.guess_type(got[1])[0] or "image/jpeg"))
         return photos
 
     async with ctx.step("extract", f"استخراج دیتای {len(items)} آیتم", request={"mode": mode}) as s:
