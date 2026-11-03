@@ -241,9 +241,11 @@ async def test_no_order_without_a_summary_and_a_yes(client, monkeypatch):
     assert "hasn't seen a summary" in llm.results()[1]
     assert (await client.get(f"/stores/{sid}/ai-orders", headers=h)).json()["items"] == []
     # the model says "ثبت شد" without placing anything: the shop sends the real summary instead
+    # (told once to use the tools, it says it again)
     llm.steps = [[("set_customer_info", {"name": "سارا", "phone": "09120000001", "address": "قم"})],
-                 "سفارشت ثبت شد 🌸"]
+                 "سفارشت ثبت شد 🌸", "سفارشت ثبت شد 🌸"]
     replies, state = await say(client, h, sid, "سارا ۰۹۱۲۰۰۰۰۰۰۱ قم")
+    assert "nothing is in the order yet" in llm.calls[-1]["messages"][-1]["text"]
     assert replies[-1]["source"] == "order" and "خلاصهٔ سفارش" in replies[-1]["text"] and state["awaiting"] == "confirm"
     # confirm_order in the same turn as the summary is refused too: the customer must answer first
     llm.steps = [[("show_order_summary", {}), ("confirm_order", {})]]
@@ -505,6 +507,32 @@ async def test_tool_calls_on_each_wire_format(monkeypatch, kind):
         assert sent["messages"][1]["content"][0]["type"] == "tool_use"
         assert sent["messages"][2]["content"][0] == {"type": "tool_result", "tool_use_id": "t1", "content": "#5 ..."}
         assert sent["system"][0]["cache_control"] == {"type": "ephemeral"}
+
+
+async def test_gemini_retries_a_broken_tool_call_with_more_thinking(monkeypatch):
+    """Gemini 3 at its least thinking sometimes ends with MALFORMED_FUNCTION_CALL and no parts: asked once more."""
+    from app.core.security import encrypt_credentials
+    from app.models import AiProvider
+    import httpx
+    prov = AiProvider(name="x", kind="gemini", api_key_encrypted=encrypt_credentials({"api_key": "k"}), base_url="")
+    bodies, replies = [], [
+        _R({"candidates": [{"finishReason": "MALFORMED_FUNCTION_CALL", "content": {}}], "usageMetadata": {}}),
+        _R({"candidates": [{"content": {"parts": [{"functionCall": {"name": "show_order_summary", "args": {}}}]}}],
+            "usageMetadata": {}})]
+
+    async def fake_post(self, url, headers=None, json=None):
+        bodies.append(__import__("copy").deepcopy(json))
+        return replies.pop(0)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    tools = [{"name": "show_order_summary", "description": "d", "parameters": {"type": "object", "properties": {}}}]
+    meta: dict = {}
+    msg, *_ = await ai._call_tools(prov, "gemini-3.6-flash", "sys", [{"role": "user", "text": "تایید"}], tools, 0.3, 700, meta)
+    assert msg["calls"][0]["name"] == "show_order_summary" and meta["empty_reason"] == "MALFORMED_FUNCTION_CALL"
+    # Gemini 3 runs at 1.0 (lower makes it loop) with low thinking; the retry lets it think as it likes
+    assert bodies[0]["generationConfig"]["temperature"] == 1.0
+    assert bodies[0]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "low"}
+    assert "thinkingConfig" not in bodies[1]["generationConfig"]
 
 
 def test_unknown_numbers():
@@ -795,3 +823,37 @@ async def test_shop_policies_reach_the_assistant(client, monkeypatch):
     assert "SHOP POLICIES" in system and "ارسال / هزینهٔ ارسال: ۵۰ هزار تومان با پست" in system
     assert "مرجوعی و تعویض / مرجوعی: فقط تعویض دارد" in system and "شستشو و نگهداری: با آب سرد بشویید" in system
     assert len(llm.calls) == 1 and replies[-1]["text"].startswith("هزینه‌ی ارسال ۵۰٬۰۰۰")
+
+
+async def test_the_model_skipping_the_tools_is_sent_back_to_them(client, monkeypatch):
+    """ali's chat: the model chatted about the order and asked for «تایید» without ever calling a tool."""
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550032")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json=ORDERS_ON)
+    await say(client, h, sid, "سلام")
+    llm.steps = ["سفارش شما آماده ثبت است. لطفا برای تایید نهایی، &#34;تایید&#34; را بفرستید.",
+                 [("cart_set_item", {"product_id": p1["id"], "qty": 1, "variant": "۴۰"}),
+                  ("set_customer_info", {"name": "هانی", "phone": "09131343141", "address": "قم خیابان سلام پلاک ۲۲"}),
+                  ("show_order_summary", {})]]
+    replies, state = await say(client, h, sid, "مانتو ۴۰ هانی ۰۹۱۳۱۳۴۳۱۴۱ قم خیابان سلام پلاک ۲۲")
+    note = llm.calls[1]["messages"][-1]["text"]
+    assert "nothing is in the order yet" in note and "CART: empty" in note
+    assert replies[-1]["source"] == "order" and state["awaiting"] == "confirm"
+    replies, state = await say(client, h, sid, "تایید")
+    assert state["awaiting"] == "receipt" and state.get("order_id")
+
+
+async def test_error_notes_stay_out_of_the_models_history(client, monkeypatch):
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550033")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True})
+    await say(client, h, sid, "سلام")
+
+    async def empty(**kw):
+        raise ai.AIError("مدل پاسخ خالی داد.", code="ai_empty")
+    monkeypatch.setattr(ai, "chat_step", empty)
+    replies, _ = await say(client, h, sid, "هودی داری؟")
+    assert "خطای هوش مصنوعی" in replies[-1]["text"]
+    monkeypatch.setattr(ai, "chat_step", llm)
+    llm.steps = ["آره داریم 🌸 &quot;مشکی&quot;"]
+    replies, _ = await say(client, h, sid, "هودی داری؟")
+    assert "خطای هوش مصنوعی" not in llm.first() and "نتونستم" not in llm.first()
+    assert replies[-1]["text"] == 'آره داریم 🌸 "مشکی"'

@@ -610,10 +610,12 @@ async def _call_tools(provider: AiProvider, model: str, system: str, messages: l
     kind, base = _wire(provider, model)
     async with httpx.AsyncClient(timeout=120, proxy=provider_proxy(provider) or None) as client:
         if kind == "gemini":
-            gen: dict[str, Any] = {"temperature": temperature, "maxOutputTokens": max_tokens}
+            gemini3 = bool(re.match(r"gemini-([3-9]|\d\d)", model.lower()))
+            # Gemini 3 is tuned for temperature 1.0: lower values make it loop and repeat itself (Google's guidance),
+            # and with the least thinking it often fails to write a tool call at all. "low" keeps it fast.
+            gen: dict[str, Any] = {"temperature": 1.0 if gemini3 else temperature, "maxOutputTokens": max_tokens}
             if "flash" in model.lower():
-                gen["thinkingConfig"] = ({"thinkingLevel": "minimal"} if re.match(r"gemini-([3-9]|\d\d)", model.lower())
-                                         else {"thinkingBudget": 0})
+                gen["thinkingConfig"] = {"thinkingLevel": "low"} if gemini3 else {"thinkingBudget": 0}
             body = {"contents": _gemini_contents(messages), "systemInstruction": {"parts": [{"text": system}]},
                     "tools": [{"functionDeclarations": tools}],
                     "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}}, "generationConfig": gen}
@@ -625,6 +627,15 @@ async def _call_tools(provider: AiProvider, model: str, system: str, messages: l
             _raise_for(resp)
             data = resp.json()
             parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+            if not any(p.get("functionCall") or (p.get("text") and not p.get("thought")) for p in parts):
+                # Nothing usable (MALFORMED_FUNCTION_CALL, an empty answer): once more with the model's own thinking.
+                finish = (data.get("candidates") or [{}])[0].get("finishReason", "")
+                meta["empty_reason"] = finish
+                gen.pop("thinkingConfig", None)
+                resp = await client.post(url, headers={"x-goog-api-key": key}, json=body)
+                _raise_for(resp)
+                data = resp.json()
+                parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
             calls = [{"id": p["functionCall"].get("id") or f"call_{i}", "name": p["functionCall"].get("name", ""),
                       "args": _args(p["functionCall"].get("args"))} for i, p in enumerate(parts) if p.get("functionCall")]
             text = "\n".join(p["text"] for p in parts if isinstance(p.get("text"), str) and not p.get("thought"))
@@ -691,10 +702,10 @@ async def chat_step(
         meta: dict[str, Any] = {}
         try:
             msg, tin, tout = await _retry_busy(
-                lambda provider=provider, model=model, temp=temp: _call_tools(
+                lambda provider=provider, model=model, temp=temp, meta=meta: _call_tools(
                     provider, model, system, messages, tools, min(temp, CHAT_MAX_TEMPERATURE), max_tokens, meta))
             if not msg["text"] and not msg["calls"]:
-                raise AIError("مدل پاسخ خالی داد.", code="ai_empty")
+                raise AIError("مدل پاسخ خالی داد.", code="ai_empty", detail=str(meta.get("empty_reason") or ""))
             ms = int((time.monotonic() - started) * 1000)
             cached = int(meta.get("cached_tokens") or 0)
             await _log(provider, task, model, store_id, ok=True, is_fallback=is_fallback, latency_ms=ms,
