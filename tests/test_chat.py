@@ -1013,6 +1013,11 @@ async def test_order_tracking_code_and_status_from_the_orders(client, monkeypatc
     assert (await say("کد پیگیری پرداخت ۵۵۱۲۰۹۸۸"))["source"] == "receipt"
     llm.answers = [{"reply": "", "intent": "order_status"}]
     assert "فیش رسیده" in (await say("سفارشم چی شد؟"))["text"]
+    # a follow-up ("why?") is answered by the model from the orders it sees, not with the same list again
+    llm.answers = [{"reply": "فیشت رسیده و ادمین داره بررسیش می‌کنه 🌸", "intent": "order_status"}]
+    m = await say("چرا هنوز تایید نشده؟")
+    assert m["text"] == "فیشت رسیده و ادمین داره بررسیش می‌کنه 🌸" and "📦" not in m["text"]
+    assert "MY ORDERS" in llm.calls[-1]["prompt"] and code in llm.calls[-1]["prompt"]
 
     # a new chat finds it only by the tracking code
     await client.post(f"/stores/{sid}/chat/test", headers=h, json={"reset": True})

@@ -308,7 +308,11 @@ the chosen size/colour.
 FIRST read what the customer means in this message, with RECENT CHAT and STEP, then choose how to answer.
 WHAT WE HAVE: "چی دارین؟", "محصولاتتون؟", "لیست بده" (no specific kind of product) -> intent "catalog", reply "" (the
 shop sends its real list). "چه رنگایی/سایزایی داری؟" with no product named and none clear from the chat -> ask which one.
-ORDER STATUS: asks about an order already placed (where is it, was it sent, its status) -> intent "order_status".
+ORDER STATUS: asks for the status of an order already placed ("سفارشم چی شد؟", "وضعیت سفارش") -> intent
+"order_status", reply "" (the shop sends the order's details). A follow-up about it (why not confirmed, when will you
+tell me, what now, "هاع؟") -> intent "order_status" and answer that question yourself, short, from MY ORDERS; never
+repeat the details already sent, never invent a reason, date or promise. Payment not confirmed -> the admin checks it
+and messages them; they want the reason now or are upset -> handoff, reason "asked_human".
 PHOTOS: asks to see a product, or says yes to your "عکسش رو بفرستم؟" -> its id in "images" (only products with "عکس"),
 short reply. Never put ids in "images" otherwise.
 REFS: asks for a reference (e.g. size chart) or says yes to your offer of it -> its id in "refs"; otherwise none.
@@ -430,8 +434,12 @@ def relevant_faqs(agent: ChatAgent, text: str) -> list[dict[str, Any]]:
 def dynamic_prompt(text: str, history: list[ChatMessage], products: list[Product], state: dict[str, Any],
                    open_now: bool, catalog: bool = False, photos: dict[int, int] | None = None,
                    exact_stock: bool = True, placed: AiOrder | None = None,
-                   faqs: list[dict[str, Any]] | None = None) -> str:
+                   faqs: list[dict[str, Any]] | None = None, my_orders: list[AiOrder] | None = None) -> str:
     lines = []
+    if my_orders:
+        lines.append("MY ORDERS (this customer's, newest first):\n" + "\n".join(
+            f"#{o.id} {o.tracking_code}: {STATUS_FA.get(o.status, o.status)}; {money(o.total_toman)}; "
+            + "، ".join(i["title"][:60] for i in o.items or []) for o in my_orders))
     if faqs:
         lines.append("FAQ:\n" + "\n".join(faq_line(f) for f in faqs))
     if placed:
@@ -788,8 +796,11 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                                 .order_by(ChatMessage.id.desc()).limit(HISTORY_MESSAGES + len(pending)))).scalars().all()
     history = [m for m in reversed(history) if m.id not in pending_ids][-HISTORY_MESSAGES:]
     placed = await open_order(db, store.id, state.get("order_id")) if agent.orders_enabled else None
+    my_orders = list((await db.execute(select(AiOrder).where(AiOrder.store_id == store.id,
+                                                              AiOrder.conversation_id == conv.id)
+                                       .order_by(AiOrder.id.desc()).limit(3))).scalars().all())
     prompt = dynamic_prompt(text, history, products, state, open_now, agent.catalog_enabled, photos,
-                            policy(agent)["stock"] == "exact", placed, relevant_faqs(agent, text))
+                            policy(agent)["stock"] == "exact", placed, relevant_faqs(agent, text), my_orders)
     try:
         out, usage = await ai.generate_chat(system=system, prompt=prompt, store_id=store.id, max_tokens=MAX_OUTPUT_TOKENS)
         if mixed_language(str(out.get("reply") or ""), text, products, store):
@@ -842,8 +853,9 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         result.replies.append(Reply(catalog_overview(rows, policy(agent)["stock"] == "exact"), source="catalog",
                                     intent="product", usage=usage))
         return done()
-    if intent == "order_status":
-        # "Where is my order?": the status comes from the orders themselves, never from the model's guess.
+    if intent == "order_status" and not reply_text.strip():
+        # "Where is my order?": the details come from the orders themselves. A follow-up ("why?", "when?") is
+        # answered by the model in its own words, not with the same list again.
         if answer := await order_status_reply(db, conv, store, text, state):
             result.replies.append(Reply(answer, source="status", intent="order_status", usage=usage))
             return done()
@@ -1205,7 +1217,7 @@ def new_tracking_code() -> str:
 
 
 def order_status_text(o: AiOrder) -> str:
-    items = "، ".join(f"{i['title'][:50]}" + (f" ({i['variant']})" if i.get("variant") else "")
+    items = "، ".join(f"{i['title'][:90]}" + (f" ({i['variant']})" if i.get("variant") else "")
                      + (f" × {fa_number(i['qty'])}" if int(i.get("qty") or 1) > 1 else "") for i in o.items or [])
     code = f" (کد رهگیری {ltr(o.tracking_code)})" if o.tracking_code else ""
     when = jalali(o.created_at.astimezone(TEHRAN) if o.created_at.tzinfo else o.created_at) if o.created_at else ""
