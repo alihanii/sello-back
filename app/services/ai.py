@@ -543,6 +543,18 @@ async def generate_chat(
 # Tools: [{"name", "description", "parameters": <JSON schema object>}] (no additionalProperties: Gemini refuses it).
 
 
+GEMINI_THINKING_ROOM = 2048  # output tokens left for a Gemini model's thinking on top of the answer
+
+
+def _gemini_usable(parts: list[dict[str, Any]]) -> bool:
+    return any(p.get("functionCall") or (p.get("text") and not p.get("thought")) for p in parts)
+
+
+def _gemini_finish(data: dict[str, Any]) -> str:
+    cand = (data.get("candidates") or [{}])[0]
+    return cand.get("finishReason") or (data.get("promptFeedback") or {}).get("blockReason") or "no finish reason"
+
+
 def _gemini_contents(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for m in messages:
@@ -613,7 +625,11 @@ async def _call_tools(provider: AiProvider, model: str, system: str, messages: l
             gemini3 = bool(re.match(r"gemini-([3-9]|\d\d)", model.lower()))
             # Gemini 3 is tuned for temperature 1.0: lower values make it loop and repeat itself (Google's guidance),
             # and with the least thinking it often fails to write a tool call at all. "low" keeps it fast.
-            gen: dict[str, Any] = {"temperature": 1.0 if gemini3 else temperature, "maxOutputTokens": max_tokens}
+            # Thinking tokens count against maxOutputTokens: without room for them the answer is cut to nothing
+            # (finishReason MAX_TOKENS, no parts), which is how a tool turn came back empty.
+            thinks = gemini3 or "pro" in model.lower()
+            gen: dict[str, Any] = {"temperature": 1.0 if gemini3 else temperature,
+                                   "maxOutputTokens": max_tokens + (GEMINI_THINKING_ROOM if thinks else 0)}
             if "flash" in model.lower():
                 gen["thinkingConfig"] = {"thinkingLevel": "low"} if gemini3 else {"thinkingBudget": 0}
             body = {"contents": _gemini_contents(messages), "systemInstruction": {"parts": [{"text": system}]},
@@ -627,15 +643,16 @@ async def _call_tools(provider: AiProvider, model: str, system: str, messages: l
             _raise_for(resp)
             data = resp.json()
             parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-            if not any(p.get("functionCall") or (p.get("text") and not p.get("thought")) for p in parts):
-                # Nothing usable (MALFORMED_FUNCTION_CALL, an empty answer): once more with the model's own thinking.
-                finish = (data.get("candidates") or [{}])[0].get("finishReason", "")
-                meta["empty_reason"] = finish
-                gen.pop("thinkingConfig", None)
+            if not _gemini_usable(parts):
+                # Nothing usable (MALFORMED_FUNCTION_CALL, MAX_TOKENS, an empty answer): once more, with more room.
+                meta["empty_reason"] = _gemini_finish(data)
+                gen["maxOutputTokens"] = max_tokens + 2 * GEMINI_THINKING_ROOM
                 resp = await client.post(url, headers={"x-goog-api-key": key}, json=body)
                 _raise_for(resp)
                 data = resp.json()
                 parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                if not _gemini_usable(parts):
+                    meta["empty_reason"] = f"{meta['empty_reason']}, then {_gemini_finish(data)}"
             calls = [{"id": p["functionCall"].get("id") or f"call_{i}", "name": p["functionCall"].get("name", ""),
                       "args": _args(p["functionCall"].get("args"))} for i, p in enumerate(parts) if p.get("functionCall")]
             text = "\n".join(p["text"] for p in parts if isinstance(p.get("text"), str) and not p.get("thought"))
