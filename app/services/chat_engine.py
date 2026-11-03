@@ -482,6 +482,9 @@ def dynamic_prompt(text: str, history: list[ChatMessage], products: list[Product
     order = state.get("order") or {}
     if order:
         lines.append("ORDER SO FAR: " + json.dumps(order, ensure_ascii=False))
+    if state.get("bad_phone"):
+        lines.append(f"NOTE: the phone the customer sent ({state['bad_phone']}) has the wrong length, so it wasn't "
+                     "taken; say so and ask for the 11-digit 09… number.")
     if history:
         role = {"customer": "Customer", "ai": "You", "seller": "Admin"}
         # Our own past answers are shorter in the history: the customer's words matter more.
@@ -759,6 +762,16 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         if not text:
             return done()
 
+    # 1b. A placed, unpaid/unchecked order whose phone/name/address the customer corrects ("نه صبر کن شماره اشتباهه"):
+    # changed on the order itself, in code — and a phone number is never mistaken for a payment reference.
+    if agent.orders_enabled and text and not photo and not (state.get("order") or {}).get("items"):
+        if (placed_now := await open_order(db, store.id, state.get("order_id"))) and (
+                fix := placed_edit(state, placed_now, text)):
+            result.replies.append(Reply(fix[0], source="order", intent="order"))
+            if fix[1]:
+                result.notify_admin.append(fix[1])
+            return done()
+
     # 2. Waiting for the payment receipt: a photo or a reference number completes the order without the model.
     if state.get("awaiting") == "receipt" and state.get("order_id") and not _TRACK_CODE.search(to_en_digits(text)):
         ref = re.search(r"\d[\d\s-]{3,}\d", to_en_digits(text))
@@ -916,14 +929,22 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         await order_handoff(db, conv, store, state, result)
         return done()
 
+    # 4c'. "I already sent the number!": say what was wrong with it instead of asking the same thing again.
+    if (state.get("collecting") and agent.orders_enabled and (state.get("order") or {}).get("items")
+            and not state.get("awaiting") and _ALREADY_SENT.search(text)
+            and (missing := _missing_fields(agent, state["order"]))):
+        msg = ask_missing(agent, state, missing, thanks=False)
+        result.replies.append(Reply(msg if state.get("bad_phone") and "phone" in missing else
+                                    "ببخشید 🙏 توی پیامت پیداش نکردم. " + msg, source="order", intent="order"))
+        return done()
+
     # 4d. Waiting for name/phone/address: read in code, and the summary goes out without the model.
     if (state.get("collecting") and agent.orders_enabled and (state.get("order") or {}).get("items") and not photo
             and not state.get("awaiting") and looks_like_contact(text, _missing_fields(agent, state["order"]))):
         parse_contact(agent, state, text)
         missing = _missing_fields(agent, state["order"])
         if missing:
-            result.replies.append(Reply("ممنون 🌸 لطفاً " + "، ".join(FIELD_NAMES.get(m, m) for m in missing)
-                                        + " رو هم بفرست.", source="order", intent="order"))
+            result.replies.append(Reply(ask_missing(agent, state, missing), source="order", intent="order"))
             return done()
         lines, total = await priced_lines(db, store.id, state["order"]["items"])
         if lines:
@@ -1069,8 +1090,7 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         capture_contact(agent, state, text)
         missing = _missing_fields(agent, state["order"])
         intent, out = "order", {**out, "order_action": "confirm", "order": None, "products": []}
-        reply_text = ("ممنون 🌸 لطفاً " + "، ".join(FIELD_NAMES.get(m, m) for m in missing) + " رو هم بفرست."
-                      if missing else "")
+        reply_text = ask_missing(agent, state, missing) if missing else ""
         state["collecting"] = True
     if intent == "off_topic" and _SHOPPING_ASK.search(text):
         # "کفش هم دارین؟" is a shopping question about something the shop doesn't sell, not off-topic.
@@ -1459,7 +1479,30 @@ async def order_status_reply(db: AsyncSession, conv: ChatConversation, store: St
 OPEN_ORDER = ("awaiting_payment", "payment_submitted")  # the customer can still add to these
 FIELD_NAMES = {"name": "نام و نام خانوادگی", "phone": "شماره موبایل", "address": "آدرس کامل"}
 _ASKS_CONTACT = re.compile(r"(نام|اسم|شماره|تلفن|موبایل|تماس|آدرس|ادرس|نشانی)")
-_PHONE = re.compile(r"(?:\+?98|0)?9\d{9}")
+# An Iranian mobile: 09 + 9 digits (or 98…/+98…/0098…), with no digit glued on either side — a 10- or 12-digit
+# number is a typo, not a phone to cut down to size.
+_PHONE = re.compile(r"(?<![\d+])(?:(?:\+|00)?98[ -]?|0)?9(?:[ -]?\d){9}(?!\d)")
+_PHONE_LIKE = re.compile(r"(?<![\d+])(?:\+?98|0)9(?:[ -]?\d){6,11}(?!\d)")
+
+
+def bad_phone(text: str) -> str:
+    """A number that is meant as a mobile (starts 09/98) but has the wrong length; "" if none."""
+    t = to_en_digits(text)
+    m = _PHONE_LIKE.search(t)
+    return re.sub(r"[ -]", "", m.group()) if m and not _PHONE.search(t) else ""
+
+
+def ask_missing(agent: ChatAgent, state: dict[str, Any], missing: list[str], thanks: bool = True) -> str:
+    """What's still needed — and why the phone they sent wasn't taken, instead of asking for it again blindly."""
+    bad = state.get("bad_phone") if "phone" in missing else ""
+    head = "ممنون 🌸 " if thanks else ""
+    if bad:
+        n = len(re.sub(r"\D", "", bad))
+        rest = [m for m in missing if m != "phone"]
+        return (f"{head}شماره‌ای که فرستادی ({ltr(bad)}) {fa_number(n)} رقمیه؛ شماره موبایل باید ۱۱ رقم باشه و با ۰۹ "
+                "شروع بشه. لطفاً شماره درست رو بفرست" + (f" (و {'، '.join(FIELD_NAMES.get(m, m) for m in rest)})"
+                                                          if rest else "") + ".")
+    return f"{head}لطفاً " + "، ".join(FIELD_NAMES.get(m, m) for m in missing) + " رو هم بفرست."
 
 
 async def open_order(db: AsyncSession, store_id: int, order_id: Any) -> AiOrder | None:
@@ -1499,15 +1542,21 @@ def capture_contact(agent: ChatAgent, state: dict[str, Any], text: str) -> None:
     """The model missed a plain contact message mid-order: a phone number, or else the address/name it was asked."""
     order = dict(state.get("order") or {})
     missing = _missing_fields(agent, order)
-    phone = _PHONE.search(to_en_digits(text).replace(" ", "").replace("-", ""))
+    phone = _PHONE.search(to_en_digits(text))
     rest = text.strip()
+    if phone:
+        state.pop("bad_phone", None)
+    elif bad := bad_phone(rest):
+        state["bad_phone"] = bad
+        rest = rest.replace(bad, " ") if bad in rest else re.sub(r"[+\d۰-۹\s-]{9,}", " ", rest)
+        rest = re.sub(r"[ \t]{2,}", " ", rest).strip()
     if phone and not re.sub(r"[\d۰-۹+\s-]", "", rest):
         # Only a number: it's the phone (a correction too), never the name or the address.
-        order["phone"] = "0" + phone.group()[-10:]
+        order["phone"] = "0" + re.sub(r"\D", "", phone.group())[-10:]
         state["order"] = order
         return
     if phone and "phone" in missing:
-        order["phone"] = "0" + phone.group()[-10:]
+        order["phone"] = "0" + re.sub(r"\D", "", phone.group())[-10:]
         # "سارا محمدی ۰۹۱۲… تهران، خیابان …" on one line: the short side of the number is the name, the other the address.
         span = re.search(r"(?:(?:\+|00)?(?:98|۹۸)[\s-]?|[0۰])?[9۹](?:[\s-]*[\d۰-۹]){9}(?![\d۰-۹])", rest)
         if span and "name" in missing and "address" in missing:
@@ -1522,12 +1571,14 @@ def capture_contact(agent: ChatAgent, state: dict[str, Any], text: str) -> None:
         if span:
             rest = rest[:span.start()] + " " + rest[span.end():]
         else:
-            tail = phone.group()[-10:]
+            tail = re.sub(r"\D", "", phone.group())[-10:]
             rest = re.sub(r"[+\d۰-۹\s-]{10,}", lambda m: " " if tail in re.sub(r"\D", "", to_en_digits(m.group()))
                           else m.group(), rest)
         rest = re.sub(r"[ \t]{2,}", " ", rest).strip()
     short_name = len(words(rest)) <= 3 and not re.search(r"[\d۰-۹،,]", rest)
-    if rest and "name" in missing and ("address" not in missing or short_name):
+    # A name is a few words on one line: a pasted block never becomes the name.
+    name_ok = short_name or (len(rest.split()) <= 4 and "\n" not in rest and not re.search(r"[\d۰-۹:]", rest))
+    if rest and "name" in missing and name_ok and ("address" not in missing or short_name):
         order["name"] = rest[:100]
     elif rest and "address" in missing:
         order["address"] = rest[:500]
@@ -1536,22 +1587,26 @@ def capture_contact(agent: ChatAgent, state: dict[str, Any], text: str) -> None:
 
 _LABELS = (("phone", re.compile(r"(شماره|موبایل|تلفن|تماس|همراه)")), ("address", re.compile(r"(آدرس|ادرس|نشانی)")),
            ("name", re.compile(r"(نام|اسم)")))
+_FORM_HEADER = re.compile(r"(برای\s*ثبت\s*سفارش|توی\s*یک\s*پیام\s*بفرست|این\s*‌?ها\s*رو\s*بفرست)")
+_BARE_LABEL = re.compile(r"^(نام\s*و\s*نام\s*خانوادگی|شماره\s*(?:موبایل|تماس|تلفن|همراه)|"
+                         r"(?:آدرس|ادرس|نشانی)\s*کامل(?:\s*(?:با|و)\s*کد\s*پستی)?|کد\s*پستی)\s+(?=\S)")
 _FORM_LABEL = re.compile(r"(نام\s*و\s*نام\s*خانوادگی|نام|اسم|شماره\s*(موبایل|تماس|تلفن|همراه)?|موبایل|تلفن|"
                          r"(آدرس|ادرس|نشانی)(\s*کامل)?(\s*(با|و)\s*کد\s*پستی)?|کد\s*پستی)\s*[:：]")
-_NOT_CONTACT = re.compile(r"[؟?]|(خودت|رندوم|الکی|دلبخواه|هرچی|چنده|چقدر|قیمت|موجود|دارین|دارید|عکس|سایز|رنگ|لغو|کنسل|نمی\s*‌?خوام|نمیخوام|"
+_ALREADY_SENT = re.compile(r"(دادم|فرستادم|نوشتم|گفتم|دادمش|فرستادمش|نوشتمش|گفتمش)(?!\w)")
+_NOT_CONTACT = re.compile(r"[؟?]|(دادم|فرستادم|نوشتم|گفتم|خودت|رندوم|الکی|دلبخواه|هرچی|چنده|چقدر|قیمت|موجود|دارین|دارید|عکس|سایز|رنگ|لغو|کنسل|نمی\s*‌?خوام|نمیخوام|"
                           r"باشه|صبر|بعدا|بعداً|چطور|کی\s|کجا|مرسی|ممنون|اضافه|عوض|تغییر|بجا|به\s*جا|^\s*نه\b|^\s*خیر\b)")
 
 
 def looks_like_contact(text: str, missing: list[str] | tuple = ()) -> bool:
     """While the shop waits for name/phone/address: is this message those details (not a question)?"""
     t = text.strip()
-    if not t or _NOT_CONTACT.search(t) and not _PHONE.search(to_en_digits(t).replace(" ", "")):
+    if not t or _NOT_CONTACT.search(t) and not _PHONE.search(to_en_digits(t)):
         return False
     if _GREETING.match(t) or _THANKS.match(t) or is_yes(t) or _NO.match(t):
         return False
     if "name" in missing and 1 <= len(t.split()) <= 3 and not re.search(r"[\d۰-۹]", t):
         return True  # "علی", "سارا کریمی"
-    return bool(_PHONE.search(to_en_digits(t).replace(" ", "").replace("-", "")) or ":" in t or "\n" in t
+    return bool(_PHONE.search(to_en_digits(t)) or bad_phone(t) or ":" in t or "\n" in t
                 or len(t) >= 8 and len(words(t)) >= 2)
 
 
@@ -1570,16 +1625,26 @@ def parse_contact(agent: ChatAgent, state: dict[str, Any], text: str) -> None:
         else:
             segments.append(line)
     for line in [x.strip(" -•▫️،,") for x in segments if x.strip()]:
+        if _FORM_HEADER.search(line):
+            continue  # the customer pasted our own form back: its title line is not their name
+        if ":" not in line and "：" not in line and (m := _BARE_LABEL.match(line)):
+            line = f"{m.group(1)}: {line[m.end():]}"  # "نام و نام خانوادگی علی رضایی" (the colon left out)
         label, sep, value = line.partition(":") if ":" in line else line.partition("：")
         value = value.strip(" ،,")
+        if sep and not value:
+            continue  # an empty form line
         if sep and value and re.search(r"کد\s*پستی|کدپستی", label) and not re.search(r"(آدرس|ادرس|نشانی)", label):
             order["address"] = f"{order.get('address', '')} کد پستی {value}".strip()[:500]
             continue
         if sep and value:
             key = next((k for k, rx in _LABELS if rx.search(label)), None)
             field_ = next((f for f in text_fields if f in label or label.strip() in f), None)
-            if key == "phone" and _PHONE.search(to_en_digits(value).replace(" ", "").replace("-", "")):
+            if key == "phone" and _PHONE.search(to_en_digits(value)):
                 order["phone"] = norm_phone(value)
+                state.pop("bad_phone", None)
+                continue
+            if key == "phone":
+                state["bad_phone"] = to_en_digits(value).strip()[:20]  # said why it wasn't taken, never guessed
                 continue
             if key in ("name", "address"):
                 order[key] = value[:100 if key == "name" else 500]
@@ -1593,7 +1658,7 @@ def parse_contact(agent: ChatAgent, state: dict[str, Any], text: str) -> None:
     state["order"] = order
     if loose:
         rest = "\n".join(loose)
-        lines = [x for x in loose if not _PHONE.search(to_en_digits(x).replace(" ", "").replace("-", ""))]
+        lines = [x for x in loose if not _PHONE.search(to_en_digits(x))]
         missing = _missing_fields(agent, order)
         if len(lines) >= 2 and "name" in missing and len(words(lines[0])) <= 4 and not re.search(r"\d", lines[0]):
             order["name"] = lines[0][:100]  # "علی رضایی\nقم، خیابان …"
@@ -1699,7 +1764,9 @@ async def quick_answer(db: AsyncSession, conv: ChatConversation, store: Store, a
                 and not await open_order(db, store.id, state.get("order_id")))
 
     # The size/colour the customer picks after "which size?": straight on to the details or the summary.
-    if waiting == p.id and ordering and p.stock_qty > 0:
+    # A bare "2xl" right after the assistant named the sizes counts too, even if the model asked the question.
+    if ordering and p.stock_qty > 0 and (waiting == p.id or len(_tokens(text)) <= 2) \
+            and not (state.get("order") or {}).get("items"):
         chosen = {k: match_option(text, v) for k, v in opts.items() if len(v) > 1}
         if chosen and all(chosen.values()) and len(_tokens(text)) <= 4:
             chosen.update({k: v[0] for k, v in opts.items() if len(v) == 1})
@@ -1798,8 +1865,8 @@ FIELD_ASK = {"name": "نام و نام خانوادگی", "phone": "شماره �
 
 def norm_phone(text: str) -> str:
     """"۰۹۱۲…", "+98 912…", "98912…" → "0912…"; "" when there is no mobile number."""
-    m = _PHONE.search(to_en_digits(text).replace(" ", "").replace("-", ""))
-    return "0" + m.group()[-10:] if m else ""
+    m = _PHONE.search(to_en_digits(text))
+    return "0" + re.sub(r"\D", "", m.group())[-10:] if m else ""
 
 
 def edit_order_field(state: dict[str, Any], text: str) -> str | None:
@@ -1860,13 +1927,71 @@ async def edit_reply(db: AsyncSession, store: Store, agent: ChatAgent, state: di
     if missing:
         state["collecting"] = True
         state.pop("awaiting", None)
-        return Reply("ممنون 🌸 لطفاً " + "، ".join(FIELD_NAMES.get(m, m) for m in missing) + " رو هم بفرست.",
-                     source="order", intent="order")
+        return Reply(ask_missing(agent, state, missing), source="order", intent="order")
     lines, total = await priced_lines(db, store.id, order.get("items") or [])
     state["awaiting"] = "confirm"
     head = "اصلاح شد ✅\n" if edit else ""
     return Reply(head + "خلاصهٔ سفارشت:\n" + order_summary(order, lines, total) + "\n\nتأیید می‌کنی؟ (بله / خیر)",
                  source="order", intent="order")
+
+
+def placed_edit(state: dict[str, Any], o: AiOrder, text: str) -> tuple[str, str] | None:
+    """(reply, admin note) when the message corrects a placed order's contact details; None otherwise."""
+    if _PAID.search(text) or re.search(r"(کارت|شبا)", text):
+        return None  # "شماره پیگیری …", "شماره کارت؟": about paying, not the phone
+    t = to_en_digits(text)
+    offer = state.pop("phone_offer", None)
+    if offer and is_yes(text):
+        state["phone_offer_done"] = True
+        return _apply_placed(o, {"phone": offer}, "phone")
+    pending = state.get("edit_field") if state.get("edit_placed") == o.id else None
+    asks_fix = bool(_WRONG.search(text)) or bool(pending)
+    only_number = not re.sub(r"[\d+\s-]", "", t.strip())
+    if not asks_fix:
+        if only_number and (norm_phone(t) or bad_phone(t)) and state.get("awaiting") == "receipt":
+            # A mobile number where a payment reference is expected: ask, don't file it as a receipt.
+            if bad := bad_phone(t):
+                return (f"این شماره ({ltr(bad)}) {fa_number(len(re.sub(r'\\D', '', bad)))} رقمیه 🙏 اگه شماره موبایل "
+                        "جدیدته، ۱۱ رقمی (۰۹…) بفرست؛ اگه کد پیگیری پرداخته، بنویس «کد پیگیری: …».", "")
+            if norm_phone(t) != o.customer_phone:
+                state["phone_offer"] = norm_phone(t)
+                return (f"این شماره موبایله، نه کد پیگیری 🙏 شمارهٔ سفارش #{fa_number(o.id)} رو به "
+                        f"{ltr(norm_phone(t))} عوض کنم؟ (بله / خیر)", "")
+        return None
+    tmp = {"order": {"name": o.customer_name, "phone": o.customer_phone, "address": o.customer_address}}
+    if pending:
+        tmp["edit_field"] = pending
+    if only_number and bad_phone(t):
+        state["edit_field"], state["edit_placed"] = "phone", o.id
+        bad = bad_phone(t)
+        return (f"این شماره ({ltr(bad)}) {fa_number(len(re.sub(r'\\D', '', bad)))} رقمیه 🙏 شماره موبایل ۱۱ رقمی و با ۰۹ "
+                "شروع می‌شه؛ لطفاً درستش رو بفرست.", "")
+    edit = edit_order_field(tmp, text)
+    if edit is None:
+        if not pending and _WRONG.search(text) and len(words(text)) <= 7:
+            state["edit_placed"] = o.id
+            state["edit_field"] = "phone" if _EDIT_FIELDS[0][1].search(text) else ""
+            if not state["edit_field"]:
+                state.pop("edit_field")
+                return (f"کدوم قسمت سفارش #{fa_number(o.id)} رو عوض کنم؟ نام، شماره موبایل یا آدرس؟ "
+                        "(مثلاً بنویس «شماره ۰۹۱۲…»)", "")
+        return None
+    if edit.startswith("ask:"):
+        state["edit_field"], state["edit_placed"] = edit[4:], o.id
+        return (f"{FIELD_ASK[edit[4:]]} درست رو بفرست 🌸", "")
+    state.pop("edit_field", None)
+    state.pop("edit_placed", None)
+    return _apply_placed(o, tmp["order"], edit)
+
+
+def _apply_placed(o: AiOrder, values: dict[str, Any], field_: str) -> tuple[str, str]:
+    col = {"name": "customer_name", "phone": "customer_phone", "address": "customer_address"}[field_]
+    old = getattr(o, col) or "—"
+    setattr(o, col, str(values.get(field_) or "")[:500])
+    label = {"name": "نام", "phone": "شماره موبایل", "address": "آدرس"}[field_]
+    new = getattr(o, col)
+    return (f"اصلاح شد ✅ {label} سفارش #{fa_number(o.id)}: {ltr(new) if field_ == 'phone' else new}",
+            f"✏️ مشتری {label} سفارش #{o.id} را عوض کرد: «{old}» ← «{new}»")
 
 
 async def create_order(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent,

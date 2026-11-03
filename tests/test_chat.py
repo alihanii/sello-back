@@ -1280,3 +1280,64 @@ async def test_no_then_cancel_and_buy_intent_skips_the_extra_question(client, mo
     assert "کدوم قسمت" in (await say("نه"))["text"]
     assert "لغو شد" in (await say("لغو"))["text"]
     assert chat_engine.is_order_ask("حله میخوامش")
+
+
+async def test_pasted_form_wrong_length_phones_and_fixing_a_placed_order(client, monkeypatch):
+    """ali's «هودی اختاپوس» chat: the pasted form (title line, a label without «:», a 10-digit phone) went into the
+    name, «I already sent it» got the same question, a 12-digit number was cut to 11, and the corrected phone after
+    the order was filed as a payment reference."""
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550048")
+    form = "برای ثبت سفارش لطفاً این‌ها رو توی یک پیام بفرست 🌸\nنام و نام خانوادگی:\nشماره موبایل:\nآدرس کامل با کد پستی:"
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        "enabled": True, "orders_enabled": True, "payment": {"card_number": "6037991234567890", "order_form": form}})
+    hoodie = (await client.post(f"/stores/{sid}/products", headers=h, json={
+        "title": "هودی اختاپوس", "price": 2000000, "stock_qty": 5,
+        "attributes": {"سایز": "S، M، L، XL، 2XL، 3XL", "رنگ": "مشکی"}})).json()
+
+    async def say(text):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
+
+    await say("سلام")
+    llm.answers = [{"reply": "هودی اختاپوس مشکی سایز S تا 3XL موجوده. کدوم سایز رو میخواید؟", "intent": "product",
+                    "products": [hoodie["id"]]}]
+    await say("خب میخوام هودی اختابوش مشکی")
+    m = await say("2xl")
+    assert m["text"] == form
+    n = len(llm.calls)
+
+    m = await say("برای ثبت سفارش لطفاً اینها رو توی یک پیام بفرست 🌸\nنام و نام خانوادگی jsj\n"
+                  "شماره موبایل: 0932453454\nآدرس کامل با کد پستی:fsd fdg fdg dfg sd gsf")
+    assert "0932453454" in m["text"] and "۱۰ رقمیه" in m["text"]
+    m = await say("شماره موبایل رو ک برات دادمش")
+    assert "۱۰ رقمیه" in m["text"]
+    m = await say("092452435254")
+    assert "۱۲ رقمیه" in m["text"] and "خلاصه" not in m["text"]
+    m = await say("09124443322")
+    assert "خلاصهٔ سفارشت" in m["text"] and "👤 jsj\n" in m["text"] and "09124443322" in m["text"]
+    assert "📍 fsd fdg fdg dfg sd gsf" in m["text"] and "2XL" in m["text"]
+    assert "ثبت شد" in (await say("اره"))["text"]
+
+    m = await say("نه صب کن شماره اشتباه")
+    assert "شماره موبایل" in m["text"] and "درست" in m["text"]
+    m = await say("092343535435")
+    assert m["source"] != "receipt" and "۱۲ رقمیه" in m["text"]
+    m = await say("09351112233")
+    assert "اصلاح شد" in m["text"] and "09351112233" in m["text"]
+    # a lone mobile number while the receipt is awaited: offered as the new phone, never filed as payment
+    m = await say("09121234567")
+    assert m["source"] != "receipt" and "عوض کنم" in m["text"]
+    assert "اصلاح شد" in (await say("بله"))["text"]
+    assert (await say("کد پیگیری ۷۷۸۸۹۹۰۰"))["source"] == "receipt"
+    assert len(llm.calls) == n
+    rows = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
+    rows = rows.get("items", rows) if isinstance(rows, dict) else rows
+    assert rows[0]["customer_phone"] == "09121234567" and rows[0]["customer_name"] == "jsj"
+    assert any("شماره موبایل سفارش" in t for t in await _notes(sid))
+
+
+def test_phone_numbers_of_the_wrong_length_are_not_cut_down():
+    for bad in ("0932453454", "092452435254", "0912 345 678"):
+        assert chat_engine.norm_phone(bad) == "" and chat_engine.bad_phone(bad), bad
+    for good, want in (("0912 345 6789", "09123456789"), ("+98 912 345 6789", "09123456789"),
+                       ("989335137843", "09335137843"), ("۰۹۱۲۳۴۵۶۷۸۹", "09123456789")):
+        assert chat_engine.norm_phone(good) == want, good
