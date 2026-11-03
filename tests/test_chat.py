@@ -92,7 +92,11 @@ class FakeAgent:
         return [r["content"] for m in self.calls[i]["messages"] if m["role"] == "tool" for r in m["results"]]
 
 
-async def _setup(client, monkeypatch, phone="09125550001"):
+KNOWLEDGE = {"shipping": {"cost": "۵۰ هزار تومان با پست", "time": "۲ تا ۴ روز کاری", "areas": "همه‌ی ایران"},
+             "returns": {"policy": "exchange", "days": "۷", "conditions": "برچسب جدا نشده باشد"}}
+
+
+async def _setup(client, monkeypatch, phone="09125550001", ready=True):
     monkeypatch.setattr(BotApiAdapter, "_call", fake_bot_call)
     llm = FakeAgent()
     monkeypatch.setattr(ai, "chat_step", llm)
@@ -107,6 +111,9 @@ async def _setup(client, monkeypatch, phone="09125550001"):
         "title": "مانتو لینن کرم", "price": 1250000, "stock_qty": 3, "attributes": {"سایز": "۳۸ تا ۴۴"}})).json()
     p2 = (await client.post(f"/stores/{sid}/products", headers=h, json={
         "title": "شال نخی مشکی", "price": 350000, "stock_qty": 0})).json()
+    if ready:  # the required checklist steps, so the assistant can be turned on
+        r = await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"knowledge": KNOWLEDGE})
+        assert r.status_code == 200, r.text
     return h, sid, llm, p1, p2
 
 
@@ -508,9 +515,31 @@ def test_unknown_numbers():
 
 
 async def test_agent_settings_and_validation(client, monkeypatch):
-    h, sid, llm, *_ = await _setup(client, monkeypatch)
+    h, sid, llm, *_ = await _setup(client, monkeypatch, ready=False)
     a = (await client.get(f"/stores/{sid}/chat/agent", headers=h)).json()
     assert a["enabled"] is False and "بوتیک چت" in a["defaults"]["welcome_message"]
+    assert a["knowledge"]["shipping"]["cost"] == "" and [s["key"] for s in a["knowledge_form"]][:2] == ["shipping", "returns"]
+    # the required checklist steps gate turning it on: shipping and returns must be filled first
+    ov = (await client.get(f"/stores/{sid}/chat/overview", headers=h)).json()
+    assert ov["ready"] is False
+    assert {s["key"]: s["done"] for s in ov["setup"] if s["required"]} == {"ai": True, "products": True, "policies": False}
+    r = await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True})
+    assert r.status_code == 422 and "هزینهٔ ارسال" in r.json()["detail"]["message"] and "مرجوعی" in r.json()["detail"]["message"]
+    assert (await client.get(f"/stores/{sid}/chat/agent", headers=h)).json()["enabled"] is False
+    # unknown sections, fields and return policies are dropped; text is trimmed
+    r = await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"knowledge": {
+        "shipping": {"cost": "  ۵۰ هزار  ", "time": "۳ روز", "hack": "x"}, "returns": {"policy": "maybe"}, "evil": {"a": 1}}})
+    k = r.json()["knowledge"]
+    assert k["shipping"]["cost"] == "۵۰ هزار" and "hack" not in k["shipping"] and k["returns"]["policy"] == "" and "evil" not in k
+    r = await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True})
+    assert r.status_code == 422 and "مرجوعی" in r.json()["detail"]["message"] and "ارسال" not in r.json()["detail"]["message"]
+    # filled in the same request it is turned on in
+    r = await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True, "knowledge": KNOWLEDGE})
+    assert r.status_code == 200 and r.json()["enabled"] is True
+    assert (await client.get(f"/stores/{sid}/chat/overview", headers=h)).json()["ready"] is True
+    # an assistant already on stays on when a field is cleared; only turning it on is gated
+    r = await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"knowledge": {}})
+    assert r.status_code == 200 and r.json()["enabled"] is True
     # orders need a way to pay
     r = await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"orders_enabled": True})
     assert r.status_code == 422
@@ -752,3 +781,17 @@ async def test_openai_compatible_retries_an_answer_lost_to_reasoning(monkeypatch
     monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
     text, *_ = await ai._call(prov, "deepseek-flash", "s", "p", [], 0.3, max_tokens=700)
     assert text == '{"reply":"سلام"}' and caps == [700, 4096]
+
+
+async def test_shop_policies_reach_the_assistant(client, monkeypatch):
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550031")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True, "knowledge": {
+        **KNOWLEDGE, "sizing": {"guide": "۳۸ برای قد ۱۶۰ تا ۱۶۵"}, "products": {"care": "با آب سرد بشویید"}}})
+    await say(client, h, sid, "سلام")
+    # the shop's own price for shipping, written differently, is a known number, not a made-up one
+    llm.steps = ["هزینه‌ی ارسال ۵۰٬۰۰۰ تومانه و ۲ تا ۴ روز کاری می‌رسه 🌸"]
+    replies, _ = await say(client, h, sid, "ارسال چقدر طول میکشه و هزینش چنده؟")
+    system = llm.calls[-1]["system"]
+    assert "SHOP POLICIES" in system and "ارسال / هزینهٔ ارسال: ۵۰ هزار تومان با پست" in system
+    assert "مرجوعی و تعویض / مرجوعی: فقط تعویض دارد" in system and "شستشو و نگهداری: با آب سرد بشویید" in system
+    assert len(llm.calls) == 1 and replies[-1]["text"].startswith("هزینه‌ی ارسال ۵۰٬۰۰۰")
