@@ -82,6 +82,7 @@ from app.services.chat_engine import (
     is_abusive,
     is_open,
     is_yes,
+    knowledge_text,
     last_order,
     mark_paid,
     match_option,
@@ -196,6 +197,9 @@ def shop_profile(store: Store, agent: ChatAgent, refs: list[ChatReference], cate
             parts.append("FAQ:\n" + "\n".join(faq_line(f) for f in _faqs(agent)))
     else:
         parts.append("FAQ: the entries that fit each message are under FAQ in the message.")
+    if knowledge_text(agent):
+        parts.append("SHOP POLICIES (the seller's own words: answer shipping, returns, sizing, material and care only from "
+                     "these; anything not here, say you'll ask the admin):\n" + knowledge_text(agent))
     if agent.rules.strip():
         parts.append("RULES:\n" + agent.rules.strip()[:3000])
     if refs:
@@ -699,18 +703,24 @@ def _numbers(text: str) -> set[str]:
     return {re.sub(r"[,٬،.]", "", n) for n in _NUMBER.findall(to_en_digits(text or ""))}
 
 
+def _scaled(text: str) -> set[str]:
+    """Amounts written with a unit: "۹۹۰ هزار" → 990000, "۱٫۲ میلیون" → 1200000."""
+    out = set()
+    for n, unit in _SCALED.findall(to_en_digits(text or "")):
+        try:
+            out.add(str(round(float(n.replace("٫", ".").replace("/", ".")) * (1000 if unit == "هزار" else 1000000))))
+        except ValueError:
+            pass
+    return out
+
+
 def unknown_numbers(reply: str, known: str) -> set[str]:
     """Prices and counts in the reply that no tool, product card or the customer gave (4+ digits: prices, codes)."""
     have = _numbers(known)
+    have |= _scaled(known)  # "۵۰ هزار" in the shop's text is 50000
     # A price written in thousands ("۸۹۰ هزار") is the same as 890000.
     have |= {n[:-3] for n in have if n.endswith("000")} | {n[:-6] for n in have if n.endswith("000000")}
-    said = _numbers(reply)
-    # "۹۹۰ هزار" / "۱.۲ میلیون" in the reply is a price too: 990000 / 1200000.
-    for n, unit in _SCALED.findall(to_en_digits(reply or "")):
-        try:
-            said.add(str(int(float(n.replace("٫", ".").replace("/", ".")) * (1000 if unit == "هزار" else 1000000))))
-        except ValueError:
-            pass
+    said = _numbers(reply) | _scaled(reply)  # "۹۹۰ هزار" in the reply is a price too: 990000
     return {n for n in said if len(n) >= 4 and n not in have}
 
 
@@ -860,7 +870,7 @@ async def agent_turn(ctx: Ctx, pending: list[ChatMessage], open_now: bool, done)
                                 .order_by(ChatMessage.id.desc()).limit(HISTORY_MESSAGES + len(pending)))).scalars().all()
     history = [m for m in reversed(history) if m.id not in pending_ids][-HISTORY_MESSAGES:]
     first = await context_message(ctx, history, prefetched, open_now)
-    ctx.facts.append(first)
+    ctx.facts += [first, system]
     tools = tool_specs(agent)
     allowed = {t["name"] for t in tools}
     messages: list[dict[str, Any]] = [{"role": "user", "text": first}]

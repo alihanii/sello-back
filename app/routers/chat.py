@@ -21,7 +21,8 @@ from app.services import chat_runtime as rt
 from app.services import chat_faq
 from app.services.ai import AIError, route_problem
 from app.services.chat_engine import (
-    MAX_ANSWER_RULES, MAX_ORDER_FIELDS, due_toman, order_fields, policy,
+    KNOWLEDGE, MAX_ANSWER_RULES, MAX_ORDER_FIELDS, RETURN_POLICIES, clean_knowledge, due_toman, knowledge_missing,
+    order_fields, policy,
     DEFAULT_AWAY, DEFAULT_OFF_TOPIC, DEFAULT_WELCOME, chat_limit, get_agent, month_ai_messages,
 )
 
@@ -55,6 +56,7 @@ class AgentIn(BaseModel):
     handoff_minutes: int | None = Field(None, ge=5, le=1440)
     answer_policy: dict[str, Any] | None = None
     order_fields: list[dict[str, Any]] | None = Field(None, max_length=MAX_ORDER_FIELDS)
+    knowledge: dict[str, Any] | None = None
 
 
 def _agent_out(agent: ChatAgent, store: Store) -> dict[str, Any]:
@@ -69,6 +71,11 @@ def _agent_out(agent: ChatAgent, store: Store) -> dict[str, Any]:
         "handoff_minutes": agent.handoff_minutes,
         "answer_policy": policy(agent),
         "order_fields": order_fields(agent),
+        "knowledge": {sec: {k: "" for k, _l, _n in fields} | clean_knowledge(agent.knowledge).get(sec, {})
+                      for sec, (_t, fields) in KNOWLEDGE.items()},
+        "knowledge_form": [{"key": sec, "title": title, "fields": [{"key": k, "label": label, "max": n} for k, label, n in fields]}
+                           for sec, (title, fields) in KNOWLEDGE.items()],
+        "return_policies": RETURN_POLICIES,
         "defaults": {"welcome_message": DEFAULT_WELCOME.replace("{store}", store.name),
                      "off_topic_message": DEFAULT_OFF_TOPIC.replace("{store}", store.name),
                      "away_message": DEFAULT_AWAY},
@@ -121,16 +128,62 @@ async def save_agent_settings(store_id: int, body: AgentIn, user: CurrentUser, d
         rules = [re.sub(r"\s+", " ", str(r)).strip()[:200] for r in (ap.get("rules") or []) if str(r).strip()]
         data["answer_policy"] = {"stock": "available" if ap.get("stock") == "available" else "exact",
                                  "rules": rules[:MAX_ANSWER_RULES]}
+    if "knowledge" in data:
+        data["knowledge"] = clean_knowledge(data["knowledge"])
     if data.get("enabled") and (problem := await route_problem("chat")):
         raise HTTPException(422, {"message": "دستیار بدون هوش مصنوعی روشن نمی‌شود: " + problem})
     if ("orders_enabled" in data or "payment" in data) and data.get("orders_enabled", agent.orders_enabled):
         pay = data.get("payment", agent.payment or {})
         if not any(pay.get(k) for k in ("card_number", "sheba", "link")):
             raise HTTPException(422, "برای سفارش‌گیری، حداقل شماره کارت، شبا یا لینک پرداخت را وارد کن.")
+    turning_on = bool(data.get("enabled")) and not agent.enabled
     for k, v in data.items():
         setattr(agent, k, v)
+    if turning_on:
+        # Going live needs the required checklist steps: what customers ask first and the assistant must not guess.
+        todo = [s for s in await readiness(db, store, agent) if s["required"] and not s["done"]]
+        if todo:
+            await db.rollback()
+            raise HTTPException(422, "قبل از روشن کردن دستیار این‌ها را کامل کن: " + "، ".join(
+                s.get("hint") or s["label"] for s in todo))
     await db.commit()
     return _agent_out(agent, store)
+
+
+async def readiness(db, store: Store, agent: ChatAgent) -> list[dict[str, Any]]:
+    """The setup checklist on the overview tab. Required steps gate turning the assistant on; the rest are advice."""
+    sid = store.id
+    bots = (await db.execute(select(ChatBot.status).where(ChatBot.store_id == sid))).scalars().all()
+    refs = await db.scalar(select(func.count()).select_from(ChatReference).where(ChatReference.store_id == sid)) or 0
+    priced = await db.scalar(select(func.count()).select_from(Product).where(
+        Product.store_id == sid, Product.status != "archived", Product.price > 0)) or 0
+    tested = await db.scalar(select(ChatConversation.id).where(
+        ChatConversation.store_id == sid, ChatConversation.is_test, ChatConversation.message_count > 0).limit(1))
+    ai_problem = await route_problem("chat")
+    missing = knowledge_missing(agent)
+    k = clean_knowledge(agent.knowledge)
+    if agent.catalog_enabled:
+        goods = {"done": priced > 0, "label": "حداقل یک محصول با قیمت", "hint": "یک محصول با قیمت", "tab": "products"}
+    else:
+        goods = {"done": bool(agent.custom_instructions.strip()), "label": "توضیح کسب‌وکار برای دستیار",
+                 "hint": "توضیح کسب‌وکار (تب دستیار و لحن)", "tab": "assistant"}
+    steps = [
+        {"key": "ai", "required": True, "done": not ai_problem, "label": "هوش مصنوعی توسط ادمین Sello تنظیم شده"},
+        {"key": "products", "required": True, **goods},
+        {"key": "policies", "required": True, "done": not missing, "label": "ارسال و مرجوعی",
+         "hint": "، ".join(missing), "tab": "knowledge"},
+        {"key": "orders", "required": agent.orders_enabled, "done": agent.orders_enabled and any(
+            (agent.payment or {}).get(x) for x in ("card_number", "sheba", "link")),
+         "label": "سفارش‌گیری و اطلاعات پرداخت", "tab": "orders-settings"},
+        {"key": "connect", "required": False, "done": "connected" in bots, "label": "اتصال تلگرام یا بله",
+         "tab": "connections"},
+        {"key": "welcome", "required": False, "done": bool(agent.welcome_message or agent.assistant_name),
+         "label": "نام دستیار، پیام خوشامد و لحن", "tab": "assistant"},
+        {"key": "knowledge", "required": False, "done": bool(k.get("sizing") or k.get("products")) and bool(
+            agent.faqs or refs), "label": "سایزبندی، جنس و سؤالات متداول", "tab": "knowledge"},
+        {"key": "test", "required": False, "done": bool(tested), "label": "چند پیام در «تست چت»", "tab": "test"},
+    ]
+    return steps
 
 
 # ---------- connections ----------
@@ -653,21 +706,12 @@ async def overview(store_id: int, user: CurrentUser, db: DB):
     tokens = (await db.execute(select(func.coalesce(func.sum(ChatMessage.input_tokens + ChatMessage.output_tokens), 0),
                                       func.coalesce(func.sum(ChatMessage.cost_toman), 0))
                                .where(*real, ChatMessage.created_at >= _month_start()))).one()
-    refs = await db.scalar(select(func.count()).select_from(ChatReference).where(ChatReference.store_id == store_id)) or 0
     ai_problem = await route_problem("chat")
-    setup = [
-        {"key": "ai", "done": not ai_problem, "label": "هوش مصنوعی توسط ادمین Sello تنظیم شده"},
-        {"key": "connect", "done": any(b.status == "connected" for b in bots), "label": "اتصال تلگرام یا بله"},
-        {"key": "welcome", "done": bool(agent.welcome_message), "label": "پیام خوشامد و لحن"},
-        {"key": "knowledge", "done": bool(agent.faqs or agent.rules or refs), "label": "سؤالات متداول، قوانین یا رفرنس"},
-        {"key": "orders", "done": agent.orders_enabled, "label": "سفارش‌گیری و اطلاعات پرداخت"},
-        {"key": "test", "done": bool(await db.scalar(select(ChatConversation.id).where(
-            ChatConversation.store_id == store_id, ChatConversation.is_test, ChatConversation.message_count > 0).limit(1))),
-         "label": "یک بار تست چت"},
-    ]
+    setup = await readiness(db, store, agent)
     return {
         "enabled": agent.enabled, "ai_ready": not ai_problem, "ai_problem": ai_problem if user.role == "admin" else "",
         "bots": [_bot_out(b) for b in bots], "setup": setup,
+        "ready": all(x["done"] for x in setup if x["required"]),
         "today": {"customer_messages": msgs_today, "ai_replies": ai_today},
         "orders": {"payment_submitted": pending_orders, "awaiting_payment": open_orders},
         "needs_human": needs_human,

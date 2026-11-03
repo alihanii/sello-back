@@ -464,6 +464,9 @@ class ChatAgent(TimestampMixin, Base):
     # Extra things every order needs, the seller's own: [{"label": "طرح چاپ", "kind": "image"|"text", "required": true,
     # "hint": "..."}] — e.g. a custom-print shop collects the customer's design (like Shopify line-item properties).
     order_fields: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, default=list, nullable=True)
+    # The shop's policies, as short forms: {"shipping": {...}, "returns": {...}, "sizing": {...}, "products": {...}}
+    # (fields in chat_engine.KNOWLEDGE). They go into the assistant's fixed prompt, so it never makes these up.
+    knowledge: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict, nullable=True)
 
 
 class ChatBot(TimestampMixin, Base):

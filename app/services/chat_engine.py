@@ -117,6 +117,64 @@ def policy(agent: ChatAgent) -> dict[str, Any]:
             "rules": [str(r) for r in (p.get("rules") or []) if str(r).strip()][:MAX_ANSWER_RULES]}
 
 
+# ---------- the shop's knowledge forms ----------
+
+# section -> (title, [(field, label, max length)]). The panel builds its form from this list (GET .../chat/agent).
+KNOWLEDGE: dict[str, tuple[str, list[tuple[str, str, int]]]] = {
+    "shipping": ("ارسال", [("areas", "ارسال به کجا", 200), ("methods", "روش ارسال", 200), ("cost", "هزینهٔ ارسال", 200),
+                           ("free_over", "ارسال رایگان", 200), ("time", "زمان رسیدن", 200), ("prep", "زمان آماده‌سازی", 200)]),
+    "returns": ("مرجوعی و تعویض", [("policy", "مرجوعی", 20), ("days", "مهلت (روز)", 20), ("conditions", "شرایط", 500),
+                                   ("cost", "هزینهٔ ارسال برگشتی", 200)]),
+    "sizing": ("سایزبندی", [("guide", "راهنمای سایز", 1000), ("fit", "قالب لباس‌ها", 200)]),
+    "products": ("جنس و نگهداری", [("material", "جنس و کیفیت", 500), ("care", "شستشو و نگهداری", 500),
+                                   ("warranty", "ضمانت", 300), ("origin", "تولید", 200)]),
+}
+RETURN_POLICIES = {"return": "مرجوعی و تعویض دارد", "exchange": "فقط تعویض دارد", "none": "مرجوعی و تعویض ندارد"}
+
+
+def clean_knowledge(raw: dict[str, Any] | None) -> dict[str, dict[str, str]]:
+    """Only the known sections and fields, as trimmed text; empty ones are left out."""
+    out: dict[str, dict[str, str]] = {}
+    for sec, (_title, fields) in KNOWLEDGE.items():
+        got = (raw or {}).get(sec) or {}
+        if not isinstance(got, dict):
+            continue
+        vals = {k: re.sub(r"[ \t]+", " ", str(got.get(k) or "")).strip()[:n] for k, _label, n in fields}
+        if sec == "returns" and vals["policy"] not in RETURN_POLICIES:
+            vals["policy"] = ""
+        vals = {k: v for k, v in vals.items() if v}
+        if vals:
+            out[sec] = vals
+    return out
+
+
+def knowledge_text(agent: ChatAgent) -> str:
+    """The forms as the assistant reads them: one line a field, in the seller's own words."""
+    k = clean_knowledge(agent.knowledge)
+    lines = []
+    for sec, (title, fields) in KNOWLEDGE.items():
+        vals = k.get(sec) or {}
+        for key, label, _n in fields:
+            v = vals.get(key)
+            if v:
+                lines.append(f"{title} / {label}: {RETURN_POLICIES.get(v, v) if key == 'policy' else v}")
+    return "\n".join(lines)
+
+
+def knowledge_missing(agent: ChatAgent) -> list[str]:
+    """What the shop must fill before the assistant goes live: what customers ask first and the model must not guess."""
+    k = clean_knowledge(agent.knowledge)
+    ship, ret = k.get("shipping") or {}, k.get("returns") or {}
+    missing = []
+    if not ship.get("cost"):
+        missing.append("هزینهٔ ارسال")
+    if not ship.get("time"):
+        missing.append("زمان رسیدن سفارش")
+    if not ret.get("policy"):
+        missing.append("شرایط مرجوعی")
+    return missing
+
+
 def norm(text: str) -> str:
     text = to_en_digits(normalize_fa(text)).lower()
     text = re.sub(r"[ً-ْـ]", "", text)  # harakat, tatweel
