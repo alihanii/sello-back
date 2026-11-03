@@ -15,6 +15,7 @@ The system prompt is the stable, cacheable part (rules + the shop); the conversa
 prefetched products go in the message after it."""
 
 import hashlib
+import html
 import json
 import re
 from dataclasses import dataclass, field
@@ -327,7 +328,8 @@ async def cart_text(ctx: Ctx) -> str:
             + f" ×{ln['qty']} = {ln['unit_price'] * ln['qty']}" for ln in lines]
     who = {k: order[k] for k in ("name", "phone", "address", "note") if order.get(k)}
     missing = _missing_fields(ctx.agent, order) if lines else []
-    return ("CART: " + ("\n" + "\n".join(rows) + f"\nTOTAL: {total}" if rows else "empty")
+    return ("CART: " + ("\n" + "\n".join(rows) + f"\nTOTAL: {total}" if rows
+                        else "empty (nothing is ordered until you call cart_set_item)")
             + (f"\nCUSTOMER: {json.dumps(who, ensure_ascii=False)}" if who else "")
             + (f"\nEXTRAS: {json.dumps(order['extras'], ensure_ascii=False)}" if order.get("extras") else "")
             + (f"\nSTILL NEEDED: {', '.join(missing)}" if missing else ("\nREADY: call show_order_summary" if lines else "")))
@@ -693,6 +695,10 @@ async def context_message(ctx: Ctx, history: list[ChatMessage], prefetched: list
 
 _CLAIMS_PLACED = re.compile(r"(ثبت\s*(شد|کردم|کردیم|گردید)|سفارش(ت|تون)?\s*(رو\s*)?(ثبت|گذاشتم|زدم)|در\s*نظر\s*گرفتم|"
                             r"(براتون|برات)\s*(گذاشتم|کنار\s*گذاشتم))")
+# The model asking for a final yes itself ("برای تایید نهایی «تایید» را بفرستید", "سفارشت آماده ثبته"): only
+# show_order_summary may ask that.
+_ASKS_CONFIRM = re.compile(r"(تایید|تأیید)\s*(نهایی|کنید|کنی|بفرست|رو\s*بفرست|را\s*بفرست)|آماده\S*\s*(ی\s*)?ثبت|"
+                           r"(ثبت|نهایی)\s*(کنم|بشه|شود)\s*[؟?]")
 _NUMBER = re.compile(r"\d[\d,٬،.]*\d|\d")
 
 
@@ -722,6 +728,16 @@ def unknown_numbers(reply: str, known: str) -> set[str]:
     have |= {n[:-3] for n in have if n.endswith("000")} | {n[:-6] for n in have if n.endswith("000000")}
     said = _numbers(reply) | _scaled(reply)  # "۹۹۰ هزار" in the reply is a price too: 990000
     return {n for n in said if len(n) >= 4 and n not in have}
+
+
+def _skipped_tools(ctx: Ctx, reply: str) -> bool:
+    """The reply talks as if an order were placed or ready to confirm, but no tool did it this turn. (Talking about an
+    order placed earlier, with nothing new in the cart, is fine.)"""
+    if not ctx.agent.orders_enabled or ctx.placed:
+        return False
+    if ctx.state.get("order_id") and not (ctx.state.get("order") or {}).get("items"):
+        return False
+    return bool(_CLAIMS_PLACED.search(reply) or _ASKS_CONFIRM.search(reply))
 
 
 # ---------- the turn ----------
@@ -868,7 +884,8 @@ async def agent_turn(ctx: Ctx, pending: list[ChatMessage], open_now: bool, done)
     history = (await db.execute(select(ChatMessage).where(ChatMessage.conversation_id == ctx.conv.id,
                                                           ChatMessage.role.in_(["customer", "ai", "seller"]))
                                 .order_by(ChatMessage.id.desc()).limit(HISTORY_MESSAGES + len(pending)))).scalars().all()
-    history = [m for m in reversed(history) if m.id not in pending_ids][-HISTORY_MESSAGES:]
+    # Our own error notes are not part of the talk: a model shown them copies them (debug line and all).
+    history = [m for m in reversed(history) if m.id not in pending_ids and m.intent != "error"][-HISTORY_MESSAGES:]
     first = await context_message(ctx, history, prefetched, open_now)
     ctx.facts += [first, system]
     tools = tool_specs(agent)
@@ -877,7 +894,7 @@ async def agent_turn(ctx: Ctx, pending: list[ChatMessage], open_now: bool, done)
     usage: dict[str, Any] = {}
     pin: dict[str, Any] | None = None
     reply_text = ""
-    retried_numbers = False
+    retried_numbers = nudged = False
     try:
         for _step in range(MAX_STEPS):
             msg, used = await ai.chat_step(system=system, messages=messages, tools=tools, store_id=store.id,
@@ -902,6 +919,14 @@ async def agent_turn(ctx: Ctx, pending: list[ChatMessage], open_now: bool, done)
                 continue
             if bad:
                 reply_text = ""
+            if _skipped_tools(ctx, reply_text) and not nudged:
+                # Talking as if an order is ready while the tools never ran: once more, through the tools.
+                nudged = True
+                messages.append({"role": "user", "text": "NOTE: nothing is in the order yet, you only wrote about it. "
+                                 + await cart_text(ctx) + "\nUse the tools now: cart_set_item for what the customer "
+                                 "chose in this chat, set_customer_info for each detail they gave, then "
+                                 "show_order_summary. Ask only for what a tool says is missing."})
+                continue
             break
     except ai.AIError as exc:
         fails = int(state.get("ai_fails") or 0) + 1
@@ -912,8 +937,9 @@ async def agent_turn(ctx: Ctx, pending: list[ChatMessage], open_now: bool, done)
             return done(*ctx.media, ctx.final)
         if fails >= 2:
             ctx.conv.status = "needs_human"  # twice in a row: the model is really down; hand over instead of looping
-            return done(Reply(AI_UNAVAILABLE_TEXT, source="canned"))
-        return done(Reply("ببخشید، یه لحظه نتونستم پیامت رو بخونم 🙏 یه بار دیگه بفرستش.", source="canned"))
+            return done(Reply(AI_UNAVAILABLE_TEXT, source="canned", intent="error"))
+        return done(Reply("ببخشید، یه لحظه نتونستم پیامت رو بخونم 🙏 یه بار دیگه بفرستش.", source="canned",
+                          intent="error"))
     state.pop("ai_fails", None)
 
     if ctx.final:
@@ -928,10 +954,10 @@ async def agent_turn(ctx: Ctx, pending: list[ChatMessage], open_now: bool, done)
         return done(Reply(store_text(agent.off_topic_message or DEFAULT_OFF_TOPIC, store), source="off_topic",
                           intent="off_topic", usage=usage))
 
-    reply_text = clean_language(reply_text, text, prefetched, store)
+    reply_text = clean_language(html.unescape(reply_text), text, prefetched, store)
     if policy(agent)["stock"] == "available":
         reply_text = hide_stock_counts(reply_text)
-    if agent.orders_enabled and _CLAIMS_PLACED.search(reply_text) and not ctx.placed:
+    if _skipped_tools(ctx, reply_text):
         # The model said "ثبت شد" without placing anything: the shop's real next step instead.
         order = state.get("order") or {}
         missing = _missing_fields(agent, order) if order.get("items") else []
