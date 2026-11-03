@@ -17,8 +17,7 @@ from app.core.db import SessionLocal, utcnow
 from app.models import ChatBot, ChatConversation, ChatMessage, Store
 from app.platforms.base import PlatformError
 from app.services import chat_messenger as tg
-from app.services.chat_agent import run_turn
-from app.services.chat_engine import Reply, _aware, get_agent
+from app.services.chat_engine import Reply, _aware, get_agent, run_turn
 from app.services.media import read_local, save_bytes
 from app.services.notify import notify
 
