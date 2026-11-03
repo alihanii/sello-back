@@ -47,6 +47,8 @@ UNSUPPORTED_TEXT = "فعلاً فقط پیام متنی رو می‌تونم ب�
 PHOTO_TEXT = "عکس رسید 🙏 لطفاً اسم یا کد محصولی که می‌خوای رو بنویس تا راهنماییت کنم."
 RECEIPT_TEXT = "✅ اطلاعات پرداخت سفارش #{order} دریافت شد. بعد از بررسی، نتیجه رو همین‌جا خبر می‌دیم 🌸"
 CANCELLED_TEXT = "سفارش لغو شد. اگه چیز دیگه‌ای خواستی در خدمتم 🌸"
+EDIT_ASK_TEXT = ("باشه 🌸 کدوم قسمت رو عوض کنم؟ نام، شماره موبایل، آدرس، یا محصول/سایز؟\n"
+                 "(می‌تونی مستقیم بنویسی، مثلاً «شماره ۰۹۱۲…»؛ برای لغو کامل بنویس «لغو»)")
 ORDER_HANDOFF_TEXT = "عالیه 🌸 سفارشت رو به همکارم دادم؛ همین‌جا برای ثبت نهایی، پرداخت و ارسال بهت پیام می‌ده 🙏"
 AI_UNAVAILABLE_TEXT = "پیامت رسید 🙏 همکارم به‌زودی جواب می‌ده."
 ABUSE_TEXT = "لطفاً محترمانه صحبت کنیم 🙏 اگه مشکلی پیش اومده بگو تا پیگیری کنم."
@@ -361,6 +363,7 @@ code goes in the address; ask nothing else), 1-2 questions at a time. "order" al
 each line once; a change touches only the item meant. All known and the customer wants it -> order_action "confirm"
 (the shop shows the summary and payment; never write card numbers or totals). Cancel -> "cancel". Name, phone or
 address is never off_topic. A new order after an earlier one works the same way.
+product_id is the number after "#" in PRODUCTS, never the product's code (کد).
 PLACED ORDER (still open): adding -> order.items = ONLY the new items, "confirm" once each has its options; never ask
 contact details again. "همون مدل" = its product."""
 
@@ -665,8 +668,22 @@ def _missing_fields(agent: ChatAgent, order: dict[str, Any]) -> list[str]:
             + [f["label"] for f in order_fields(agent) if f["required"] and not str(extras.get(f["label"]) or "").strip()])
 
 
+def fix_product_id(pid: int, products: list[Product], hint: str) -> int:
+    """The model sometimes puts a product's code (کد 11) where its id goes, and id 11 is another product (the brown
+    hoodie instead of «کاپلی»). The words of the chat decide which of the two was meant."""
+    by_code = next((p for p in products if p.sku and norm(p.sku) == str(pid) and p.id != pid), None)
+    if not by_code:
+        return pid
+    same_id = next((p for p in products if p.id == pid), None)
+    if not same_id:
+        return by_code.id
+    said = words(hint)
+    return by_code.id if _overlap(said, words(by_code.title)) > _overlap(said, words(same_id.title)) else pid
+
+
 async def _merge_order(db: AsyncSession, store_id: int, agent: ChatAgent, state: dict[str, Any],
-                       update: dict[str, Any] | None) -> dict[str, Any]:
+                       update: dict[str, Any] | None, products: list[Product] | None = None,
+                       hint: str = "") -> dict[str, Any]:
     order = dict(state.get("order") or {})
     if not isinstance(update, dict):
         return order
@@ -680,6 +697,8 @@ async def _merge_order(db: AsyncSession, store_id: int, agent: ChatAgent, state:
             except ValueError:
                 qty = 1
             pid = it.get("product_id")
+            if str(pid or "").isdigit() and products:
+                pid = fix_product_id(int(pid), products, hint)
             p = await db.get(Product, int(pid)) if str(pid or "").isdigit() and int(pid) else None
             if p and p.store_id == store_id and p.status != "archived":
                 if p.stock_qty > 0:
@@ -710,7 +729,7 @@ async def _merge_order(db: AsyncSession, store_id: int, agent: ChatAgent, state:
         if k == "name" and v and v == str(update.get("address") or order.get("address") or "").strip():
             continue  # the model sometimes copies the address into the name
         if v:
-            order[k] = to_en_digits(v)[:30] if k == "phone" else v[:500]
+            order[k] = (norm_phone(v) or to_en_digits(v)[:30]) if k == "phone" else v[:500]
     return order
 
 
@@ -832,7 +851,16 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                     result.replies.append(Reply(payment_text(agent, order, added=bool(adding)), source="order",
                                                 intent="order"))
                 return done()
-        if _NO.match(text):
+        if (edit := edit_order_field(state, text)) is not None:
+            # "شماره اشتباهه ۰۹۱۲…", "آدرس: …", or a bare "شماره" (the new value comes next): only that field changes.
+            result.replies.append(await edit_reply(db, store, agent, state, edit))
+            return done()
+        if (_NO.match(text) or _WRONG.search(text)) and not _CANCEL.search(text) and not state.get("add_to"):
+            # A plain "no" to the summary is rarely "cancel everything": ask what to change, keep the order.
+            state["awaiting"] = "edit"
+            result.replies.append(Reply(EDIT_ASK_TEXT, source="order", intent="order"))
+            return done()
+        if _NO.match(text) or _CANCEL.search(text):
             state.pop("awaiting", None)
             state.pop("order", None)
             if state.pop("add_to", None):
@@ -846,6 +874,25 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
             result.replies.append(Reply(CANCELLED_TEXT, source="canned", intent="order"))
             return done()
         state.pop("awaiting", None)  # anything else: the customer is changing the order; let the model handle it
+
+    # 4a. After "what should I change?": the field (and maybe its new value), or a cancel.
+    if state.get("awaiting") == "edit" and agent.orders_enabled and (state.get("order") or {}).get("items"):
+        if (edit := edit_order_field(state, text)) is not None:
+            result.replies.append(await edit_reply(db, store, agent, state, edit))
+            return done()
+        if _CANCEL.search(text) or _NO.match(text):
+            state.pop("awaiting", None)
+            state.pop("order", None)
+            result.replies.append(Reply(CANCELLED_TEXT, source="canned", intent="order"))
+            return done()
+        if _WRONG.search(text) and len(words(text)) <= 6:
+            result.replies.append(Reply(EDIT_ASK_TEXT, source="order", intent="order"))
+            return done()
+        if is_yes(text):
+            state["awaiting"] = "confirm"
+            result.replies.append(await edit_reply(db, store, agent, state, ""))
+            return done()
+        state.pop("awaiting", None)  # a product/size change: the model handles it with the order it has
 
     # 4b. "Yes" to "send you its photo?": the offered product's photos, no model needed.
     offer, ref_offer = state.pop("photo_offer", None), state.pop("ref_offer", None)
@@ -1043,7 +1090,8 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         state.pop("awaiting", None)
     else:
         # With AI ordering off this is only a note of what they chose, for the admin who takes the order.
-        state["order"] = await _merge_order(db, store.id, agent, state, out.get("order"))
+        hint = " ".join([text, str(out.get("reply") or "")] + [m.text for m in history if m.role == "customer"][-3:])
+        state["order"] = await _merge_order(db, store.id, agent, state, out.get("order"), products, hint)
         if not state["order"]:
             state.pop("order")
     if not agent.orders_enabled and action == "confirm":
@@ -1067,9 +1115,12 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         if placed and placed.extras:
             order["extras"] = {**placed.extras, **(order.get("extras") or {})}
         state["order"] = order
-    if (agent.orders_enabled and order.get("items") and not state.get("awaiting")
-            and _CLAIMS_PLACED.search(reply.text)):
-        # The model said "ثبت شد" on its own: the shop's own steps (details, summary, confirm, payment) run instead.
+    # The customer said yes / "I want it", or the model only asked "ثبت کنم؟" or said "ثبت شد / اصلاح کردم" without
+    # doing it: with every item chosen, the shop's own next step runs now (details or summary), no extra round.
+    go_on = bool(_CLAIMS_PLACED.search(reply.text) or _CLAIMS_FIXED.search(reply.text)) or (
+        action != "cancel" and (is_yes(text) or is_order_ask(text) or bool(_ASKS_CONFIRM.search(reply.text)))
+        and await items_complete(db, store.id, order.get("items") or []))
+    if agent.orders_enabled and order.get("items") and not state.get("awaiting") and go_on:
         action = "confirm"
         missing = _missing_fields(agent, order)
         if missing:
@@ -1158,6 +1209,23 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
             result.replies.append(Reply(HANDOFF_TEXT, source="handoff", intent="handoff", usage=usage))
         result.notify_admin.append(f"🙋 گفتگو با {conv.customer_name or 'مشتری'} به ادمین نیاز دارد: «{text[:120]}»")
     return done()
+
+
+_CLAIMS_FIXED = re.compile(r"(اصلاح|عوض|تغییر|درست)\s*(شد|کردم|کردیم|می\s*‌?کنم|میکنم|می\s*‌?دم|میدم|دادم)")
+_ASKS_CONFIRM = re.compile(r"(ثبت(ش)?\s*کنم|ثبت\s*بشه|ثبت\s*کنیم|نهایی\s*کنم|بفرستم\s*برای\s*ثبت)\s*\S{0,10}\s*[؟?]")
+
+
+async def items_complete(db: AsyncSession, store_id: int, items: list[dict[str, Any]]) -> bool:
+    """Every item names a product of this shop, and one with several sizes/colours has its choice."""
+    if not items:
+        return False
+    for it in items:
+        p = await db.get(Product, it.get("product_id") or 0) if it.get("product_id") else None
+        if not p or p.store_id != store_id:
+            return False
+        if any(len(v) > 1 for v in variant_options(p).values()) and not str(it.get("variant") or "").strip():
+            return False
+    return True
 
 
 _CLAIMS_PLACED = re.compile(r"(ثبت\s*(شد|کردم|کردیم|گردید)|سفارش(ت|تون)?\s*(رو\s*)?(ثبت|گذاشتم|زدم)|در\s*نظر\s*گرفتم|"
@@ -1433,8 +1501,13 @@ def capture_contact(agent: ChatAgent, state: dict[str, Any], text: str) -> None:
     missing = _missing_fields(agent, order)
     phone = _PHONE.search(to_en_digits(text).replace(" ", "").replace("-", ""))
     rest = text.strip()
+    if phone and not re.sub(r"[\d۰-۹+\s-]", "", rest):
+        # Only a number: it's the phone (a correction too), never the name or the address.
+        order["phone"] = "0" + phone.group()[-10:]
+        state["order"] = order
+        return
     if phone and "phone" in missing:
-        order["phone"] = phone.group()
+        order["phone"] = "0" + phone.group()[-10:]
         # "سارا محمدی ۰۹۱۲… تهران، خیابان …" on one line: the short side of the number is the name, the other the address.
         span = re.search(r"(?:(?:\+|00)?(?:98|۹۸)[\s-]?|[0۰])?[9۹](?:[\s-]*[\d۰-۹]){9}(?![\d۰-۹])", rest)
         if span and "name" in missing and "address" in missing:
@@ -1463,7 +1536,9 @@ def capture_contact(agent: ChatAgent, state: dict[str, Any], text: str) -> None:
 
 _LABELS = (("phone", re.compile(r"(شماره|موبایل|تلفن|تماس|همراه)")), ("address", re.compile(r"(آدرس|ادرس|نشانی)")),
            ("name", re.compile(r"(نام|اسم)")))
-_NOT_CONTACT = re.compile(r"[؟?]|(چنده|چقدر|قیمت|موجود|دارین|دارید|عکس|سایز|رنگ|لغو|کنسل|نمی\s*‌?خوام|نمیخوام|"
+_FORM_LABEL = re.compile(r"(نام\s*و\s*نام\s*خانوادگی|نام|اسم|شماره\s*(موبایل|تماس|تلفن|همراه)?|موبایل|تلفن|"
+                         r"(آدرس|ادرس|نشانی)(\s*کامل)?(\s*(با|و)\s*کد\s*پستی)?|کد\s*پستی)\s*[:：]")
+_NOT_CONTACT = re.compile(r"[؟?]|(خودت|رندوم|الکی|دلبخواه|هرچی|چنده|چقدر|قیمت|موجود|دارین|دارید|عکس|سایز|رنگ|لغو|کنسل|نمی\s*‌?خوام|نمیخوام|"
                           r"باشه|صبر|بعدا|بعداً|چطور|کی\s|کجا|مرسی|ممنون|اضافه|عوض|تغییر|بجا|به\s*جا|^\s*نه\b|^\s*خیر\b)")
 
 
@@ -1486,14 +1561,25 @@ def parse_contact(agent: ChatAgent, state: dict[str, Any], text: str) -> None:
     extras = dict(order.get("extras") or {})
     text_fields = {f["label"]: f for f in order_fields(agent) if f["kind"] == "text"}
     loose = []
-    for line in [x.strip(" -•▫️") for x in text.splitlines() if x.strip()]:
+    segments = []
+    for line in text.splitlines():
+        # The whole form pasted on one line ("نام: … شماره موبایل: … آدرس: …"): one segment per label.
+        starts = [m.start() for m in _FORM_LABEL.finditer(line)]
+        if len(starts) >= 2:
+            segments += [line[a:b] for a, b in zip([0] + starts, starts + [len(line)]) if line[a:b].strip()]
+        else:
+            segments.append(line)
+    for line in [x.strip(" -•▫️،,") for x in segments if x.strip()]:
         label, sep, value = line.partition(":") if ":" in line else line.partition("：")
-        value = value.strip()
+        value = value.strip(" ،,")
+        if sep and value and re.search(r"کد\s*پستی|کدپستی", label) and not re.search(r"(آدرس|ادرس|نشانی)", label):
+            order["address"] = f"{order.get('address', '')} کد پستی {value}".strip()[:500]
+            continue
         if sep and value:
             key = next((k for k, rx in _LABELS if rx.search(label)), None)
             field_ = next((f for f in text_fields if f in label or label.strip() in f), None)
             if key == "phone" and _PHONE.search(to_en_digits(value).replace(" ", "").replace("-", "")):
-                order["phone"] = _PHONE.search(to_en_digits(value).replace(" ", "").replace("-", "")).group()
+                order["phone"] = norm_phone(value)
                 continue
             if key in ("name", "address"):
                 order[key] = value[:100 if key == "name" else 500]
@@ -1527,7 +1613,7 @@ _SIZE_ASK = {"سایز", "سایزبندی", "سایزا", "سایزاش", "سا
 _COLOR_ASK = {"رنگ", "رنگبندی", "رنگا", "رنگاش", "رنگهاش", "رنگش", "رنگای", "رنگهای", "رنگاشو", "رنگبندیش"}
 _STOCK_ASK = {"موجود", "موجوده", "موجودش", "موجودی", "دارین", "داری", "دارید", "هست", "هستش"}
 _PRICE_ASK = {"قیمت", "قیمتش", "قیمتشو", "چنده", "چقدره", "چند", "چقدر"}
-_ORDER_LEAD = {"خب", "خوب", "پس", "باشه", "اوکی", "عالیه", "من", "همینو", "اینو", "همونو", "این", "همین", "همون", "رو", "را",
+_ORDER_LEAD = {"حله", "حلّه", "اوکیه", "باشه", "خب", "خوب", "پس", "باشه", "اوکی", "عالیه", "من", "همینو", "اینو", "همونو", "این", "همین", "همون", "رو", "را",
                "لطفا", "لطفاً", "دیگه", "اره", "آره", "بله"}
 _ORDER_PHRASES = {"میخوام", "میخوامش", "میخوام سفارش بدم", "میخوام سفارش بزنم", "میخوام سفارش ثبت کنم", "میخوام ثبت کنم",
                   "میخوام ثبتش کنم", "میخوام بخرم", "میخوام بخرمش", "میخواستم سفارش بدم", "میخواستم بخرم",
@@ -1695,6 +1781,92 @@ async def order_next_step(db: AsyncSession, conv: ChatConversation, store: Store
         return Reply(form[:1000], source="order", intent="order")
     return Reply("عالیه 🌸 برای ثبت سفارش لطفاً " + "، ".join(FIELD_NAMES.get(m, m) for m in missing)
                  + " رو توی یک پیام بفرست.", source="order", intent="order")
+
+
+# ---------- editing the order at the summary, in code ----------
+
+_CANCEL = re.compile(r"(لغو|کنسل|منصرف|نمی\s*‌?خوام|نمیخوام|بیخیال|بی\s*خیال)")
+_EDIT_FIELDS = (("phone", re.compile(r"(شماره|موبایل|تلفن|همراه|گوشی)")),
+                ("address", re.compile(r"(آدرس|ادرس|نشانی|کد\s*پستی|کدپستی)")),
+                ("name", re.compile(r"(?<!\w)(نام|اسم)(م|ام|مو|ه|و)?(?!\w)|(?<!\w)فامیل\S*")))
+_EDIT_NOISE = re.compile(r"(?<!\w)(اشتباه\S*|غلط\S*|درست\S*|اصلاح\S*|عوض\S*|تغییر\S*|بده|بدید|بدین|کن|کنید|کنین|میخوام|می‌خوام|"
+                         r"لطفا|لطفاً|جدید\S*|من|منو|رو|را|این|اینه|هست|هستش|است|شد|بود|نوشتی|نوشتین|زدی|که|به|با|"
+                         r"موبایل|کامل|و|نام|خانوادگی|نه|خیر|باید|میشه|می‌شه|پستی)(?!\w)|[:：!؟?]")
+_WRONG = re.compile(r"(اشتباه|غلط|اصلاح|عوض|تغییر|ویرایش)")
+FIELD_ASK = {"name": "نام و نام خانوادگی", "phone": "شماره موبایل", "address": "آدرس کامل (با کد پستی)"}
+
+
+def norm_phone(text: str) -> str:
+    """"۰۹۱۲…", "+98 912…", "98912…" → "0912…"; "" when there is no mobile number."""
+    m = _PHONE.search(to_en_digits(text).replace(" ", "").replace("-", ""))
+    return "0" + m.group()[-10:] if m else ""
+
+
+def edit_order_field(state: dict[str, Any], text: str) -> str | None:
+    """At the summary: which field the customer is correcting. Sets it when the new value is in the message (returns
+    the field) or remembers the field and waits for the value (returns "ask:<field>"). None: not a field edit."""
+    order = dict(state.get("order") or {})
+    waiting = state.pop("edit_field", None)
+    t = text.strip()
+    if waiting:
+        value = norm_phone(t) if waiting == "phone" else t
+        if not value or (waiting != "phone" and (len(value) < 2 or is_yes(value) or _NO.match(value))):
+            state["edit_field"] = waiting
+            return f"ask:{waiting}"
+        order[waiting] = value[:100 if waiting == "name" else 500]
+        state["order"] = order
+        return waiting
+    hits = [k for k, rx in _EDIT_FIELDS if rx.search(t)]
+    phone = norm_phone(t)
+    if not hits:
+        # Just a new number while looking at the summary: it's the phone.
+        if phone and len(re.sub(r"[\d۰-۹+\s-]", "", t)) == 0:
+            order["phone"] = phone
+            state["order"] = order
+            return "phone"
+        return None
+    field_ = "phone" if "phone" in hits and (phone or len(hits) == 1) else hits[0]
+    if field_ == "phone":
+        if phone:
+            order["phone"] = phone
+            state["order"] = order
+            return "phone"
+    else:
+        label, sep, after = t.partition(":") if ":" in t else t.partition("：")
+        value = after.strip() if sep else _EDIT_NOISE.sub(" ", re.sub(dict(_EDIT_FIELDS)[field_].pattern + r"\S*", " ", t))
+        value = re.sub(r"\s{2,}", " ", value).strip()
+        if field_ == "address" and re.search(r"کد\s*پستی|کدپستی", t) and re.search(r"\d{10}", to_en_digits(t)) \
+                and not sep:
+            code = re.search(r"\d{10}", to_en_digits(t)).group()
+            base = re.sub(r"\s*کد\s*پستی\s*:?\s*[\d۰-۹]+", "", order.get("address") or "").strip()
+            order["address"] = f"{base} کد پستی {code}".strip()
+            state["order"] = order
+            return "address"
+        question = re.search(r"(چرا|[؟?])", t)  # "آدرسم رو چرا عوض کردی؟" is not a new address
+        if not question and len(value) >= (2 if field_ == "name" else 6):
+            order[field_] = value[:100 if field_ == "name" else 500]
+            state["order"] = order
+            return field_
+    state["edit_field"] = field_
+    return f"ask:{field_}"
+
+
+async def edit_reply(db: AsyncSession, store: Store, agent: ChatAgent, state: dict[str, Any], edit: str) -> Reply:
+    if edit.startswith("ask:"):
+        state["awaiting"] = "edit"
+        return Reply(f"{FIELD_ASK[edit[4:]]} درست رو بفرست 🌸", source="order", intent="order")
+    order = state.get("order") or {}
+    missing = _missing_fields(agent, order)
+    if missing:
+        state["collecting"] = True
+        state.pop("awaiting", None)
+        return Reply("ممنون 🌸 لطفاً " + "، ".join(FIELD_NAMES.get(m, m) for m in missing) + " رو هم بفرست.",
+                     source="order", intent="order")
+    lines, total = await priced_lines(db, store.id, order.get("items") or [])
+    state["awaiting"] = "confirm"
+    head = "اصلاح شد ✅\n" if edit else ""
+    return Reply(head + "خلاصهٔ سفارشت:\n" + order_summary(order, lines, total) + "\n\nتأیید می‌کنی؟ (بله / خیر)",
+                 source="order", intent="order")
 
 
 async def create_order(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent,

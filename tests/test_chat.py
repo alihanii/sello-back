@@ -1219,3 +1219,64 @@ def test_order_asks_and_variant_options():
     assert o == {"size": ["L", "XL", "XXL"], "color": ["مشکی", "سفید"]}
     assert chat_engine.match_option("2xl", o["size"]) == "XXL" and chat_engine.match_option("xl", o["size"]) == "XL"
     assert chat_engine.match_option("۴۰", ["۳۸ تا ۴۴"]) == "40" and chat_engine.match_option("۵۰", ["۳۸ تا ۴۴"]) == ""
+
+
+async def test_order_edits_at_the_summary_change_only_that_field(client, monkeypatch):
+    """ali's «هودی کاپلی» chat: the model used the product code as the id (brown hoodie in the summary), the
+    one-line form all went into the name, «نه» cancelled the order and the new phone landed in the address."""
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550046")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        "enabled": True, "orders_enabled": True, "payment": {"card_number": "6037991234567890"}})
+    brown = (await client.post(f"/stores/{sid}/products", headers=h, json={
+        "title": "هودی مردانه قهوه‌ای با جزئیات دوخت برجسته", "price": 2000000, "stock_qty": 3})).json()
+    kapli = (await client.post(f"/stores/{sid}/products", headers=h, json={
+        "title": "هودی کاپلی مشکی", "price": 2200000, "stock_qty": 3, "attributes": {"سایز": "2XL"}})).json()
+    await client.patch(f"/products/{kapli['id']}", headers=h, json={"sku": str(brown["id"])})
+
+    async def say(text):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
+
+    await say("سلام")
+    llm.answers = [{"reply": "هودی کاپلی و هودی قهوه‌ای داریم. کدوم؟", "intent": "clarify",
+                    "products": [kapli["id"], brown["id"]]}]
+    await say("برام یه هودی بیار")
+    # "ثبت کنم؟" with everything chosen: no extra round, the details are asked right away
+    llm.answers = [{"reply": "هودی کاپلی رو انتخاب کردین. ثبت کنم؟", "intent": "order", "order_action": "update",
+                    "order": {"items": [{"product_id": brown["id"], "qty": 1, "variant": "2XL"}]}}]
+    m = await say("کاپلی")
+    assert "نام و نام خانوادگی" in m["text"] and "ثبت کنم" not in m["text"]
+    n = len(llm.calls)
+
+    m = await say("نام و نام خانوادگی: هانی شماره موبایل:09124443322ز+ آدرس کامل با کد پستی:قم خیابان صفاییه 42 1")
+    assert "خلاصهٔ سفارشت" in m["text"] and "کاپلی" in m["text"] and "قهوه" not in m["text"]
+    assert "👤 هانی\n" in m["text"] and "09124443322" in m["text"] and "📍 قم خیابان صفاییه 42 1" in m["text"]
+
+    m = await say("نه")
+    assert "کدوم قسمت" in m["text"] and "لغو" not in m["text"].split("\n")[0]
+    m = await say("شماره")
+    assert "شماره موبایل" in m["text"]
+    m = await say("09123332233")
+    assert "09123332233" in m["text"] and "📍 قم خیابان صفاییه 42 1" in m["text"] and "👤 هانی\n" in m["text"]
+    m = await say("آدرسم اشتباهه قم خیابان امام کوچه ۵")
+    assert "📍 قم خیابان امام کوچه ۵" in m["text"] and "09123332233" in m["text"]
+    m = await say("شماره رو اشتباه زدم 09351112233")
+    assert "09351112233" in m["text"] and "📍 قم خیابان امام کوچه ۵" in m["text"]
+    m = await say("بله")
+    assert m["source"] == "order" and "ثبت شد" in m["text"]
+    assert len(llm.calls) == n  # all of it in code
+    rows = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
+    rows = rows.get("items", rows) if isinstance(rows, dict) else rows
+    assert rows[0]["items"][0]["product_id"] == kapli["id"] and rows[0]["customer_phone"] == "09351112233"
+
+
+async def test_no_then_cancel_and_buy_intent_skips_the_extra_question(client, monkeypatch):
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550047")
+    r = await _order_ready(client, h, sid, llm, p1)
+    assert "خلاصهٔ سفارشت" in r["messages"][-1]["text"]
+
+    async def say(text):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
+
+    assert "کدوم قسمت" in (await say("نه"))["text"]
+    assert "لغو شد" in (await say("لغو"))["text"]
+    assert chat_engine.is_order_ask("حله میخوامش")
