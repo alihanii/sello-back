@@ -533,6 +533,186 @@ async def generate_chat(
     raise last  # type: ignore[misc]
 
 
+# ---------- tool calling (the chat agent) ----------
+#
+# Messages are kept in one neutral shape and written out in each provider's format at every call, so a turn can
+# use Gemini, OpenAI-compatible gateways or Claude alike:
+#   {"role": "user", "text": "..."}
+#   {"role": "assistant", "text": "...", "calls": [{"id", "name", "args"}], "raw": <provider content>, "wire": kind}
+#   {"role": "tool", "results": [{"id", "name", "content": "..."}]}
+# Tools: [{"name", "description", "parameters": <JSON schema object>}] (no additionalProperties: Gemini refuses it).
+
+
+def _gemini_contents(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        if m["role"] == "user":
+            out.append({"role": "user", "parts": [{"text": m["text"]}]})
+        elif m["role"] == "assistant":
+            # Gemini 3 wants its own parts back as they came (they carry the thought signature of each call).
+            parts = m.get("raw") if m.get("wire") == "gemini" and m.get("raw") else (
+                ([{"text": m["text"]}] if m.get("text") else [])
+                + [{"functionCall": {"name": c["name"], "args": c["args"]}} for c in m.get("calls") or []])
+            out.append({"role": "model", "parts": parts})
+        else:
+            out.append({"role": "user", "parts": [
+                {"functionResponse": {"name": r["name"], "response": {"result": r["content"]}}} for r in m["results"]]})
+    return out
+
+
+def _openai_messages(system: str, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = [{"role": "system", "content": system}]
+    for m in messages:
+        if m["role"] == "user":
+            out.append({"role": "user", "content": m["text"]})
+        elif m["role"] == "assistant":
+            msg: dict[str, Any] = {"role": "assistant", "content": m.get("text") or None}
+            if m.get("calls"):
+                msg["tool_calls"] = [{"id": c["id"], "type": "function",
+                                      "function": {"name": c["name"], "arguments": json.dumps(c["args"], ensure_ascii=False)}}
+                                     for c in m["calls"]]
+            out.append(msg)
+        else:
+            out += [{"role": "tool", "tool_call_id": r["id"], "content": r["content"]} for r in m["results"]]
+    return out
+
+
+def _anthropic_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        if m["role"] == "user":
+            out.append({"role": "user", "content": [{"type": "text", "text": m["text"]}]})
+        elif m["role"] == "assistant":
+            content = ([{"type": "text", "text": m["text"]}] if m.get("text") else []) + [
+                {"type": "tool_use", "id": c["id"], "name": c["name"], "input": c["args"]} for c in m.get("calls") or []]
+            out.append({"role": "assistant", "content": content})
+        else:
+            out.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": r["id"], "content": r["content"]}
+                                                    for r in m["results"]]})
+    return out
+
+
+def _args(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    try:
+        value = json.loads(raw or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+async def _call_tools(provider: AiProvider, model: str, system: str, messages: list[dict[str, Any]],
+                      tools: list[dict[str, Any]], temperature: float, max_tokens: int,
+                      meta: dict[str, Any]) -> tuple[dict[str, Any], int, int]:
+    """One model step with tools. Returns (assistant message in the neutral shape, input tokens, output tokens)."""
+    key = _api_key(provider)
+    kind, base = _wire(provider, model)
+    async with httpx.AsyncClient(timeout=120, proxy=provider_proxy(provider) or None) as client:
+        if kind == "gemini":
+            gen: dict[str, Any] = {"temperature": temperature, "maxOutputTokens": max_tokens}
+            if "flash" in model.lower():
+                gen["thinkingConfig"] = ({"thinkingLevel": "minimal"} if re.match(r"gemini-([3-9]|\d\d)", model.lower())
+                                         else {"thinkingBudget": 0})
+            body = {"contents": _gemini_contents(messages), "systemInstruction": {"parts": [{"text": system}]},
+                    "tools": [{"functionDeclarations": tools}],
+                    "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}}, "generationConfig": gen}
+            url = f"{base}/v1beta/models/{model}:generateContent"
+            resp = await client.post(url, headers={"x-goog-api-key": key}, json=body)
+            if resp.status_code == 400 and "thinkingConfig" in gen:
+                gen.pop("thinkingConfig")
+                resp = await client.post(url, headers={"x-goog-api-key": key}, json=body)
+            _raise_for(resp)
+            data = resp.json()
+            parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+            calls = [{"id": p["functionCall"].get("id") or f"call_{i}", "name": p["functionCall"].get("name", ""),
+                      "args": _args(p["functionCall"].get("args"))} for i, p in enumerate(parts) if p.get("functionCall")]
+            text = "\n".join(p["text"] for p in parts if isinstance(p.get("text"), str) and not p.get("thought"))
+            usage = data.get("usageMetadata", {})
+            meta["cached_tokens"] = usage.get("cachedContentTokenCount", 0)
+            return ({"role": "assistant", "text": text.strip(), "calls": calls, "raw": parts, "wire": "gemini"},
+                    usage.get("promptTokenCount", 0), usage.get("candidatesTokenCount", 0) + usage.get("thoughtsTokenCount", 0))
+
+        if kind in ("openai", "openrouter"):
+            req = {"model": model, "temperature": temperature, "max_tokens": max_tokens,
+                   "messages": _openai_messages(system, messages),
+                   "tools": [{"type": "function", "function": t} for t in tools], "tool_choice": "auto"}
+            resp = await client.post(f"{base}/chat/completions", headers={"Authorization": f"Bearer {key}"}, json=req)
+            _raise_for(resp)
+            data = resp.json()
+            msg = ((data.get("choices") or [{}])[0].get("message") or {})
+            calls = [{"id": c.get("id") or f"call_{i}", "name": (c.get("function") or {}).get("name", ""),
+                      "args": _args((c.get("function") or {}).get("arguments"))}
+                     for i, c in enumerate(msg.get("tool_calls") or [])]
+            usage = data.get("usage", {})
+            meta["cached_tokens"] = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
+            return ({"role": "assistant", "text": (msg.get("content") or "").strip(), "calls": calls, "wire": kind},
+                    usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+
+        if kind == "anthropic":
+            resp = await client.post(
+                f"{base}/v1/messages", headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
+                json={"model": model, "max_tokens": max_tokens, "temperature": temperature,
+                      "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+                      "tools": [{"name": t["name"], "description": t["description"], "input_schema": t["parameters"]}
+                                for t in tools],
+                      "messages": _anthropic_messages(messages)})
+            _raise_for(resp)
+            data = resp.json()
+            blocks = data.get("content") or []
+            calls = [{"id": b.get("id", ""), "name": b.get("name", ""), "args": _args(b.get("input"))}
+                     for b in blocks if b.get("type") == "tool_use"]
+            text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+            usage = data.get("usage", {})
+            cached = usage.get("cache_read_input_tokens", 0) or 0
+            meta["cached_tokens"] = cached
+            tin = usage.get("input_tokens", 0) + cached + (usage.get("cache_creation_input_tokens", 0) or 0)
+            return ({"role": "assistant", "text": text.strip(), "calls": calls, "wire": "anthropic"},
+                    tin, usage.get("output_tokens", 0))
+
+    raise AIError("نوع سرویس هوش مصنوعی پشتیبانی نمی‌شود.", code="ai_bad_kind")
+
+
+async def chat_step(
+    *, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]], store_id: int | None,
+    max_tokens: int = 700, task: str = "chat", pin: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """One step of the chat agent: the model answers in text or asks for tools. Returns (assistant message, usage).
+    `pin` ({"provider_id", "model"}) keeps the rest of a turn on the key/model that started it, because a provider
+    cannot continue another provider's tool calls; the others stay as fallbacks."""
+    candidates = await _route(task)
+    if not candidates:
+        raise AIError(await route_problem(task), code="ai_not_configured")
+    if pin:
+        candidates.sort(key=lambda c: not (c[0].id == pin.get("provider_id") and c[1] == pin.get("model")))
+    last: AIError | None = None
+    for provider, model, temp, is_fallback in candidates:
+        started = time.monotonic()
+        meta: dict[str, Any] = {}
+        try:
+            msg, tin, tout = await _retry_busy(
+                lambda provider=provider, model=model, temp=temp: _call_tools(
+                    provider, model, system, messages, tools, min(temp, CHAT_MAX_TEMPERATURE), max_tokens, meta))
+            if not msg["text"] and not msg["calls"]:
+                raise AIError("مدل پاسخ خالی داد.", code="ai_empty")
+            ms = int((time.monotonic() - started) * 1000)
+            cached = int(meta.get("cached_tokens") or 0)
+            await _log(provider, task, model, store_id, ok=True, is_fallback=is_fallback, latency_ms=ms,
+                       input_tokens=tin, output_tokens=tout, cached_tokens=cached)
+            return msg, {"model": model, "provider_id": provider.id, "input_tokens": tin, "output_tokens": tout,
+                         "cached_tokens": cached, "cost_toman": token_cost(provider, tin, tout, cached), "latency_ms": ms}
+        except (AIError, httpx.HTTPError, KeyError, ValueError) as exc:
+            err = exc if isinstance(exc, AIError) else AIError(
+                "ارتباط با سرویس هوش مصنوعی برقرار نشد." if isinstance(exc, httpx.HTTPError)
+                else "پاسخ هوش مصنوعی قابل خواندن نبود.",
+                code="ai_network" if isinstance(exc, httpx.HTTPError) else "ai_bad_json", detail=str(exc)[:500])
+            await _log(provider, task, model, store_id, ok=False, is_fallback=is_fallback,
+                       latency_ms=int((time.monotonic() - started) * 1000),
+                       error_code=err.code, error_message=f"{err.message_fa} {err.detail or ''}"[:1000])
+            last = err
+    raise last  # type: ignore[misc]
+
+
 async def generate_image(
     *, system: str, prompt: str, images: list[tuple[bytes, str]], store_id: int | None = None, task: str = "image_edit",
 ) -> tuple[bytes, str]:

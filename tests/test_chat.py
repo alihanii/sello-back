@@ -1,13 +1,12 @@
-"""Sales chat assistant: connections, the cheap no-model paths, one model call per turn, orders, takeover, usage."""
+"""Sales chat assistant: connections, the no-model paths, the tool-calling agent, orders, takeover, usage."""
 
-import re
 import json
 
 import pytest
 from sqlalchemy import delete
 
 from app.platforms.botapi import BotApiAdapter
-from app.services import ai, chat_engine
+from app.services import ai, chat_agent, chat_engine
 from app.services import chat_runtime as rt
 from tests.conftest import login as _login
 
@@ -51,8 +50,12 @@ async def fake_bot_call(self, token, method, data=None, files=None):
     }[method]
 
 
+USAGE = {"model": "gemini-3.6-flash", "provider_id": 1, "input_tokens": 1200, "output_tokens": 60,
+         "cached_tokens": 800, "cost_toman": 3, "latency_ms": 420}
+
+
 class FakeLLM:
-    """Scripted model: records every prompt so tests can check what (and how much) was sent."""
+    """Scripted JSON model for generate_chat (the FAQ import still uses it)."""
 
     def __init__(self):
         self.calls: list[dict] = []
@@ -61,14 +64,39 @@ class FakeLLM:
     async def __call__(self, *, system, prompt, store_id, max_tokens=400, task="chat"):
         self.calls.append({"system": system, "prompt": prompt, "max_tokens": max_tokens})
         out = self.answers.pop(0) if self.answers else {"reply": "بله موجوده", "intent": "product"}
-        return out, {"model": "gemini-flash-lite", "input_tokens": 1200, "output_tokens": 60, "cached_tokens": 800,
-                     "cost_toman": 3, "latency_ms": 420}
+        return out, dict(USAGE)
+
+
+class FakeAgent:
+    """Scripted tool-calling model. Each step is a text reply or a list of (tool, args) calls. Records what each step
+    was sent, so tests can check the prompt, the tools and the tool results."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+        self.steps: list = []
+
+    async def __call__(self, *, system, messages, tools, store_id, max_tokens=700, task="chat", pin=None):
+        self.calls.append({"system": system, "messages": [dict(m) for m in messages], "tools": [t["name"] for t in tools]})
+        step = self.steps.pop(0) if self.steps else "بله موجوده 🌸"
+        if isinstance(step, str):
+            return {"role": "assistant", "text": step, "calls": []}, dict(USAGE)
+        calls = [{"id": f"c{i}", "name": n, "args": a} for i, (n, a) in enumerate(step)]
+        return {"role": "assistant", "text": "", "calls": calls}, dict(USAGE)
+
+    def first(self, i=-1) -> str:
+        """The context message (state, products, chat, customer) of call i."""
+        return self.calls[i]["messages"][0]["text"]
+
+    def results(self, i=-1) -> list[str]:
+        """Tool results the model saw at call i."""
+        return [r["content"] for m in self.calls[i]["messages"] if m["role"] == "tool" for r in m["results"]]
 
 
 async def _setup(client, monkeypatch, phone="09125550001"):
     monkeypatch.setattr(BotApiAdapter, "_call", fake_bot_call)
-    llm = FakeLLM()
-    monkeypatch.setattr(chat_engine.ai, "generate_chat", llm)
+    llm = FakeAgent()
+    monkeypatch.setattr(ai, "chat_step", llm)
+    monkeypatch.setattr(ai, "generate_chat", FakeLLM())
     admin = await login(client, "09120000000")
     r = await client.post("/admin/ai/providers", headers=admin, json={
         "name": "chat-key", "kind": "gemini", "api_key": "k-chat", "default_model": "gemini-3.6-flash"})
@@ -80,6 +108,403 @@ async def _setup(client, monkeypatch, phone="09125550001"):
     p2 = (await client.post(f"/stores/{sid}/products", headers=h, json={
         "title": "شال نخی مشکی", "price": 350000, "stock_qty": 0})).json()
     return h, sid, llm, p1, p2
+
+
+ORDERS_ON = {"enabled": True, "orders_enabled": True,
+             "payment": {"card_number": "6037-1111", "holder": "علی", "require_receipt": True}}
+
+
+async def say(client, h, sid, text):
+    """One message in the seller's test chat; returns (the replies, the conversation state)."""
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()
+    return r["messages"][1:], r["state"]
+
+
+async def test_full_chat_flow(client, monkeypatch):
+    h, sid, llm, p1, p2 = await _setup(client, monkeypatch, "09125550003")
+    scheduled: list[int] = []
+    monkeypatch.setattr(rt, "schedule", lambda cid: scheduled.append(cid))
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        **ORDERS_ON, "welcome_message": "سلام به {store}!",
+        "faqs": [{"q": "هزینه ارسال چقدره؟", "a": "ارسال ۷۰ هزار تومان است."}]})
+    bot = (await client.post(f"/stores/{sid}/chat/bots", headers=h, json={
+        "platform": "telegram", "mode": "bot", "bot_token": "444:flow-token"})).json()
+
+    # 1. "/start": welcome only, no model; a repeated update is ignored
+    await _customer(bot["id"], 1001, "/start", 1)
+    conv_id = scheduled[-1]
+    saved = await rt.answer(conv_id)
+    assert [m.source for m in saved] == ["welcome"] and saved[0].text == "سلام به بوتیک چت!" and llm.calls == []
+    scheduled.clear()
+    await _customer(bot["id"], 1001, "/start", 1)
+    assert scheduled == []
+
+    # 2. FAQ: the seller's own answer, no model
+    await _customer(bot["id"], 1001, "هزینه ارسال چقدره", 2)
+    saved = await rt.answer(conv_id)
+    assert saved[0].source == "faq" and "۷۰" in saved[0].text and llm.calls == []
+
+    # 3. a burst of two messages -> one turn; the matching product is in the message before the model asks
+    await _customer(bot["id"], 1001, "سلام مانتو لینن", 3)
+    await _customer(bot["id"], 1001, "سایز ۴۰ دارید؟", 4)
+    llm.steps = ["بله، مانتو لینن کرم سایز ۴۰ موجوده؛ ۱٬۲۵۰٬۰۰۰ تومان 🌸"]
+    saved = await rt.answer(conv_id)
+    assert len(llm.calls) == 1 and saved[0].source == "llm" and saved[0].input_tokens == 1200
+    call = llm.calls[0]
+    assert "مانتو لینن کرم" in llm.first() and "<customer>سلام مانتو لینن\nسایز ۴۰ دارید؟</customer>" in llm.first()
+    assert "هزینه ارسال" in call["system"] and "6037" not in call["system"]  # FAQ in the cached prefix, no card
+    assert {"search_products", "cart_set_item", "show_order_summary", "confirm_order"} <= set(call["tools"])
+
+    # 4. off-topic: the shop's fixed answer
+    await _customer(bot["id"], 1001, "یه شعر درباره پاییز بگو", 5)
+    llm.steps = ["OFF_TOPIC"]
+    saved = await rt.answer(conv_id)
+    assert saved[0].source == "off_topic" and "بوتیک چت" in saved[0].text
+
+    # 5. the order: tools keep the cart; the phone with a wrong length is refused with the reason
+    await _customer(bot["id"], 1001, "۹ تا سایز ۴۰ میخوام، مریم احمدی ۰۹۱۲۱۲۳۴۵۶ تهران خیابان آزادی", 6)
+    llm.steps = [[("cart_set_item", {"product_id": p1["id"], "qty": 9, "variant": "۴۰"}),
+                  ("set_customer_info", {"name": "مریم احمدی", "phone": "۰۹۱۲۱۲۳۴۵۶", "address": "تهران خیابان آزادی"})],
+                 "فقط ۳ تا موجوده و گذاشتمش 🌸 شماره‌ات ۱۰ رقمیه؛ لطفاً شماره ۱۱ رقمی رو بفرست."]
+    saved = await rt.answer(conv_id)
+    cart, info = llm.results()
+    assert "Only 3 in stock" in cart and "×3 = 3750000" in cart
+    assert "ERROR" in info and "10 digits" in info and "STILL NEEDED: phone" in info
+    assert saved[0].source == "llm" and "۱۱ رقمی" in saved[0].text
+
+    await _customer(bot["id"], 1001, "ببخشید ۰۹۱۲۱۲۳۴۵۶۷", 7)
+    llm.steps = [[("set_customer_info", {"phone": "۰۹۱۲۱۲۳۴۵۶۷"}), ("show_order_summary", {})]]
+    saved = await rt.answer(conv_id)
+    assert saved[0].source == "order" and "خلاصهٔ سفارش" in saved[0].text and "۳٬۷۵۰٬۰۰۰" in saved[0].text
+    assert "09121234567" in saved[0].text
+
+    # "بله" places it in code, no model
+    calls = len(llm.calls)
+    await _customer(bot["id"], 1001, "بله", 8)
+    saved = await rt.answer(conv_id)
+    assert len(llm.calls) == calls and saved[0].source == "order" and "6037-1111" in saved[0].text
+    order = (await client.get(f"/stores/{sid}/ai-orders", headers=h)).json()["items"][0]
+    assert order["status"] == "awaiting_payment" and order["total_toman"] == 3750000
+    assert order["customer_phone"] == "09121234567" and order["items"][0]["variant"] == "۴۰"
+
+    # 6. the receipt: a reference number completes payment, no model
+    await _customer(bot["id"], 1001, "کد پیگیری ۱۲۳۴۵۶۷۸", 9)
+    saved = await rt.answer(conv_id)
+    assert saved[0].source == "receipt" and len(llm.calls) == calls
+    order = (await client.get(f"/stores/{sid}/ai-orders", headers=h)).json()["items"][0]
+    assert order["status"] == "payment_submitted" and order["payment_ref"] == "12345678"
+    assert any(m == "sendMessage" and d.get("chat_id") == "1001" for m, d in SENT)
+
+    # the seller confirms: stock goes down
+    r = (await client.patch(f"/ai-orders/{order['id']}", headers=h, json={"status": "confirmed"})).json()
+    assert r["status"] == "confirmed"
+    assert (await client.get(f"/products/{p1['id']}", headers=h)).json()["stock_qty"] == 0
+
+    # 7. the history shows everything, with the order linked
+    detail = (await client.get(f"/chat/conversations/{conv_id}", headers=h)).json()
+    assert detail["orders"][0]["id"] == order["id"]
+    assert {m["source"] for m in detail["messages"] if m["role"] == "ai"} >= {"welcome", "faq", "llm", "off_topic", "order", "receipt"}
+
+    # 8. the seller takes over: the assistant pauses for that chat
+    r = await client.post(f"/chat/conversations/{conv_id}/messages", headers=h, json={"text": "سلام، من فروشنده‌ام"})
+    assert r.status_code == 200
+    await _customer(bot["id"], 1001, "یه سؤال دیگه هم داشتم درباره شال", 10)
+    assert await rt.answer(conv_id) == []
+    await client.post(f"/chat/conversations/{conv_id}/resume", headers=h)
+    llm.steps = ["شال نخی مشکی الان ناموجوده 🙏"]
+    saved = await rt.answer(conv_id)
+    assert saved and saved[0].source == "llm"
+
+    # 9. usage for the seller and the admin: one AI message per model-answered turn
+    u = (await client.get(f"/stores/{sid}/chat/usage", headers=h)).json()
+    assert u["totals"]["llm_calls"] == 5 and u["totals"]["orders"] == 1
+    admin = await login(client, "09120000000")
+    au = (await client.get("/admin/chat/usage", headers=admin)).json()
+    assert any(s["store_id"] == sid and s["llm_calls"] == 5 for s in au["stores"])
+
+
+async def test_no_order_without_a_summary_and_a_yes(client, monkeypatch):
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550020")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json=ORDERS_ON)
+    await say(client, h, sid, "سلام")
+    # the model tries to place it straight away: refused, and nothing is created
+    llm.steps = [[("cart_set_item", {"product_id": p1["id"], "qty": 1, "variant": "۴۲"}), ("confirm_order", {})],
+                 "حتماً 🌸 اسم، شماره و آدرست رو بفرست."]
+    await say(client, h, sid, "مانتو لینن ۴۲ میخوام ثبتش کن")
+    assert "hasn't seen a summary" in llm.results()[1]
+    assert (await client.get(f"/stores/{sid}/ai-orders", headers=h)).json()["items"] == []
+    # the model says "ثبت شد" without placing anything: the shop sends the real summary instead
+    llm.steps = [[("set_customer_info", {"name": "سارا", "phone": "09120000001", "address": "قم"})],
+                 "سفارشت ثبت شد 🌸"]
+    replies, state = await say(client, h, sid, "سارا ۰۹۱۲۰۰۰۰۰۰۱ قم")
+    assert replies[-1]["source"] == "order" and "خلاصهٔ سفارش" in replies[-1]["text"] and state["awaiting"] == "confirm"
+    # confirm_order in the same turn as the summary is refused too: the customer must answer first
+    llm.steps = [[("show_order_summary", {}), ("confirm_order", {})]]
+    replies, state = await say(client, h, sid, "یه بار دیگه خلاصه رو بفرست")
+    assert "خلاصهٔ سفارش" in replies[-1]["text"]
+    assert (await client.get(f"/stores/{sid}/ai-orders", headers=h)).json()["items"] == []
+    # a yes in other words, read by the model: now it is placed
+    llm.steps = [[("confirm_order", {})]]
+    replies, state = await say(client, h, sid, "همین خوبه بفرستید لطفا سریع")
+    assert "6037-1111" in replies[-1]["text"] and state["awaiting"] == "receipt"
+
+
+async def test_changes_after_the_summary_need_a_new_summary(client, monkeypatch):
+    """ali's runs: "the address is wrong", "make it 2", "size 44 instead" after the summary."""
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550021")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json=ORDERS_ON)
+    await say(client, h, sid, "سلام")
+    llm.steps = [[("cart_set_item", {"product_id": p1["id"], "qty": 1, "variant": "سایز ۴۰"}),
+                  ("set_customer_info", {"name": "رضا", "phone": "+98 912 333 4455", "address": "تهران، ونک"}),
+                  ("show_order_summary", {})]]
+    replies, state = await say(client, h, sid, "مانتو لینن ۴۰، رضا ۰۹۱۲۳۳۳۴۴۵۵ تهران ونک")
+    assert "09123334455" in replies[-1]["text"]
+    first_sig = state["summary_sig"]
+    # a change drops the old summary; a bare "yes" can't place the old version
+    llm.steps = [[("set_customer_info", {"address": "شیراز، خیابان زند"}),
+                  ("cart_set_item", {"product_id": p1["id"], "qty": 2})], "باشه 🌸 آدرس و تعداد عوض شد؛ خلاصه رو بفرستم؟"]
+    replies, state = await say(client, h, sid, "آدرس اشتباهه شیراز خیابان زند، دوتا هم میخوام")
+    assert "awaiting" not in state and "summary_sig" not in state
+    assert state["order"]["items"] == [{"product_id": p1["id"], "qty": 2, "variant": "سایز ۴۰"}]  # size kept
+    calls = len(llm.calls)
+    llm.steps = [[("show_order_summary", {})]]
+    replies, state = await say(client, h, sid, "بله")  # "yes" with no summary pending goes to the model
+    assert len(llm.calls) == calls + 1 and "۲٬۵۰۰٬۰۰۰" in replies[-1]["text"] and "شیراز" in replies[-1]["text"]
+    assert state["summary_sig"] != first_sig
+    replies, state = await say(client, h, sid, "آره")
+    # test-chat orders are hidden from /ai-orders, so the state is what tells it was placed
+    assert state["awaiting"] == "receipt" and state.get("order_id")
+
+
+async def test_size_choice_and_stock_are_checked_by_the_tool(client, monkeypatch):
+    h, sid, llm, p1, p2 = await _setup(client, monkeypatch, "09125550022")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json=ORDERS_ON)
+    await say(client, h, sid, "سلام")
+    llm.steps = [[("cart_set_item", {"product_id": p1["id"], "qty": 1}),
+                  ("cart_set_item", {"product_id": p1["id"], "qty": 1, "variant": "۵۰"}),
+                  ("cart_set_item", {"product_id": p2["id"], "qty": 1}),
+                  ("cart_set_item", {"product_id": 999999, "qty": 1})], "چه سایزی؟ ۳۸ تا ۴۴ داریم."]
+    replies, state = await say(client, h, sid, "مانتو و شال رو میخوام")
+    no_size, bad_size, out, missing = llm.results()
+    assert "choose a size" in no_size and "۳۸ تا ۴۴" in no_size
+    assert "«۵۰» is not one of them" in bad_size
+    assert "out of stock" in out and "no such product" in missing
+    assert not (state.get("order") or {}).get("items")
+
+
+async def test_a_placed_orders_details_are_fixed_on_the_order(client, monkeypatch):
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550023")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json=ORDERS_ON)
+    await say(client, h, sid, "سلام")
+    llm.steps = [[("cart_set_item", {"product_id": p1["id"], "qty": 1, "variant": "۳۸"}),
+                  ("set_customer_info", {"name": "نیما", "phone": "09125551234", "address": "کرج"}),
+                  ("show_order_summary", {})]]
+    await say(client, h, sid, "مانتو ۳۸ برای نیما ۰۹۱۲۵۵۵۱۲۳۴ کرج")
+    replies, state = await say(client, h, sid, "بله")
+    oid = state["order_id"]
+    llm.steps = [[("set_customer_info", {"phone": "09125559999"})], "درست شد 🌸 شماره جدید ثبت شد."]
+    replies, state = await say(client, h, sid, "شماره رو اشتباه دادم ۰۹۱۲۵۵۵۹۹۹۹")
+    assert f"Updated on placed order #{oid}" in llm.results()[0]
+    from app.core.db import SessionLocal
+    from app.models import AiOrder
+    async with SessionLocal() as db:
+        assert (await db.get(AiOrder, oid)).customer_phone == "09125559999"
+    # a phone number is never taken as a payment reference
+    assert state["awaiting"] == "receipt"
+    # a second order carries the contact details over; nothing is asked twice
+    llm.steps = [[("cart_set_item", {"product_id": p1["id"], "qty": 1, "variant": "۴۴"})], "یکی دیگه هم اضافه شد 🌸"]
+    await say(client, h, sid, "یه ۴۴ هم اضافه کن")
+    assert "STILL NEEDED" not in llm.results()[0] and "READY" in llm.results()[0]
+
+
+async def test_numbers_the_data_never_gave_are_not_sent(client, monkeypatch):
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550024")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True})
+    await say(client, h, sid, "سلام")
+    llm.steps = ["قیمتش ۹۹۰٬۰۰۰ تومانه 🌸", "قیمتش ۱٬۲۵۰٬۰۰۰ تومانه 🌸"]
+    replies, _ = await say(client, h, sid, "قیمت مانتو لینن چنده؟")
+    assert replies[-1]["text"] == "قیمتش ۱٬۲۵۰٬۰۰۰ تومانه 🌸"
+    assert "990000" in llm.calls[-1]["messages"][-1]["text"]  # the model was told which number was wrong
+    llm.steps = ["۹۹۰ هزار تومان", "باز هم ۹۹۰٬۰۰۰"]
+    replies, _ = await say(client, h, sid, "مطمئنی؟")
+    assert replies[-1]["text"] == chat_engine.NO_ANSWER_TEXT
+
+
+async def test_photos_status_handoff_and_stock_policy(client, monkeypatch):
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550025")
+    from app.core.db import SessionLocal
+    from app.models import ProductImage
+    async with SessionLocal() as db:
+        db.add(ProductImage(product_id=p1["id"], url="/media/p1.jpg", position=0))
+        await db.commit()
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        **ORDERS_ON, "answer_policy": {"stock": "available", "rules": ["تخفیف نده"]}})
+    await say(client, h, sid, "سلام")
+    # photos go out before the words
+    llm.steps = [[("send_product_photos", {"product_id": p1["id"]})], "این هم عکسش 🌸 چه سایزی؟"]
+    replies, _ = await say(client, h, sid, "عکس مانتو رو بفرست")
+    assert replies[0]["image_url"] == "/media/p1.jpg" and replies[-1]["text"] == "این هم عکسش 🌸 چه سایزی؟"
+    # the seller's stock rule: counts never reach the model and are removed if written anyway
+    llm.steps = ["بله، فقط ۳ تا ازش مونده 🌸"]
+    replies, _ = await say(client, h, sid, "مانتو لینن موجوده؟")
+    assert "موجودی 3" not in llm.first() and "| موجود |" in llm.first() and "1. تخفیف نده" in llm.calls[-1]["system"]
+    assert replies[-1]["text"] == "بله، موجوده 🌸"
+    # status: only this chat's orders, sent by the shop's own text
+    # no order in this chat: the model is told so and asks for the tracking code itself
+    llm.steps = [[("check_order_status", {})], "سفارشی از این چت ثبت نشده؛ کد پیگیریت رو می‌فرستی؟"]
+    replies, _ = await say(client, h, sid, "سفارشم چی شد؟")
+    assert replies[-1]["source"] == "llm" and "کد پیگیری" in replies[-1]["text"]
+    assert "no orders" in llm.results()[0]
+    # a complaint the model hands over; asking for a person needs no model
+    llm.steps = [[("handoff_to_human", {"reason": "complaint", "summary": "پارگی"})]]
+    replies, state = await say(client, h, sid, "مانتویی که فرستادین پاره بود")
+    assert replies[-1]["source"] == "handoff"
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"reset": True})
+    await say(client, h, sid, "سلام")
+    calls = len(llm.calls)
+    replies, _ = await say(client, h, sid, "می‌خوام با ادمین صحبت کنم")
+    assert replies[-1]["source"] == "handoff" and len(llm.calls) == calls
+
+
+async def test_orders_off_hands_the_buyer_to_the_admin(client, monkeypatch):
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550026")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True})
+    await say(client, h, sid, "سلام")
+    llm.steps = [[("pass_order_to_admin", {"product_id": p1["id"], "variant": "۴۰", "qty": 1})]]
+    replies, state = await say(client, h, sid, "مانتو ۴۰ رو میخوام")
+    assert "cart_set_item" not in llm.calls[-1]["tools"] and "pass_order_to_admin" in llm.calls[-1]["tools"]
+    assert replies[-1]["source"] == "handoff" and "همکارم" in replies[-1]["text"]
+
+
+async def test_model_failures(client, monkeypatch):
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550027")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True})
+    await say(client, h, sid, "سلام")
+
+    async def boom(**kw):
+        raise ai.AIError("پاسخ هوش مصنوعی قابل خواندن نبود.", code="ai_bad_json")
+    monkeypatch.setattr(ai, "chat_step", boom)
+    replies, _ = await say(client, h, sid, "مانتو دارید؟")
+    assert replies[-1]["source"] == "canned" and "یه بار دیگه" in replies[-1]["text"]
+    replies, _ = await say(client, h, sid, "مانتو دارید؟")
+    assert replies[-1]["text"].startswith(chat_engine.AI_UNAVAILABLE_TEXT)
+
+
+async def test_business_owner_message_pauses_ai(client, monkeypatch):
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550004")
+    scheduled: list[int] = []
+    monkeypatch.setattr(rt, "schedule", lambda cid: scheduled.append(cid))
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True})
+    biz = (await client.post(f"/stores/{sid}/chat/bots", headers=h, json={
+        "platform": "telegram", "mode": "business", "bot_token": "555:biz-owner"})).json()
+    await rt.handle_update(biz["id"], {"update_id": 1, "business_connection": {
+        "id": "bc9", "user": {"id": 77, "first_name": "Ali"}, "user_chat_id": 77, "is_enabled": True,
+        "rights": {"can_reply": True}}})
+    msg = {"message_id": 10, "business_connection_id": "bc9", "chat": {"id": 3003, "type": "private", "first_name": "سارا"},
+           "from": {"id": 3003, "first_name": "سارا"}, "text": "قیمت مانتو چنده؟"}
+    await rt.handle_update(biz["id"], {"update_id": 2, "business_message": msg})
+    conv_id = scheduled[-1]
+    SENT.clear()
+    llm.steps = ["۱٬۲۵۰٬۰۰۰ تومان"]
+    await rt.answer(conv_id)
+    assert all(d.get("business_connection_id") == "bc9" for m, d in SENT if m == "sendMessage")
+    own = {**msg, "message_id": 11, "from": {"id": 77, "first_name": "Ali"}, "text": "خودم جواب میدم"}
+    scheduled.clear()
+    await rt.handle_update(biz["id"], {"update_id": 3, "business_message": own})
+    assert scheduled == []
+    detail = (await client.get(f"/chat/conversations/{conv_id}", headers=h)).json()
+    assert detail["conversation"]["status"] == "human" and detail["messages"][-1]["role"] == "seller"
+
+
+async def test_test_chat_and_limits(client, monkeypatch):
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550005")
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})).json()
+    assert [m["source"] for m in r["messages"]] == ["", "welcome"]
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "مانتو دارید؟"})).json()
+    assert r["messages"][-1]["source"] == "llm" and r["messages"][-1]["input_tokens"] == 1200
+    u = (await client.get(f"/stores/{sid}/chat/usage", headers=h)).json()
+    assert u["totals"]["llm_calls"] == 0  # tests are not counted
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"reset": True})).json()
+    assert r["messages"] == []
+
+    monkeypatch.setattr(chat_agent, "chat_limit", lambda db, store: _async(1))
+    monkeypatch.setattr(chat_agent, "month_ai_messages", lambda db, sid: _async(1))
+    conv = await _real_conv(sid)
+    before = len(llm.calls)
+    from app.core.db import SessionLocal
+    async with SessionLocal() as db:
+        c = await db.get(chat_engine.ChatConversation, conv)
+        rt.add_message(db, c, role="customer", text="مانتو لینن موجوده؟")
+        await db.commit()
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True})
+    saved = await rt.answer(conv, send=False)
+    assert saved[-1].source == "limit" and len(llm.calls) == before
+
+
+class _R:
+    def __init__(self, body):
+        self.status_code, self._body, self.text = 200, body, json.dumps(body)
+
+    def json(self):
+        return self._body
+
+
+@pytest.mark.parametrize("kind", ["gemini", "openai", "anthropic"])
+async def test_tool_calls_on_each_wire_format(monkeypatch, kind):
+    from app.core.security import encrypt_credentials
+    from app.models import AiProvider
+    import httpx
+    prov = AiProvider(name="x", kind=kind, api_key_encrypted=encrypt_credentials({"api_key": "k"}),
+                      base_url="https://x.test/v1" if kind == "openai" else "")
+    model = {"gemini": "gemini-3.6-flash", "openai": "gpt-x", "anthropic": "claude-haiku-5-5"}[kind]
+    first = {
+        "gemini": {"candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "get_product", "args": {"product_id": 5}}, "thoughtSignature": "sig1"}]}}],
+            "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 5}},
+        "openai": {"choices": [{"message": {"content": None, "tool_calls": [
+            {"id": "t1", "type": "function", "function": {"name": "get_product", "arguments": '{"product_id": 5}'}}]}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 5}},
+        "anthropic": {"content": [{"type": "tool_use", "id": "t1", "name": "get_product", "input": {"product_id": 5}}],
+                      "usage": {"input_tokens": 100, "output_tokens": 5}},
+    }[kind]
+    second = {
+        "gemini": {"candidates": [{"content": {"parts": [{"text": "بله 🌸"}]}}], "usageMetadata": {}},
+        "openai": {"choices": [{"message": {"content": "بله 🌸"}}], "usage": {}},
+        "anthropic": {"content": [{"type": "text", "text": "بله 🌸"}], "usage": {}},
+    }[kind]
+    bodies, replies = [], [_R(first), _R(second)]
+
+    async def fake_post(self, url, headers=None, json=None):
+        bodies.append(__import__("copy").deepcopy(json))
+        return replies.pop(0)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    tools = [{"name": "get_product", "description": "d", "parameters": {"type": "object", "properties": {
+        "product_id": {"type": "integer"}}, "required": ["product_id"]}}]
+    msgs = [{"role": "user", "text": "سلام"}]
+    msg, tin, tout = await ai._call_tools(prov, model, "sys", msgs, tools, 0.3, 700, {})
+    assert msg["calls"] == [{"id": msg["calls"][0]["id"], "name": "get_product", "args": {"product_id": 5}}] and tin == 100
+    msgs += [msg, {"role": "tool", "results": [{"id": msg["calls"][0]["id"], "name": "get_product", "content": "#5 ..."}]}]
+    msg, *_ = await ai._call_tools(prov, model, "sys", msgs, tools, 0.3, 700, {})
+    assert msg["text"] == "بله 🌸" and not msg["calls"]
+    sent = bodies[1]
+    if kind == "gemini":
+        assert sent["contents"][1]["parts"][0]["thoughtSignature"] == "sig1"  # Gemini 3 needs its signature back
+        assert sent["contents"][2]["parts"][0]["functionResponse"]["name"] == "get_product"
+        assert sent["tools"][0]["functionDeclarations"][0]["name"] == "get_product"
+    elif kind == "openai":
+        assert sent["messages"][2]["tool_calls"][0]["id"] == "t1" and sent["messages"][3]["tool_call_id"] == "t1"
+    else:
+        assert sent["messages"][1]["content"][0]["type"] == "tool_use"
+        assert sent["messages"][2]["content"][0] == {"type": "tool_result", "tool_use_id": "t1", "content": "#5 ..."}
+        assert sent["system"][0]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_unknown_numbers():
+    known = "#12 | مانتو | 1250000 | موجودی 3\nCART: TOTAL: 2500000\n<customer>09121234567</customer>"
+    assert chat_agent.unknown_numbers("قیمت ۱٬۲۵۰٬۰۰۰ و جمع ۲,۵۰۰,۰۰۰ تومان", known) == set()
+    assert chat_agent.unknown_numbers("۱۲۵۰ هزار تومان، شماره ۰۹۱۲۱۲۳۴۵۶۷", known) == set()
+    assert chat_agent.unknown_numbers("قیمت ۹۹۰٬۰۰۰", known) == {"990000"}
 
 
 async def test_agent_settings_and_validation(client, monkeypatch):
@@ -159,166 +584,6 @@ async def _customer(bot_id, chat_id, text, msg_id, **extra):
     await rt.handle_update(bot_id, {"update_id": msg_id, "message": msg})
 
 
-async def test_full_chat_flow(client, monkeypatch):
-    h, sid, llm, p1, p2 = await _setup(client, monkeypatch, "09125550003")
-    scheduled: list[int] = []
-    monkeypatch.setattr(rt, "schedule", lambda cid: scheduled.append(cid))
-    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
-        "enabled": True, "orders_enabled": True, "welcome_message": "سلام به {store}!",
-        "payment": {"card_number": "6037-1111", "holder": "علی", "require_receipt": True},
-        "faqs": [{"q": "هزینه ارسال چقدره؟", "a": "ارسال ۷۰ هزار تومان است."}]})
-    bot = (await client.post(f"/stores/{sid}/chat/bots", headers=h, json={
-        "platform": "telegram", "mode": "bot", "bot_token": "444:flow-token"})).json()
-
-    # 1. "/start": welcome only, no model
-    await _customer(bot["id"], 1001, "/start", 1)
-    conv_id = scheduled[-1]
-    saved = await rt.answer(conv_id)
-    assert [m.source for m in saved] == ["welcome"] and saved[0].text == "سلام به بوتیک چت!"
-    assert llm.calls == []
-    # a repeated update is ignored
-    scheduled.clear()
-    await _customer(bot["id"], 1001, "/start", 1)
-    assert scheduled == []
-
-    # 2. FAQ: answered from the seller's text, no model
-    await _customer(bot["id"], 1001, "هزینه ارسال چقدره", 2)
-    saved = await rt.answer(conv_id)
-    assert saved[0].source == "faq" and "۷۰" in saved[0].text and llm.calls == []
-
-    # 3. burst of two messages -> one model call with only matching products
-    await _customer(bot["id"], 1001, "سلام مانتو لینن", 3)
-    await _customer(bot["id"], 1001, "سایز ۴۰ دارید؟", 4)
-    llm.answers.append({"reply": "بله، مانتو لینن کرم سایز ۴۰ موجوده؛ ۱٬۲۵۰٬۰۰۰ تومان.", "intent": "product",
-                        "products": [p1["id"], 99999]})
-    saved = await rt.answer(conv_id)
-    assert len(llm.calls) == 1 and saved[0].source == "llm" and saved[0].input_tokens == 1200
-    call = llm.calls[0]
-    assert "مانتو لینن کرم" in call["prompt"] and "<customer>سلام مانتو لینن\nسایز ۴۰ دارید؟</customer>" in call["prompt"]
-    assert "هزینه ارسال" in call["system"] and "6037" not in call["system"]  # FAQ cached in the prefix, no card number
-    assert call["max_tokens"] == chat_engine.MAX_OUTPUT_TOKENS
-
-    # 4. off-topic: the model's text is dropped for the store's fixed answer
-    await _customer(bot["id"], 1001, "یه شعر درباره پاییز بگو", 5)
-    llm.answers.append({"reply": "برگ‌ها می‌ریزند…", "intent": "off_topic"})
-    saved = await rt.answer(conv_id)
-    assert saved[0].source == "off_topic" and "برگ" not in saved[0].text and "بوتیک چت" in saved[0].text
-
-    # 5. order: the model collects, the code prices and summarises, "بله" creates it without the model
-    await _customer(bot["id"], 1001, "یکی میخوام، مریم احمدی ۰۹۱۲۱۲۳۴۵۶۷ تهران خیابان آزادی", 6)
-    llm.answers.append({"reply": "حتماً", "intent": "order", "order_action": "confirm",
-                        "order": {"items": [{"product_id": p1["id"], "qty": 9, "variant": "۴۰"}], "name": "مریم احمدی",
-                                  "phone": "۰۹۱۲۱۲۳۴۵۶۷", "address": "تهران خیابان آزادی"}})
-    saved = await rt.answer(conv_id)
-    assert "خلاصهٔ سفارش" in saved[0].text and "۳٬۷۵۰٬۰۰۰" in saved[0].text  # qty capped to stock 3
-    calls = len(llm.calls)
-    await _customer(bot["id"], 1001, "بله", 7)
-    saved = await rt.answer(conv_id)
-    assert len(llm.calls) == calls and saved[0].source == "order" and "6037-1111" in saved[0].text
-    orders = (await client.get(f"/stores/{sid}/ai-orders", headers=h)).json()
-    order = orders["items"][0]
-    assert order["status"] == "awaiting_payment" and order["total_toman"] == 3750000
-    assert order["customer_phone"] == "09121234567"
-
-    # 6. receipt: a tracking number completes payment without the model
-    await _customer(bot["id"], 1001, "کد پیگیری ۱۲۳۴۵۶۷۸", 8)
-    saved = await rt.answer(conv_id)
-    assert saved[0].source == "receipt" and len(llm.calls) == calls
-    order = (await client.get(f"/stores/{sid}/ai-orders", headers=h)).json()["items"][0]
-    assert order["status"] == "payment_submitted" and order["payment_ref"] == "12345678"
-    assert any(m == "sendMessage" and d.get("chat_id") == "1001" for m, d in SENT)
-
-    # seller confirms: stock goes down, customer is told
-    r = (await client.patch(f"/ai-orders/{order['id']}", headers=h, json={"status": "confirmed"})).json()
-    assert r["status"] == "confirmed"
-    assert (await client.get(f"/products/{p1['id']}", headers=h)).json()["stock_qty"] == 0
-
-    # 7. conversation history shows everything, with the order linked
-    lst = (await client.get(f"/stores/{sid}/chat/conversations", headers=h)).json()
-    assert lst["items"][0]["orders"] == 1 and lst["items"][0]["platform"] == "telegram"
-    detail = (await client.get(f"/chat/conversations/{conv_id}", headers=h)).json()
-    assert detail["orders"][0]["id"] == order["id"]
-    assert {m["source"] for m in detail["messages"] if m["role"] == "ai"} >= {"welcome", "faq", "llm", "off_topic", "order", "receipt"}
-
-    # 8. seller takes over: assistant pauses for that chat
-    r = await client.post(f"/chat/conversations/{conv_id}/messages", headers=h, json={"text": "سلام، من فروشنده‌ام"})
-    assert r.status_code == 200
-    await _customer(bot["id"], 1001, "مرسی از شما، یه سؤال دیگه هم داشتم درباره شال", 9)
-    assert await rt.answer(conv_id) == []
-    await client.post(f"/chat/conversations/{conv_id}/resume", headers=h)
-    llm.answers.append({"reply": "شال نخی مشکی الان ناموجوده.", "intent": "product", "products": [p2["id"]]})
-    saved = await rt.answer(conv_id)
-    assert saved and saved[0].source == "llm"
-
-    # 9. usage for the seller and the admin
-    u = (await client.get(f"/stores/{sid}/chat/usage", headers=h)).json()
-    t = u["totals"]
-    assert t["llm_calls"] == 4 and t["without_llm"] >= 4 and t["cached_tokens"] == 3200 and t["orders"] == 1
-    admin = await login(client, "09120000000")
-    au = (await client.get("/admin/chat/usage", headers=admin)).json()
-    assert any(s["store_id"] == sid and s["llm_calls"] == 4 for s in au["stores"])
-    ov = (await client.get(f"/stores/{sid}/chat/overview", headers=h)).json()
-    assert ov["enabled"] and ov["month"]["ai_messages"] == 4
-
-
-async def test_business_owner_message_pauses_ai(client, monkeypatch):
-    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550004")
-    scheduled: list[int] = []
-    monkeypatch.setattr(rt, "schedule", lambda cid: scheduled.append(cid))
-    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True})
-    biz = (await client.post(f"/stores/{sid}/chat/bots", headers=h, json={
-        "platform": "telegram", "mode": "business", "bot_token": "555:biz-owner"})).json()
-    await rt.handle_update(biz["id"], {"update_id": 1, "business_connection": {
-        "id": "bc9", "user": {"id": 77, "first_name": "Ali"}, "user_chat_id": 77, "is_enabled": True,
-        "rights": {"can_reply": True}}})
-    msg = {"message_id": 10, "business_connection_id": "bc9", "chat": {"id": 3003, "type": "private", "first_name": "سارا"},
-           "from": {"id": 3003, "first_name": "سارا"}, "text": "قیمت مانتو چنده؟"}
-    await rt.handle_update(biz["id"], {"update_id": 2, "business_message": msg})
-    conv_id = scheduled[-1]
-    SENT.clear()
-    llm.answers.append({"reply": "۱٬۲۵۰٬۰۰۰ تومان", "intent": "product"})
-    await rt.answer(conv_id)
-    assert all(d.get("business_connection_id") == "bc9" for m, d in SENT if m == "sendMessage")
-    # the seller types in their own chat: saved as seller, assistant goes quiet
-    own = {**msg, "message_id": 11, "from": {"id": 77, "first_name": "Ali"}, "text": "خودم جواب میدم"}
-    scheduled.clear()
-    await rt.handle_update(biz["id"], {"update_id": 3, "business_message": own})
-    assert scheduled == []
-    detail = (await client.get(f"/chat/conversations/{conv_id}", headers=h)).json()
-    assert detail["conversation"]["status"] == "human" and detail["messages"][-1]["role"] == "seller"
-
-
-async def test_test_chat_and_limits(client, monkeypatch):
-    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550005")
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})).json()
-    assert [m["source"] for m in r["messages"]] == ["", "welcome"]
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "مانتو دارید؟"})).json()
-    assert r["messages"][-1]["source"] == "llm" and r["messages"][-1]["input_tokens"] == 1200
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "می‌خوام با ادمین صحبت کنم"})).json()
-    assert r["messages"][-1]["source"] == "handoff"
-    # tests are not counted in the seller's usage
-    u = (await client.get(f"/stores/{sid}/chat/usage", headers=h)).json()
-    assert u["totals"]["llm_calls"] == 0
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"reset": True})).json()
-    assert r["messages"] == []
-    hist = (await client.get(f"/stores/{sid}/chat/test", headers=h)).json()
-    assert hist["messages"] == []
-
-    # monthly plan limit: no model call once it's used up
-    monkeypatch.setattr(chat_engine, "chat_limit", lambda db, store: _async(1))
-    monkeypatch.setattr(chat_engine, "month_ai_messages", lambda db, sid: _async(1))
-    conv = await _real_conv(sid)
-    before = len(llm.calls)
-    from app.core.db import SessionLocal
-    async with SessionLocal() as db:
-        c = await db.get(chat_engine.ChatConversation, conv)
-        rt.add_message(db, c, role="customer", text="مانتو لینن موجوده؟")
-        await db.commit()
-    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True})
-    saved = await rt.answer(conv, send=False)
-    assert saved[-1].source == "limit" and len(llm.calls) == before
-
-
 async def _async(v):
     return v
 
@@ -391,30 +656,9 @@ async def test_polling_saves_messages_and_moves_offset(client, monkeypatch):
     assert lst["items"][0]["customer_name"] == "رضا"
 
 
-async def test_catalog_reaches_the_model(client, monkeypatch):
-    """Draft (imported) and out-of-stock products are still the seller's catalog; suffixed words still match."""
-    h, sid, llm, p1, p2 = await _setup(client, monkeypatch, "09125550009")
-    from app.core.db import SessionLocal
-    from app.models import Product
-    async with SessionLocal() as db:
-        db.add(Product(store_id=sid, title="کفش اسپرت سفید", price=900000, stock_qty=0, status="draft"))
-        await db.commit()
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
-    n = len(llm.calls)
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "چه محصولاتی دارید؟"})).json()
-    # "what do you have?" is answered from the catalog itself, with no model call
-    assert len(llm.calls) == n and r["messages"][-1]["source"] == "catalog"
-    assert "مانتو لینن کرم" in r["messages"][-1]["text"] and "کفش اسپرت سفید" in r["messages"][-1]["text"]
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "یه چیز خوب پیشنهاد بده"})
-    prompt = llm.calls[-1]["prompt"]
-    assert "مانتو لینن کرم" in prompt and "کفش اسپرت سفید" in prompt
-    assert "Never say you can't see products" in llm.calls[-1]["system"]
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "کفشاتون چند؟"})
-    assert "کفش اسپرت سفید" in llm.calls[-1]["prompt"].split("PRODUCTS")[1].splitlines()[1]
-
-
 async def test_faq_extract_from_text_and_file(client, monkeypatch):
-    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550010")
+    h, sid, *_ = await _setup(client, monkeypatch, "09125550010")
+    llm = FakeLLM()
     monkeypatch.setattr("app.services.chat_faq.ai.generate_chat", llm)
     await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"faqs": [{"q": "هزینه ارسال چقدر است؟", "a": "۵۰ هزار"}]})
     llm.answers = [{"items": [{"q": "هزینه ارسال چقدر است؟", "a": "تکراری"},
@@ -437,88 +681,6 @@ async def test_faq_extract_from_text_and_file(client, monkeypatch):
     assert r.status_code == 422
 
 
-async def test_assistant_keeps_the_chat_unless_a_person_is_wanted(client, monkeypatch):
-    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550011")
-    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True})
-    conv = await _real_conv(sid)
-    from app.core.db import SessionLocal
-
-    async def say(text):
-        async with SessionLocal() as db:
-            rt.add_message(db, await db.get(chat_engine.ChatConversation, conv), role="customer", text=text)
-            await db.commit()
-        saved = await rt.answer(conv, send=False)
-        async with SessionLocal() as db:
-            return saved, (await db.get(chat_engine.ChatConversation, conv)).status
-
-    # an unsure model answer is not a handoff: the reply is sent and the assistant stays on
-    llm.answers = [{"reply": "این رو دقیق نمی‌دونم، ولی مانتو لینن موجوده.", "intent": "product", "handoff": True}]
-    saved, status = await say("جنس آستر مانتو چیه؟")
-    assert saved[-1].source == "llm" and status == "ai"
-    llm.answers = [{"reply": "", "intent": "faq", "handoff": True}]
-    saved, status = await say("پشتیبانی دارید؟")
-    assert saved[-1].text == chat_engine.NO_ANSWER_TEXT and status == "ai"
-    # a real request for a person pauses the assistant (no model call)
-    before = len(llm.calls)
-    saved, status = await say("وصلم کن به پشتیبانی")
-    assert saved[-1].source == "handoff" and status == "needs_human" and len(llm.calls) == before
-
-
-async def test_photos_variants_and_clarify(client, monkeypatch):
-    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550012")
-    from app.core.db import SessionLocal
-    from app.models import Product, ProductImage
-    async with SessionLocal() as db:
-        hoodie = Product(store_id=sid, title="هودی کلاه‌دار", price=890000, stock_qty=4,
-                         attributes={"جنس": "دورس", "برند": "X", "کشور": "ایران", "یقه": "کلاه‌دار",
-                                     "آستین": "بلند", "رنگ": "مشکی، نارنجی، طوسی", "سایز": "L، XL"})
-        db.add(hoodie)
-        await db.flush()
-        db.add_all([ProductImage(product_id=hoodie.id, url=f"/media/x/h{i}.jpg", position=i) for i in range(4)])
-        await db.commit()
-        hid = hoodie.id
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
-    llm.answers = [{"reply": "این هودی کلاه‌دار ماست 👇", "intent": "product", "products": [hid], "images": [hid]}]
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "عکس هودی رو بفرست"})).json()
-    call = llm.calls[-1]
-    # colour/size come first in the product line even with many details, and the photo count is shown
-    line = next(x for x in call["prompt"].splitlines() if x.startswith(f"#{hid} "))
-    assert "رنگ: مشکی، نارنجی، طوسی" in line and "سایز: L، XL" in line and "۴ عکس" in line
-    assert "WHICH PRODUCT" in call["system"] and "VARIANTS" in call["system"]
-    imgs = [m for m in r["messages"] if m["image_url"]]
-    assert len(imgs) == 1 and imgs[0]["image_url"] == "/media/x/h0.jpg" and "هودی کلاه‌دار" in imgs[0]["text"]
-    llm.answers = [{"reply": "بفرما", "intent": "product", "products": [hid], "images": [hid]}]
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "عکس‌های بیشتر"})).json()
-    assert len([m for m in r["messages"][-4:] if m["image_url"]]) == 3
-    assert f"LAST PRODUCT: #{hid}" in llm.calls[-1]["prompt"]
-    # the model offers a photo but the customer did not ask: no photo yet
-    llm.answers = [{"reply": "بله موجوده، عکسش رو بفرستم؟", "intent": "product", "images": [hid]}]
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "موجوده؟"})).json()
-    assert not any(m["image_url"] for m in r["messages"][-2:])
-    # an id the model made up gets no photo
-    llm.answers = [{"reply": "بفرما", "intent": "product", "images": [99999]}]
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "عکسشو ببینم"})).json()
-    assert not any(m["image_url"] for m in r["messages"][-2:])
-
-
-async def test_answer_rules_and_stock_only_available(client, monkeypatch):
-    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550013")
-    r = await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"answer_policy": {
-        "stock": "available", "rules": ["  تخفیف نده  ", "", "به رقبا اشاره نکن"]}})
-    assert r.json()["answer_policy"] == {"stock": "available", "rules": ["تخفیف نده", "به رقبا اشاره نکن"]}
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
-    llm.answers = [{"reply": "بله، فقط ۳ تا ازش مونده 🌸", "intent": "product"}]
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "مانتو لینن موجوده؟"})).json()
-    call = llm.calls[-1]
-    assert "1. تخفیف نده" in call["system"] and "2. به رقبا اشاره نکن" in call["system"]
-    assert "مانتو لینن کرم" in call["prompt"] and "موجودی" not in call["prompt"].split("RECENT CHAT")[0] and "| موجود |" in call["prompt"]
-    assert r["messages"][-1]["text"] == "بله، موجوده 🌸"
-    # default: exact numbers
-    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"answer_policy": {"stock": "exact", "rules": []}})
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "مانتو لینن موجوده؟"})
-    assert "موجودی 3" in llm.calls[-1]["prompt"] and "SELLER RULES (obey" not in llm.calls[-1]["system"]
-
-
 async def test_generate_chat_survives_prose_and_cut_json(client, monkeypatch):
     admin = await login(client, "09120000000")
     prov = (await client.post("/admin/ai/providers", headers=admin, json={
@@ -536,46 +698,6 @@ async def test_generate_chat_survives_prose_and_cut_json(client, monkeypatch):
     out, usage = await ai.generate_chat(system="s", prompt="p", store_id=None)
     assert out["reply"] == "بله موجوده" and usage["input_tokens"] == 200
     assert temps[0] <= ai.CHAT_MAX_TEMPERATURE and temps[1] == 0.0
-
-
-async def test_real_conversation_from_the_screenshots(client, monkeypatch):
-    """ali's test: forwarded hoodie post, "موجوده؟", sizes, "similar?" — with a model that fails once and mixes languages."""
-    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550014")
-    from app.core.db import SessionLocal
-    from app.models import Product
-    async with SessionLocal() as db:
-        hoodie = Product(store_id=sid, title="هودی کلاهدار قهوه‌ای با درزهای عمودی", price=100000, stock_qty=2,
-                         category_hint="هودی", attributes={"رنگ": "قهوه‌ای", "برش": "گشاد"})
-        other = Product(store_id=sid, title="هودی زیپ‌دار مشکی", price=980000, stock_qty=1, category_hint="هودی")
-        db.add_all([hoodie, other])
-        await db.commit()
-        hid, oid = hoodie.id, other.id
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
-    # the forwarded post names the hoodie: it becomes LAST PRODUCT even before the model says so
-    llm.answers = [{"reply": "این هودی قهوه‌ای کلاهدار ماست 🌸", "intent": "product"}]
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={
-        "text": "هودی کلاهدار به رنگ قهوه‌ای شکلاتی با برش گشاد و آستین بلند. درزهای عمودی"})
-
-    # the model fails once: a true answer about that hoodie, not "a colleague will answer"
-    async def boom(**kw):
-        raise ai.AIError("پاسخ هوش مصنوعی قابل خواندن نبود.", code="ai_bad_json")
-    monkeypatch.setattr(chat_engine.ai, "generate_chat", boom)
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "موجوده؟"})).json()
-    text = r["messages"][-1]["text"]
-    assert "هودی کلاهدار قهوه‌ای" in text and "موجوده" in text and "۱۰۰٬۰۰۰" in text and "همکارم" not in text
-    monkeypatch.setattr(chat_engine.ai, "generate_chat", llm)
-
-    # mixed-language answer: asked again once, then cleaned
-    llm.answers = [{"reply": "unfortunately سایزبندی ثبت نشده確認", "intent": "product"},
-                   {"reply": "سایزبندی ثبت نشده، ولی برشش گشاده 🌸 unfortunately", "intent": "product"}]
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سایزبندیش چیه؟"})).json()
-    assert r["messages"][-1]["text"] == "سایزبندی ثبت نشده، ولی برشش گشاده 🌸"
-    assert "Persian only" in llm.calls[-1]["prompt"]
-
-    # "similar?" brings the other hoodie into PRODUCTS
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "چی دیگه دارین مشابه؟"})
-    prompt = llm.calls[-1]["prompt"]
-    assert f"#{oid} " in prompt and f"LAST PRODUCT: #{hid}" in prompt
 
 
 class _Resp:
@@ -630,714 +752,3 @@ async def test_openai_compatible_retries_an_answer_lost_to_reasoning(monkeypatch
     monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
     text, *_ = await ai._call(prov, "deepseek-flash", "s", "p", [], 0.3, max_tokens=700)
     assert text == '{"reply":"سلام"}' and caps == [700, 4096]
-
-
-async def test_photo_of_the_named_product_and_yes_to_a_photo_offer(client, monkeypatch):
-    """ali's run: "photos of the brown hoodie" sent the black octopus one; "ارهه" to "send its photo?" got nothing."""
-    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550015")
-    from app.core.db import SessionLocal
-    from app.models import Product, ProductImage
-    async with SessionLocal() as db:
-        brown = Product(store_id=sid, title="هودی کلاهدار قهوه‌ای", price=100000, stock_qty=2)
-        octo = Product(store_id=sid, title="هودی اختاپوس", price=0, stock_qty=1)
-        sully = Product(store_id=sid, title="هودی سالیوان", price=890000, stock_qty=3)
-        db.add_all([brown, octo, sully])
-        await db.flush()
-        db.add_all([ProductImage(product_id=p.id, url=f"/media/x/{p.id}.jpg") for p in (brown, octo, sully)])
-        await db.commit()
-        b, o, s = brown.id, octo.id, sully.id
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
-    llm.answers = [{"reply": "عالیه 🌸 عکس‌های هودی قهوه‌ای رو ببینید.", "intent": "product", "images": [o]}]
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "عکس هودی قهوه‌ای رو بفرست"})).json()
-    imgs = [m for m in r["messages"] if m["image_url"]]
-    assert [m["image_url"] for m in imgs] == [f"/media/x/{b}.jpg"] and imgs[0]["text"] == "هودی کلاهدار قهوه‌ای — ۱۰۰٬۰۰۰ تومان"
-
-    llm.answers = [{"reply": "بله هودی سالیوان رو داریم 🌸 عکسش رو بفرستم؟", "intent": "product", "products": [s]}]
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "هودی با طرح سالیوان؟"})
-    before = len(llm.calls)
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "ارهه"})).json()
-    assert len(llm.calls) == before  # no model call for "yes"
-    assert r["messages"][-1]["image_url"] == f"/media/x/{s}.jpg" and r["messages"][-1]["text"] == "هودی سالیوان — ۸۹۰٬۰۰۰ تومان"
-    # a photo of a product without a price has no "unknown price" caption
-    llm.answers = [{"reply": "بفرما", "intent": "product", "images": [o]}]
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "عکس هودی اختاپوس"})).json()
-    assert r["messages"][-2]["text"] == "هودی اختاپوس" and r["messages"][-1]["text"] == "بفرما"  # photo first, then words
-
-
-async def test_busy_buyer_is_not_handed_over(client, monkeypatch):
-    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550016")
-    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True})
-    conv = await _real_conv(sid)
-    from app.core.db import SessionLocal
-    for i in range(12):  # the old limit (10 in 10 minutes) handed this chat to the admin
-        async with SessionLocal() as db:
-            rt.add_message(db, await db.get(chat_engine.ChatConversation, conv), role="customer", text=f"مانتو لینن سایز {i}؟")
-            await db.commit()
-        saved = await rt.answer(conv, send=False)
-        assert saved[-1].source == "llm"
-    async with SessionLocal() as db:
-        assert (await db.get(chat_engine.ChatConversation, conv)).status == "ai"
-
-
-async def test_size_chart_offer_waits_for_yes(client, monkeypatch):
-    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550017")
-    from app.core.db import SessionLocal
-    from app.models import ChatReference
-    async with SessionLocal() as db:
-        ref = ChatReference(store_id=sid, title="راهنمای سایز", text="جدول سایز: M=۱۰۰ L=۱۰۴")
-        db.add(ref)
-        await db.commit()
-        rid = ref.id
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
-    llm.answers = [{"reply": "برشش گشاده 🌸 راهنمای سایز رو براتون بفرستم؟", "intent": "product", "refs": [rid]}]
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سایز مانتو لینن چطوره؟"})).json()
-    assert "جدول سایز" not in r["messages"][-1]["text"]
-    before = len(llm.calls)
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "آره لطفا"})).json()
-    assert len(llm.calls) == before and r["messages"][-1]["text"] == "جدول سایز: M=۱۰۰ L=۱۰۴"
-    # asked directly: the chart comes with the answer
-    llm.answers = [{"reply": "اینم جدول سایز 🌸", "intent": "faq", "refs": [rid]}]
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "جدول سایزتون رو بفرست"})).json()
-    assert r["messages"][-1]["text"] == "جدول سایز: M=۱۰۰ L=۱۰۴"
-
-
-async def test_swapped_product_keeps_size_and_ok_is_not_a_photo_request(client, monkeypatch):
-    h, sid, llm, p1, p2 = await _setup(client, monkeypatch, "09125550018")
-    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
-        "orders_enabled": True, "payment": {"card_number": "6037991234567890"}})
-    from app.core.db import SessionLocal
-    from app.models import ProductImage
-    async with SessionLocal() as db:
-        db.add(ProductImage(product_id=p1["id"], url="/media/x/m.jpg"))
-        await db.commit()
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام وقت بخیر"})
-    assert llm.calls == []  # a longer greeting is still a greeting
-    llm.answers = [{"reply": "ثبت شد", "intent": "order", "products": [p1["id"]], "images": [p1["id"]],
-                    "order": {"items": [{"product_id": p1["id"], "qty": 1, "variant": "XL"}]}, "order_action": "update"}]
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "اوکی مانتو لینن سایز XL"})).json()
-    assert not any(m["image_url"] for m in r["messages"][-2:])
-    llm.answers = [{"reply": "عوض شد", "intent": "order",
-                    "order": {"items": [{"product_id": p2["id"], "qty": 1}]}, "order_action": "update"}]
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "نه بجاش شال نخی"})
-    async with SessionLocal() as db:
-        from sqlalchemy import select
-        conv = (await db.execute(select(chat_engine.ChatConversation).where(
-            chat_engine.ChatConversation.store_id == sid, chat_engine.ChatConversation.is_test))).scalars().first()
-        assert conv.state["order"]["items"] == [{"product_id": p2["id"], "qty": 1, "variant": "XL"}]
-
-
-async def _order_ready(client, h, sid, llm, p1, extra_items=None):
-    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
-        "orders_enabled": True, "payment": {"card_number": "6037991234567890"}})
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"reset": True})
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
-    items = [{"product_id": p1["id"], "qty": 1, "variant": "L"}] + (extra_items or [])
-    llm.answers = [{"reply": "", "intent": "order", "order_action": "confirm", "order": {
-        "items": items, "name": "سارا کریمی", "phone": "09171234567", "address": "شیراز، معالی آباد"}}]
-    return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "همین رو ثبت کن"})).json()
-
-
-async def test_order_yes_variants_payment_ref_and_duplicates(client, monkeypatch):
-    """From two long buyer chats: "بله تایید"/"تایید" re-showed the summary, a payment reference sent before
-    the yes was lost, and the model listed one item twice."""
-    h, sid, llm, p1, p2 = await _setup(client, monkeypatch, "09125550019")
-    r = await _order_ready(client, h, sid, llm, p1, [{"product_id": p1["id"], "qty": 1, "variant": "L"}])
-    assert "× ۱ " in r["messages"][-1]["text"] and r["messages"][-1]["text"].count("مانتو لینن کرم") == 1
-    before = len(llm.calls)
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "بله تایید"})).json()
-    assert r["messages"][-1]["source"] == "order" and len(llm.calls) == before
-
-    await _order_ready(client, h, sid, llm, p1)
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "کارت به کارت کردم، شماره پیگیری ۵۵۱۲۰۹۸۸"})).json()
-    assert r["messages"][-1]["source"] == "receipt"
-    orders = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
-    rows = orders.get("items", orders) if isinstance(orders, dict) else orders
-    assert any(o.get("payment_ref") == "55120988" and o["status"] == "payment_submitted" for o in rows)
-
-
-async def test_declined_chart_is_not_sent_later(client, monkeypatch):
-    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550020")
-    from app.core.db import SessionLocal
-    from app.models import ChatReference
-    async with SessionLocal() as db:
-        ref = ChatReference(store_id=sid, title="جدول سایز بندی", text="جدول: M L XL")
-        db.add(ref)
-        await db.commit()
-        rid = ref.id
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
-    llm.answers = [{"reply": "برای شما M مناسبه. جدول سایز رو بفرستم؟", "intent": "product", "refs": [rid]}]
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "چه سایزی بگیرم؟"})
-    llm.answers = [{"reply": "باشه، M براتون مناسبه.", "intent": "product", "refs": [rid]}]
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "نه جدول نمیخوام، خودت بگو"})).json()
-    assert "جدول: M L XL" not in [m["text"] for m in r["messages"]]
-    llm.answers = [{"reply": "ثبت شد", "intent": "order", "refs": [rid]}]
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سایز M مشکی برای من"})).json()
-    assert "جدول: M L XL" not in [m["text"] for m in r["messages"]]
-    llm.answers = [{"reply": "بفرمایید", "intent": "faq", "refs": [rid]}]
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "راستی جدول سایز رو بفرست"})).json()
-    assert r["messages"][-1]["text"] == "جدول: M L XL"
-
-
-async def test_custom_print_shop_collects_the_design_and_codes(client, monkeypatch):
-    """A hoodie shop that prints the customer's own design: the picture goes on the order; product codes work."""
-    h, sid, llm, p1, p2 = await _setup(client, monkeypatch, "09125550021")
-    r = await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
-        "orders_enabled": True, "payment": {"card_number": "6037991234567890"},
-        "order_fields": [{"label": "طرح چاپ", "kind": "image", "required": True, "hint": "عکس یا فایل طرح"},
-                         {"label": "متن روی لباس", "kind": "text", "required": False}, {"label": ""}]})
-    assert [f["label"] for f in r.json()["order_fields"]] == ["طرح چاپ", "متن روی لباس"]
-    await client.patch(f"/products/{p1['id']}", headers=h, json={"sku": "H12"})
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
-    llm.answers = [{"reply": "مانتو لینن کرم با کد H12 🌸", "intent": "product", "products": [p1["id"]]}]
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "کد h12 رو میخوام"})
-    call = llm.calls[-1]
-    assert "EXTRA ORDER FIELDS" in call["system"] and "طرح چاپ (image, required)" in call["system"]
-    assert f"#{p1['id']} | مانتو لینن کرم (کد H12)" in call["prompt"]
-    # all usual fields known but no design yet: no confirm
-    llm.answers = [{"reply": "", "intent": "order", "order_action": "confirm", "order": {
-        "items": [{"product_id": p1["id"], "qty": 1, "variant": "L"}], "name": "نیما", "phone": "09120000001",
-        "address": "مشهد", "extras": {"متن روی لباس": "NIMA", "ناشناخته": "x"}}}]
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "ثبتش کن"})).json()
-    assert "خلاصهٔ سفارشت" not in r["messages"][-1]["text"]
-    # the customer sends the design picture: it lands on the order and the model is told so
-    from app.core.db import SessionLocal
-    from sqlalchemy import select
-    async with SessionLocal() as db:
-        conv = (await db.execute(select(chat_engine.ChatConversation).where(
-            chat_engine.ChatConversation.store_id == sid, chat_engine.ChatConversation.is_test))).scalars().first()
-        rt.add_message(db, conv, role="customer", text="", image_url="/media/x/design.png")
-        await db.commit()
-        cid = conv.id
-    llm.answers = [{"reply": "", "intent": "order", "order_action": "confirm"}]
-    saved = await rt.answer(cid, send=False)
-    assert "طرح چاپ" in llm.calls[-1]["prompt"] and "خلاصهٔ سفارشت" in saved[-1].text
-    assert "📝 طرح چاپ: ✔️ عکس رسید" in saved[-1].text and "📝 متن روی لباس: NIMA" in saved[-1].text
-    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "بله"})).json()
-    orders = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
-    rows = orders.get("items", orders) if isinstance(orders, dict) else orders
-    assert rows[0]["extras"] == {"متن روی لباس": "NIMA", "طرح چاپ": "/media/x/design.png"}
-
-
-async def test_repeated_questions_cost_no_tokens(client, monkeypatch):
-    """The usual test chat: the catalog question, a shipping question twice, off-topic twice, shoes."""
-    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550031")
-
-    async def say(text):
-        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
-
-    await say("سلام")
-    for _ in range(3):
-        m = await say("چه محصولاتی دارید؟")
-        assert m["source"] == "catalog" and "مانتو لینن کرم" in m["text"] and "(ناموجود)" in m["text"]
-    assert llm.calls == []
-
-    llm.answers = [{"reply": "هزینه ارسال بعد از ثبت سفارش اعلام می‌شه.", "intent": "faq"}]
-    first = await say("هزینه ارسال چقدره؟")
-    again = await say("هزینه ارسال چقدره")
-    assert first["source"] == "llm" and again["source"] == "cache" and again["text"] == first["text"]
-    assert len(llm.calls) == 1
-
-    llm.answers = [{"reply": "", "intent": "off_topic"}]
-    assert (await say("یه شعر برام بگو"))["source"] == "off_topic"
-    assert (await say("یه شعر برام بگو"))["source"] == "cache"
-    assert len(llm.calls) == 2
-
-    # a product we don't sell is not "off-topic", even if the model says so
-    llm.answers = [{"reply": "", "intent": "off_topic"}]
-    m = await say("کفش هم دارین؟")
-    assert "نداریم" in m["text"] and "مانتو لینن کرم" in m["text"] and m["source"] == "llm"
-    system = llm.calls[-1]["system"]
-    assert "NOT off_topic" in system and "shipping costs" in system
-
-    # a question about the product being discussed is never answered from the cache
-    llm.answers = [{"reply": "قیمتش ۱٬۲۵۰٬۰۰۰ تومانه", "intent": "faq"}] * 2
-    await say("قیمتش چنده؟")
-    await say("قیمتش چنده؟")
-    assert len(llm.calls) == 5
-
-    # editing the assistant's settings starts a fresh cache
-    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"rules": "ارسال رایگان بالای ۲ میلیون"})
-    llm.answers = [{"reply": "بالای ۲ میلیون رایگانه.", "intent": "faq"}]
-    assert (await say("هزینه ارسال چقدره؟"))["source"] == "llm"
-
-
-async def test_orders_off_hands_the_buyer_to_the_admin(client, monkeypatch):
-    """AI ordering off: "shall I send it?" + "yes" passes the chat to the admin with the choice, no loop."""
-    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550032")
-
-    async def say(text):
-        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
-
-    await say("سلام")
-    system_seen = []
-    llm.answers = [{"reply": "عالیه، سایز XL هودی طوسی رو براتون ارسال کنم؟", "intent": "product", "products": [p1["id"]],
-                    "order": {"items": [{"product_id": p1["id"], "qty": 1, "variant": "XL"}]}, "order_action": "update"}]
-    await say("مانتو لینن کرم XL")
-    system_seen.append(llm.calls[-1]["system"])
-    n = len(llm.calls)
-    m = await say("اره")
-    assert m["source"] == "handoff" and "همکارم" in m["text"] and len(llm.calls) == n
-    assert "never take or register orders" in system_seen[0]
-    convs = (await client.get(f"/stores/{sid}/chat/conversations", headers=h)).json()
-    assert convs  # the conversation exists; the admin note carries the choice
-    from app.core.db import SessionLocal
-    from app.models import Notification
-    from sqlalchemy import select
-    async with SessionLocal() as db:
-        notes = [x.title_fa + x.body_fa for x in (await db.execute(select(Notification).where(
-            Notification.store_id == sid))).scalars()]
-    assert any("مانتو لینن کرم" in t and "XL" in t for t in notes), notes
-
-    # the model says the customer wants to buy: same hand-over
-    llm.answers = [{"reply": "", "intent": "order", "order": {"items": [{"product_id": p1["id"], "qty": 1}]},
-                    "order_action": "confirm"}]
-    m = await say("همینو می‌خوام بخرم")
-    assert m["source"] == "handoff" and m["intent"] == "order"
-
-    assert (await say("ادمین اصلی کجاس"))["source"] == "handoff"
-    llm.answers = [{"reply": "باشه 🌸", "intent": "product"}]
-    assert (await say("باشه"))["source"] == "llm"  # "ok" is not "thanks"
-
-
-async def test_adding_to_a_paid_order_asks_only_for_the_rest(client, monkeypatch):
-    """ali's chat: ordered, sent the receipt, then "add another hoodie" — the bot must ask for the new amount only."""
-    h, sid, llm, p1, p2 = await _setup(client, monkeypatch, "09125550033")
-
-    async def say(text):
-        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
-
-    await _order_ready(client, h, sid, llm, p1)
-    assert (await say("بله"))["source"] == "order"
-    assert (await say("56455561561561"))["source"] == "receipt"
-
-    llm.answers = [{"reply": "", "intent": "order", "order_action": "confirm",
-                    "order": {"items": [{"product_id": p1["id"], "qty": 1, "variant": "M"}]}}]
-    m = await say("همون مدل سایز M رو هم اضافه کن")
-    assert "PLACED ORDER #" in llm.calls[-1]["prompt"] and "paid" in llm.calls[-1]["prompt"]
-    assert "اضافه به سفارش" in m["text"] and "۱٬۲۵۰٬۰۰۰" in m["text"] and "سارا" not in m["text"]
-    m = await say("بله")
-    assert "اضافه شد" in m["text"] and "۱٬۲۵۰٬۰۰۰" in m["text"] and "2,500" not in m["text"]
-
-    # "thanks" while the addition is unpaid: a payment reminder, not just "you're welcome"
-    m = await say("مرسی")
-    assert "پرداخت" in m["text"] and "۱٬۲۵۰٬۰۰۰" in m["text"]
-
-    orders = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
-    rows = orders.get("items", orders) if isinstance(orders, dict) else orders
-    o = rows[0]
-    assert len(o["items"]) == 2 and [i["paid"] for i in o["items"]] == [True, False]
-    assert o["total_toman"] == 2500000 and o["due_toman"] == 1250000 and o["status"] == "awaiting_payment"
-
-    assert (await say("کد پیگیری ۷۷۸۸۹۹۰۰"))["source"] == "receipt"
-    rows = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
-    rows = rows.get("items", rows) if isinstance(rows, dict) else rows
-    assert rows[0]["due_toman"] == 0 and all(i["paid"] for i in rows[0]["items"])
-
-
-async def test_order_form_and_address_is_not_off_topic(client, monkeypatch):
-    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550034")
-    form = "برای ثبت سفارش این‌ها رو بفرست 🌸\nنام:\nموبایل:\nآدرس:"
-    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
-        "orders_enabled": True, "payment": {"card_number": "6037991234567890", "order_form": form}})
-
-    async def say(text):
-        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
-
-    await say("سلام")
-    llm.answers = [{"reply": "عالیه، لطفاً نام و شماره تماستون رو بفرمایید.", "intent": "order", "order_action": "update",
-                    "order": {"items": [{"product_id": p1["id"], "qty": 1, "variant": "XL"}]}}]
-    assert (await say("اره همینو میخوام"))["text"] == form
-    n = len(llm.calls)
-    # the filled-in form is read in code: summary with no model call
-    m = await say("نام: علی رضایی\nموبایل: ۰۹۱۲۳۳۳۳۴۳۴\nآدرس: قم خیابان صفاییه کوچه ۱۲")
-    assert len(llm.calls) == n and "خلاصهٔ سفارشت" in m["text"]
-    assert "علی رضایی" in m["text"] and "09123333434" in m["text"] and "قم خیابان صفاییه" in m["text"]
-    assert (await say("بله"))["source"] == "order"
-
-
-async def test_contact_details_one_by_one_without_the_model(client, monkeypatch):
-    """ali's chat without a form: the phone, then the address that the model had called off-topic."""
-    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550035")
-    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
-        "orders_enabled": True, "payment": {"card_number": "6037991234567890"}})
-
-    async def say(text):
-        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
-
-    await say("سلام")
-    llm.answers = [{"reply": "عالیه. لطفا نام و شماره تماستون رو بفرمایید.", "intent": "order", "order_action": "update",
-                    "order": {"items": [{"product_id": p1["id"], "qty": 1, "variant": "2XL"}]}}]
-    await say("اره")
-    n = len(llm.calls)
-    m = await say("09123333434")
-    assert "نام و نام خانوادگی" in m["text"] and "آدرس کامل" in m["text"]
-    m = await say("علی")
-    assert "آدرس کامل" in m["text"] and "نام" not in m["text"]
-    m = await say("قم حشیسب ب شسیب سشیب")
-    assert "خلاصهٔ سفارشت" in m["text"] and "👤 علی" in m["text"] and "📍 قم حشیسب" in m["text"]
-    assert len(llm.calls) == n
-
-    # a question in the middle still goes to the model
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"reset": True})
-    await say("سلام")
-    llm.answers = [{"reply": "لطفاً آدرس رو بفرستید.", "intent": "order", "order_action": "update",
-                    "order": {"items": [{"product_id": p1["id"], "qty": 1}], "name": "علی", "phone": "09123333434"}}]
-    await say("ثبت کن")
-    n = len(llm.calls)
-    await say("هزینه ارسال به قم چقدره؟")
-    assert len(llm.calls) == n + 1
-
-
-async def test_order_tracking_code_and_status_without_the_model(client, monkeypatch):
-    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550036")
-
-    async def say(text):
-        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
-
-    # no order yet: a pre-purchase delivery question still goes to the assistant
-    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
-        "orders_enabled": True, "payment": {"card_number": "6037991234567890"}})
-    await say("سلام")
-    n = len(llm.calls)
-    await say("اگه الان خرید کنم کی میرسه؟")
-    assert len(llm.calls) == n + 1
-    m = await say("ی سفارش قبلا زدم وضعیتش چیه؟")
-    assert m["source"] == "status" and "کد رهگیری" in m["text"] and len(llm.calls) == n + 1
-    assert "Never say an order is placed" in llm.calls[-1]["system"]
-
-    await _order_ready(client, h, sid, llm, p1)
-    m = await say("بله")
-    code = re.search(r"S\d{7}", m["text"]).group()
-    n = len(llm.calls)
-    m = await say("وضعیت سفارشم رو بگو کجاس")
-    assert m["source"] == "status" and "منتظر پرداخت" in m["text"] and code in m["text"] and "مانتو لینن کرم" in m["text"]
-    assert "آبان" in m["text"] or "۱۴۰" in m["text"]
-    assert len(llm.calls) == n
-    # sending the tracking code while the receipt is awaited is a lookup, not a payment reference
-    m = await say(code)
-    assert m["source"] == "status"
-    assert (await say("کد پیگیری پرداخت ۵۵۱۲۰۹۸۸"))["source"] == "receipt"
-    assert "فیش رسیده" in (await say("سفارشم چی شد؟"))["text"]
-
-    # a new chat finds it only by the tracking code
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"reset": True})
-    await say("سلام")
-    m = await say("وضعیت سفارشم")
-    assert "S1234567" in m["text"]
-    m = await say(f"کدش {code}")
-    assert "فیش رسیده" in m["text"]
-    m = await say("S0000000")
-    assert "پیدا نکردم" in m["text"]
-    orders = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
-    rows = orders.get("items", orders) if isinstance(orders, dict) else orders
-    assert rows[0]["tracking_code"] == code
-
-
-async def test_name_phone_and_address_on_one_line(client):
-    agent = chat_engine.ChatAgent(required_fields={})
-    for text, name, address in (
-            ("سارا محمدی ۰۹۱۲۳۴۵۶۷۸۹ تهران خیابان ولیعصر کوچه بهار پلاک ۱۲", "سارا محمدی", "تهران خیابان ولیعصر کوچه بهار پلاک ۱۲"),
-            ("شیراز، بلوار زند، کوچه ۸ پلاک ۴ - 0935 111 2233 - مریم رضایی", "مریم رضایی", "شیراز، بلوار زند، کوچه ۸ پلاک ۴"),
-            ("علی کریمی، ۰۹۱۲۱۱۱۲۲۳۳، قم صفاییه", "علی کریمی", "قم صفاییه")):
-        state = {"order": {"items": [{"product_id": 1, "qty": 1}]}}
-        chat_engine.parse_contact(agent, state, text)
-        assert (state["order"]["name"], state["order"]["address"]) == (name, address), text
-        assert state["order"]["phone"].startswith("09")
-
-
-async def _notes(sid):
-    from sqlalchemy import select
-    from app.core.db import SessionLocal
-    from app.models import Notification
-    async with SessionLocal() as db:
-        return [n.title_fa for n in (await db.execute(select(Notification).where(Notification.store_id == sid)
-                                                      .order_by(Notification.id))).scalars()]
-
-
-async def test_second_order_after_a_confirmed_one_runs_the_order_steps(client, monkeypatch):
-    """ali's chat: order #1 paid and confirmed by the seller, then "a hoodie too, 2XL, you choose": the model wrote
-    «ثبت شد» and nothing was saved. Now the summary (with the earlier contact details) and the yes create order #2."""
-    h, sid, llm, p1, p2 = await _setup(client, monkeypatch, "09125550041")
-
-    async def say(text):
-        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
-
-    await _order_ready(client, h, sid, llm, p1)
-    assert (await say("بله"))["source"] == "order"
-    assert (await say("فیش ۱۲۸۲۹۲۹۸۲۸۲۹۲"))["source"] == "receipt"
-    rows = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
-    rows = rows.get("items", rows) if isinstance(rows, dict) else rows
-    r = await client.patch(f"/ai-orders/{rows[0]['id']}", headers=h, json={"status": "confirmed"})
-    assert r.status_code == 200, r.text
-
-    llm.answers = [{"reply": "ست هودی رو براتون در نظر گرفتم. سایز ۲XL ثبت شد.", "intent": "order",
-                    "order_action": "update", "order": {"items": [{"product_id": p1["id"], "qty": 1, "variant": "2XL"}]}}]
-    m = await say("خودت انتخاب کن")
-    assert "خلاصهٔ سفارشت" in m["text"] and "ثبت شد" not in m["text"]
-    assert "سارا کریمی" in m["text"] and "شیراز" in m["text"] and "2XL" in m["text"]
-    m = await say("بله")
-    assert m["source"] == "order" and "ثبت شد" in m["text"] and "6037991234567890" in m["text"]
-    rows = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
-    rows = rows.get("items", rows) if isinstance(rows, dict) else rows
-    assert len(rows) == 2
-
-    # "ثبت شد" with no item at all is not left standing either
-    llm.answers = [{"reply": "سفارشتون ثبت شد.", "intent": "order"}]
-    assert "ثبت شد" not in (await say("یه دونه دیگه هم میخوام"))["text"]
-
-
-async def test_a_new_customer_whose_order_the_model_claims_gets_asked_for_details(client, monkeypatch):
-    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550042")
-    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
-        "orders_enabled": True, "payment": {"card_number": "6037991234567890"}})
-
-    async def say(text):
-        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
-
-    await say("سلام")
-    llm.answers = [{"reply": "سایز L ثبت شد.", "intent": "order", "order_action": "update",
-                    "order": {"items": [{"product_id": p1["id"], "qty": 1, "variant": "L"}]}}]
-    m = await say("L بزار برام")
-    assert "ثبت شد" not in m["text"] and "نام و نام خانوادگی" in m["text"] and "آدرس کامل" in m["text"]
-    n = len(llm.calls)
-    m = await say("سید علی هانی\n۰۹۱۲۳۳۳۴۴۵۵\nقم دورشهر کوچه ۲ کد پستی هم ۲۲۲۳۳۴۵۶۱۲")
-    assert "خلاصهٔ سفارشت" in m["text"] and "۲۲۲۳۳۴۵۶۱۲" in m["text"] and len(llm.calls) == n
-
-
-def test_postal_code_stays_in_the_address():
-    agent = chat_engine.ChatAgent(required_fields={})
-    for text, address in (
-            ("سید علی هانی\n۰۹۱۲۳۳۳۴۴۵۵\nقم دورشهر کوچه ۲ کد پستی هم ۲۲۲۳۳۴۵۶۱۲", "قم دورشهر کوچه ۲ کد پستی هم ۲۲۲۳۳۴۵۶۱۲"),
-            ("علی ۰۹۱۲۱۱۱۲۲۳۳ قم صفاییه کدپستی 3713645891", "قم صفاییه کدپستی 3713645891")):
-        state = {"order": {"items": [{"product_id": 1, "qty": 1}]}}
-        chat_engine.parse_contact(agent, state, text)
-        assert state["order"]["address"] == address and state["order"]["phone"] in ("09123334455", "09121112233")
-
-
-def test_abuse_words():
-    for bad in ("کسکش", "خفه شو بابا", "مرتیکه جاکش", "خر خودتی", "بیشعورا", "کس ننه"):
-        assert chat_engine.is_abusive(bad), bad
-    for ok in ("کسی هست جواب بده؟", "خرید کنم", "چرم گوساله داره؟", "هیچ کس جواب نمیده", "خریدم", "کیف چرم",
-               "کرم پودر دارید", "اینو با کسب و کارم میخوام", "طرح حیوانات"):
-        assert not chat_engine.is_abusive(ok), ok
-
-
-async def test_swearing_is_reported_and_complaints_go_to_the_admin(client, monkeypatch):
-    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550043")
-    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True})
-
-    async def say(text):
-        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
-
-    await say("سلام")
-    n = len(llm.calls)
-    m = await say("مرتیکه کسکش جواب بده")
-    assert m["intent"] == "abuse" and "محترمانه" in m["text"] and len(llm.calls) == n
-    await say("کثافت")  # a second one within minutes: answered, not reported again
-    notes = await _notes(sid)
-    assert sum("فحاشی" in t for t in notes) == 1
-    # one the list misses: the model marks it
-    llm.answers = [{"reply": "", "intent": "abuse"}]
-    assert (await say("خیلی بی‌مصرفی"))["intent"] == "abuse"
-
-    # a complaint the FAQ can't settle: the admin is told and takes the chat
-    llm.answers = [{"reply": "متاسفم", "intent": "handoff", "handoff": True, "handoff_reason": "complaint"}]
-    m = await say("دو هفته‌ست منتظرم هیچکس جواب درست نمیده")
-    assert m["source"] == "handoff" and "ادمین" in m["text"]
-    assert any("شکایت" in t for t in await _notes(sid))
-    conv = (await client.get(f"/stores/{sid}/chat/test", headers=h)).json()
-    assert conv["state"] is not None
-
-    # the model answered as a product question, but it's plainly a complaint
-    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"reset": True})
-    await say("سلام")
-    llm.answers = [{"reply": "این مانتو لینن کرمه.", "intent": "product"}]
-    assert (await say("مانتو که فرستادین پاره رسید"))["source"] == "handoff"
-
-
-async def test_a_long_faq_is_sent_a_few_entries_at_a_time(client, monkeypatch):
-    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550044")
-    faqs = [{"q": f"سوال شماره {i} دربارهٔ موضوع {i}", "a": "جواب طولانی " * 20} for i in range(12)]
-    faqs.append({"q": "ارسال با چی انجام میشه؟", "a": "ارسال فقط با تیپاکس، دوشنبه و چهارشنبه."})
-    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True, "faqs": faqs})
-
-    async def say(text):
-        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
-
-    await say("سلام")
-    await say("کی برام ارسال میشه به دستم میرسه")
-    call = llm.calls[-1]
-    assert "تیپاکس" in call["prompt"] and "تیپاکس" not in call["system"]
-    assert "جواب طولانی" not in call["system"] and call["prompt"].count("جواب طولانی جواب") <= chat_engine.FAQ_PER_TURN
-
-
-async def test_simple_product_turns_and_first_order_steps_need_no_model(client, monkeypatch):
-    """ali's chat again: «سایزبندی؟», «موجوده؟», «میخوام سفارش بدم», «۳۸» each took a model call; now code answers."""
-    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550045")
-    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
-        "enabled": True, "orders_enabled": True, "payment": {"card_number": "6037991234567890"}})
-    jeans = (await client.post(f"/stores/{sid}/products", headers=h, json={
-        "title": "شلوار جین مام فیت زنانه طوسی", "price": 3000000, "stock_qty": 5,
-        "attributes": {"سایز": "۳۱، ۳۲، ۳۳، ۳۴، ۳۶، ۳۸", "رنگ": "طوسی"}})).json()
-
-    async def say(text):
-        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
-
-    await say("سلام")
-    llm.answers = [{"reply": "بله، شلوار جین مام فیت موجوده.", "intent": "product", "products": [jeans["id"]]}]
-    await say("شلوار جین مام فیت دارین")
-    n = len(llm.calls)
-
-    m = await say("سایز بندی رو لطف میکنی؟")
-    assert m["source"] == "canned" and "۳۸" in m["text"] and "۳۱" in m["text"]
-    m = await say("موجوده؟")
-    assert m["source"] == "canned" and "موجوده" in m["text"] and "۳٬۰۰۰٬۰۰۰" in m["text"]
-    m = await say("قیمتش چنده")
-    assert "۳٬۰۰۰٬۰۰۰" in m["text"]
-    m = await say("خب میخوام سفارش بدم")
-    assert "سایز" in m["text"] and "۳۸" in m["text"]
-    m = await say("۳۸")
-    assert "نام و نام خانوادگی" in m["text"]
-    m = await say("سید علی هانی\n۰۹۱۲۳۳۳۴۴۵۵\nقم دورشهر کوچه ۲ کد پستی ۲۲۲۳۳۴۵۶۱۲")
-    assert "خلاصهٔ سفارشت" in m["text"] and "(طوسی، ۳۸)" in m["text"] and "۲۲۲۳۳۴۵۶۱۲" in m["text"]
-    assert (await say("بله"))["source"] == "order"
-    assert len(llm.calls) == n  # none of these reached the model
-
-    # anything else still goes to the model
-    for text in ("این مردونه مگه نیست؟", "سایز ۴۰ دارید؟", "میخوام شلوار مردونه ببینم", "هودی دارین؟"):
-        await say(text)
-    assert len(llm.calls) == n + 4
-
-
-def test_order_asks_and_variant_options():
-    for t in ("خب میخوام سفارش بدم", "همینو می‌خوام", "ثبتش کن", "اوکی می خوام بخرمش"):
-        assert chat_engine.is_order_ask(t), t
-    for t in ("میخوام یه سفارش دیگه هم ثبت کنم", "میخوام شلوار مردونه ببینم", "سفارشم کی میرسه"):
-        assert not chat_engine.is_order_ask(t), t
-    p = chat_engine.Product(attributes={"سایز": "L، XL، XXL", "رنگ": "مشکی و سفید"})
-    o = chat_engine.variant_options(p)
-    assert o == {"size": ["L", "XL", "XXL"], "color": ["مشکی", "سفید"]}
-    assert chat_engine.match_option("2xl", o["size"]) == "XXL" and chat_engine.match_option("xl", o["size"]) == "XL"
-    assert chat_engine.match_option("۴۰", ["۳۸ تا ۴۴"]) == "40" and chat_engine.match_option("۵۰", ["۳۸ تا ۴۴"]) == ""
-
-
-async def test_order_edits_at_the_summary_change_only_that_field(client, monkeypatch):
-    """ali's «هودی کاپلی» chat: the model used the product code as the id (brown hoodie in the summary), the
-    one-line form all went into the name, «نه» cancelled the order and the new phone landed in the address."""
-    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550046")
-    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
-        "enabled": True, "orders_enabled": True, "payment": {"card_number": "6037991234567890"}})
-    brown = (await client.post(f"/stores/{sid}/products", headers=h, json={
-        "title": "هودی مردانه قهوه‌ای با جزئیات دوخت برجسته", "price": 2000000, "stock_qty": 3})).json()
-    kapli = (await client.post(f"/stores/{sid}/products", headers=h, json={
-        "title": "هودی کاپلی مشکی", "price": 2200000, "stock_qty": 3, "attributes": {"سایز": "2XL"}})).json()
-    await client.patch(f"/products/{kapli['id']}", headers=h, json={"sku": str(brown["id"])})
-
-    async def say(text):
-        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
-
-    await say("سلام")
-    llm.answers = [{"reply": "هودی کاپلی و هودی قهوه‌ای داریم. کدوم؟", "intent": "clarify",
-                    "products": [kapli["id"], brown["id"]]}]
-    await say("برام یه هودی بیار")
-    # "ثبت کنم؟" with everything chosen: no extra round, the details are asked right away
-    llm.answers = [{"reply": "هودی کاپلی رو انتخاب کردین. ثبت کنم؟", "intent": "order", "order_action": "update",
-                    "order": {"items": [{"product_id": brown["id"], "qty": 1, "variant": "2XL"}]}}]
-    m = await say("کاپلی")
-    assert "نام و نام خانوادگی" in m["text"] and "ثبت کنم" not in m["text"]
-    n = len(llm.calls)
-
-    m = await say("نام و نام خانوادگی: هانی شماره موبایل:09124443322ز+ آدرس کامل با کد پستی:قم خیابان صفاییه 42 1")
-    assert "خلاصهٔ سفارشت" in m["text"] and "کاپلی" in m["text"] and "قهوه" not in m["text"]
-    assert "👤 هانی\n" in m["text"] and "09124443322" in m["text"] and "📍 قم خیابان صفاییه 42 1" in m["text"]
-
-    m = await say("نه")
-    assert "کدوم قسمت" in m["text"] and "لغو" not in m["text"].split("\n")[0]
-    m = await say("شماره")
-    assert "شماره موبایل" in m["text"]
-    m = await say("09123332233")
-    assert "09123332233" in m["text"] and "📍 قم خیابان صفاییه 42 1" in m["text"] and "👤 هانی\n" in m["text"]
-    m = await say("آدرسم اشتباهه قم خیابان امام کوچه ۵")
-    assert "📍 قم خیابان امام کوچه ۵" in m["text"] and "09123332233" in m["text"]
-    m = await say("شماره رو اشتباه زدم 09351112233")
-    assert "09351112233" in m["text"] and "📍 قم خیابان امام کوچه ۵" in m["text"]
-    m = await say("بله")
-    assert m["source"] == "order" and "ثبت شد" in m["text"]
-    assert len(llm.calls) == n  # all of it in code
-    rows = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
-    rows = rows.get("items", rows) if isinstance(rows, dict) else rows
-    assert rows[0]["items"][0]["product_id"] == kapli["id"] and rows[0]["customer_phone"] == "09351112233"
-
-
-async def test_no_then_cancel_and_buy_intent_skips_the_extra_question(client, monkeypatch):
-    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550047")
-    r = await _order_ready(client, h, sid, llm, p1)
-    assert "خلاصهٔ سفارشت" in r["messages"][-1]["text"]
-
-    async def say(text):
-        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
-
-    assert "کدوم قسمت" in (await say("نه"))["text"]
-    assert "لغو شد" in (await say("لغو"))["text"]
-    assert chat_engine.is_order_ask("حله میخوامش")
-
-
-async def test_pasted_form_wrong_length_phones_and_fixing_a_placed_order(client, monkeypatch):
-    """ali's «هودی اختاپوس» chat: the pasted form (title line, a label without «:», a 10-digit phone) went into the
-    name, «I already sent it» got the same question, a 12-digit number was cut to 11, and the corrected phone after
-    the order was filed as a payment reference."""
-    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550048")
-    form = "برای ثبت سفارش لطفاً این‌ها رو توی یک پیام بفرست 🌸\nنام و نام خانوادگی:\nشماره موبایل:\nآدرس کامل با کد پستی:"
-    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
-        "enabled": True, "orders_enabled": True, "payment": {"card_number": "6037991234567890", "order_form": form}})
-    hoodie = (await client.post(f"/stores/{sid}/products", headers=h, json={
-        "title": "هودی اختاپوس", "price": 2000000, "stock_qty": 5,
-        "attributes": {"سایز": "S، M، L، XL، 2XL، 3XL", "رنگ": "مشکی"}})).json()
-
-    async def say(text):
-        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
-
-    await say("سلام")
-    llm.answers = [{"reply": "هودی اختاپوس مشکی سایز S تا 3XL موجوده. کدوم سایز رو میخواید؟", "intent": "product",
-                    "products": [hoodie["id"]]}]
-    await say("خب میخوام هودی اختابوش مشکی")
-    m = await say("2xl")
-    assert m["text"] == form
-    n = len(llm.calls)
-
-    m = await say("برای ثبت سفارش لطفاً اینها رو توی یک پیام بفرست 🌸\nنام و نام خانوادگی jsj\n"
-                  "شماره موبایل: 0932453454\nآدرس کامل با کد پستی:fsd fdg fdg dfg sd gsf")
-    assert "0932453454" in m["text"] and "۱۰ رقمیه" in m["text"]
-    m = await say("شماره موبایل رو ک برات دادمش")
-    assert "۱۰ رقمیه" in m["text"]
-    m = await say("092452435254")
-    assert "۱۲ رقمیه" in m["text"] and "خلاصه" not in m["text"]
-    m = await say("09124443322")
-    assert "خلاصهٔ سفارشت" in m["text"] and "👤 jsj\n" in m["text"] and "09124443322" in m["text"]
-    assert "📍 fsd fdg fdg dfg sd gsf" in m["text"] and "2XL" in m["text"]
-    assert "ثبت شد" in (await say("اره"))["text"]
-
-    m = await say("نه صب کن شماره اشتباه")
-    assert "شماره موبایل" in m["text"] and "درست" in m["text"]
-    m = await say("092343535435")
-    assert m["source"] != "receipt" and "۱۲ رقمیه" in m["text"]
-    m = await say("09351112233")
-    assert "اصلاح شد" in m["text"] and "09351112233" in m["text"]
-    # a lone mobile number while the receipt is awaited: offered as the new phone, never filed as payment
-    m = await say("09121234567")
-    assert m["source"] != "receipt" and "عوض کنم" in m["text"]
-    assert "اصلاح شد" in (await say("بله"))["text"]
-    assert (await say("کد پیگیری ۷۷۸۸۹۹۰۰"))["source"] == "receipt"
-    assert len(llm.calls) == n
-    rows = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
-    rows = rows.get("items", rows) if isinstance(rows, dict) else rows
-    assert rows[0]["customer_phone"] == "09121234567" and rows[0]["customer_name"] == "jsj"
-    assert any("شماره موبایل سفارش" in t for t in await _notes(sid))
-
-
-def test_phone_numbers_of_the_wrong_length_are_not_cut_down():
-    for bad in ("0932453454", "092452435254", "0912 345 678"):
-        assert chat_engine.norm_phone(bad) == "" and chat_engine.bad_phone(bad), bad
-    for good, want in (("0912 345 6789", "09123456789"), ("+98 912 345 6789", "09123456789"),
-                       ("989335137843", "09335137843"), ("۰۹۱۲۳۴۵۶۷۸۹", "09123456789")):
-        assert chat_engine.norm_phone(good) == want, good
