@@ -53,12 +53,6 @@ class Settings(BaseSettings):
     instagram_app_secret: str = ""
     instagram_proxy: str = ""
 
-    # Sales chat: "polling" (default; works without a public address) or "webhook" (needs public_base_url over
-    # https; required when more than one backend instance runs).
-    chat_transport: str = "polling"
-    # Customer messages sent within this many seconds are answered together, in one model call.
-    chat_debounce_seconds: float = 3.0
-
     # Smart proxies (admin panel › proxies): v2ray links run through a local Xray core.
     xray_path: str = "xray"  # binary name on PATH or a full path (xray.exe on Windows)
     xray_dir: str = "./xray"  # generated config and log

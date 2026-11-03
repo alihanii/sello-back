@@ -12,7 +12,7 @@ from app.core.db import utcnow
 from app.core.security import decrypt_credentials, encrypt_credentials
 from app.deps import DB, AdminUser
 from app.models import (
-    AI_TASKS, IMAGE_KINDS, IMAGE_TASKS, AdminAuditLog, AiProvider, AiTaskRoute, AiUsageLog, Channel, ChannelListing, FeatureInterest,
+    AI_TASKS, IMAGE_KINDS, IMAGE_TASKS, AdminAuditLog, AiProvider, AiTaskRoute, AiUsageLog, Channel, ChannelListing,
     Operation, Payment, Plan, PlanRequest, Product, Store, Subscription, User,
 )
 from app.services.bank import BANKS
@@ -51,7 +51,6 @@ async def stats(admin: AdminUser, db: DB):
                                      Operation.created_at >= now - timedelta(days=30)),
         "active_subscriptions": len(active_subs), "expiring_7d": len(expiring), "revenue_30d": revenue,
         "pending_requests": await count(PlanRequest, PlanRequest.status == "pending"),
-        "chat_waitlist": await count(FeatureInterest, FeatureInterest.feature == "ai_chat"),
     }
 
 

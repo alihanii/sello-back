@@ -12,10 +12,7 @@ PLAN_TIER = "sello"  # the single plan; its 1/3/12-month variants share this tie
 
 # Limits for users without a subscription (trial / free).
 FREE_LIMITS = {"max_stores": 1, "max_channels": 2, "max_products": 30, "monthly_ai_credits": 20,
-               "monthly_publishes": 50, "crawl_frequency": "daily",
-               "monthly_chat_messages": 100}
-# Limits added after a plan was saved: a paid plan without the key gets this instead of the free value.
-PAID_DEFAULTS = {"monthly_chat_messages": 5000}
+               "monthly_publishes": 50, "crawl_frequency": "daily"}
 
 
 async def create_subscription(db: AsyncSession, user_id: int, plan: Plan, *, activated_by: str, note: str = "",
@@ -46,7 +43,7 @@ async def limits_for(db: AsyncSession, user: User) -> dict:
     if not sub:
         return dict(FREE_LIMITS)
     plan = await db.get(Plan, sub.plan_id)
-    return {**FREE_LIMITS, **PAID_DEFAULTS, **(plan.limits if plan else {})}
+    return {**FREE_LIMITS, **(plan.limits if plan else {})}
 
 
 def _limit_error(what: str, limit: int) -> HTTPException:
