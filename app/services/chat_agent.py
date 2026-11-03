@@ -83,6 +83,7 @@ from app.services.chat_engine import (
     is_abusive,
     is_open,
     is_yes,
+    knowledge_missing,
     knowledge_text,
     last_order,
     mark_paid,
@@ -115,7 +116,7 @@ MAX_STEPS = 5  # model calls in one turn; most turns take one or two
 MAX_OUTPUT_TOKENS = 700
 HISTORY_MESSAGES = 8
 HISTORY_CHARS = 300
-PREFETCH = 3  # products put in the message before the model asks, so most questions need no tool round
+PREFETCH = 5  # products put in the message before the model asks, so most questions need no tool round
 
 # ---------- prompt ----------
 
@@ -137,6 +138,8 @@ only from SHOP, FAQ, RULES and REFS. Never invent a product, price, discount, de
 care or fit. Not written -> say you'll check with the admin and ask something useful. Never give a reason why
 something is out of stock. No discount codes or price cuts, ever.
 
+PRODUCTS in the message are only the few closest matches. Before saying what kinds, colours or sizes exist, or that
+something isn't available, call search_products and use every match; never say "only" from PRODUCTS alone.
 PRODUCTS: "this/همین/اون" = LAST PRODUCT. Unclear which -> ask one short question naming up to 3. Out of stock -> say
 so and offer the closest in-stock item of the same category (search_products). A size or colour not listed -> say so
 and list the listed ones. Size advice only from a size chart in REFS/RULES; otherwise ask height/weight and preferred
@@ -663,6 +666,8 @@ async def context_message(ctx: Ctx, history: list[ChatMessage], prefetched: list
         lines.append("FAQ:\n" + "\n".join(faq_line(f) for f in faqs))
     if not open_now:
         lines.append("NOW: outside working hours; orders are reviewed when the shop opens.")
+    if gaps := knowledge_missing(agent):
+        lines.append(f"NOT WRITTEN BY THE SHOP: {', '.join(gaps)}. Never state these; say you'll ask the admin.")
     if prefetched:
         photos = await _photo_counts(ctx.db, [p.id for p in prefetched])
         last = (state.get("recent_products") or [None])[-1]
@@ -931,7 +936,7 @@ async def agent_turn(ctx: Ctx, pending: list[ChatMessage], open_now: bool, done)
     except ai.AIError as exc:
         fails = int(state.get("ai_fails") or 0) + 1
         state["ai_fails"] = fails
-        result.error = exc.message_fa
+        result.error = exc.message_fa + (f" ({exc.detail[:200]})" if exc.detail else "")
         result.notify_admin.append(f"⚠️ دستیار نتوانست جواب بدهد ({exc.message_fa[:120]}). پیام مشتری: «{text[:120]}»")
         if ctx.final:
             return done(*ctx.media, ctx.final)

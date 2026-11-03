@@ -509,7 +509,7 @@ async def test_tool_calls_on_each_wire_format(monkeypatch, kind):
         assert sent["system"][0]["cache_control"] == {"type": "ephemeral"}
 
 
-async def test_gemini_retries_a_broken_tool_call_with_more_thinking(monkeypatch):
+async def test_gemini_retries_a_broken_tool_call_with_more_room(monkeypatch):
     """Gemini 3 at its least thinking sometimes ends with MALFORMED_FUNCTION_CALL and no parts: asked once more."""
     from app.core.security import encrypt_credentials
     from app.models import AiProvider
@@ -529,10 +529,25 @@ async def test_gemini_retries_a_broken_tool_call_with_more_thinking(monkeypatch)
     meta: dict = {}
     msg, *_ = await ai._call_tools(prov, "gemini-3.6-flash", "sys", [{"role": "user", "text": "تایید"}], tools, 0.3, 700, meta)
     assert msg["calls"][0]["name"] == "show_order_summary" and meta["empty_reason"] == "MALFORMED_FUNCTION_CALL"
-    # Gemini 3 runs at 1.0 (lower makes it loop) with low thinking; the retry lets it think as it likes
-    assert bodies[0]["generationConfig"]["temperature"] == 1.0
-    assert bodies[0]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "low"}
-    assert "thinkingConfig" not in bodies[1]["generationConfig"]
+    # Gemini 3 runs at 1.0 (lower makes it loop) with low thinking, and its thinking gets room of its own on top of
+    # the answer (thoughts count against maxOutputTokens; without room the answer was cut to nothing)
+    first, retry = bodies[0]["generationConfig"], bodies[1]["generationConfig"]
+    assert first["temperature"] == 1.0 and first["thinkingConfig"] == {"thinkingLevel": "low"}
+    assert first["maxOutputTokens"] == 700 + ai.GEMINI_THINKING_ROOM
+    assert retry["maxOutputTokens"] > first["maxOutputTokens"]
+
+
+async def test_an_empty_gemini_answer_says_why_in_the_test_chat(client, monkeypatch):
+    """The test chat shows the model's finish reason, so the next empty answer can be traced."""
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550034")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True})
+    await say(client, h, sid, "سلام")
+
+    async def empty(**kw):
+        raise ai.AIError("مدل پاسخ خالی داد.", code="ai_empty", detail="MAX_TOKENS, then MALFORMED_FUNCTION_CALL")
+    monkeypatch.setattr(ai, "chat_step", empty)
+    replies, _ = await say(client, h, sid, "اره")
+    assert "MAX_TOKENS, then MALFORMED_FUNCTION_CALL" in replies[-1]["text"]
 
 
 def test_unknown_numbers():
@@ -857,3 +872,14 @@ async def test_error_notes_stay_out_of_the_models_history(client, monkeypatch):
     replies, _ = await say(client, h, sid, "هودی داری؟")
     assert "خطای هوش مصنوعی" not in llm.first() and "نتونستم" not in llm.first()
     assert replies[-1]["text"] == 'آره داریم 🌸 "مشکی"'
+
+
+async def test_unwritten_shop_policies_are_named_to_the_model(client, monkeypatch):
+    """The test chat works while the assistant is off, before the forms are filled: the model is told what the shop
+    hasn't written (it made up a shipping cost in ali's test), and that a few products are not all of them."""
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550035", ready=False)
+    await say(client, h, sid, "سلام")
+    llm.steps = ["این رو از همکارم می‌پرسم 🌸"]
+    await say(client, h, sid, "هزینه ارسال چقدره؟")
+    assert "NOT WRITTEN BY THE SHOP: هزینهٔ ارسال، زمان رسیدن سفارش، شرایط مرجوعی" in llm.first().replace(", ", "، ")
+    assert "never say \"only\" from PRODUCTS alone" in llm.calls[-1]["system"]
