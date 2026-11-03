@@ -2,7 +2,7 @@
 
 A new product with an empty SKU gets the code written in its description ("کد: A120", "کد محصول ۳۴۵",
 "SKU: X-9"); when the text has none, it gets the product's own id. The code is then written as the first
-line of the description, so the posts and the chat show it."""
+line of the description, so the posts show it."""
 
 import re
 

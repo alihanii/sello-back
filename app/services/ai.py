@@ -128,7 +128,7 @@ async def _call(
     low_res: bool = False, image_res: str = "",
 ) -> tuple[str, int, int]:
     """Returns (text, input_tokens, output_tokens). `meta`, when given, receives `cached_tokens` (the part of the
-    input the provider served from its prompt cache). `max_tokens` caps the answer (the chat assistant).
+    input the provider served from its prompt cache). `max_tokens` caps the answer.
     `low_res` asks for the provider's cheapest image reading (crawl: colour and shape are enough); `image_res`
     "low" is the same, "medium" is half of Gemini's default image tokens (product photos: text on a label stays legible)."""
     image_res = "low" if low_res else image_res
@@ -454,78 +454,6 @@ async def generate_text(
         except (AIError, httpx.HTTPError) as exc:
             err = exc if isinstance(exc, AIError) else AIError("ارتباط با سرویس هوش مصنوعی برقرار نشد.", code="ai_network",
                                                                detail=str(exc)[:500])
-            await _log(provider, task, model, store_id, ok=False, is_fallback=is_fallback,
-                       latency_ms=int((time.monotonic() - started) * 1000),
-                       error_code=err.code, error_message=f"{err.message_fa} {err.detail or ''}"[:1000])
-            last = err
-    raise last  # type: ignore[misc]
-
-
-def parse_chat_json(text: str) -> dict[str, Any]:
-    """The model's JSON, tolerating prose around it, and a cut-off answer (max_tokens hit mid-JSON): then the
-    "reply" text alone is kept, so the customer still gets an answer instead of an error."""
-    raw = _strip_fences(text)
-    start, end = raw.find("{"), raw.rfind("}")
-    if start != -1 and end > start:
-        try:
-            result = json.loads(raw[start:end + 1])
-            if isinstance(result, dict):
-                return result
-        except json.JSONDecodeError:
-            pass
-    m = re.search(r'"reply"\s*:\s*"((?:[^"\\]|\\.)*)', raw)
-    if m and m.group(1).strip():
-        try:
-            reply = json.loads(f'"{m.group(1)}"')
-        except json.JSONDecodeError:
-            reply = m.group(1)
-        return {"reply": reply, "intent": "product", "partial": True}
-    raise json.JSONDecodeError("no JSON object", text, 0)
-
-
-CHAT_MAX_TEMPERATURE = 0.4  # sales answers must be steady; higher values drift into other languages
-
-
-async def generate_chat(
-    *, system: str, prompt: str, store_id: int | None, max_tokens: int = 400, task: str = "chat",
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """One chat turn: a JSON answer with a capped length. Returns (answer, usage) where usage has the model,
-    input/output/cached tokens, cost and latency, so the conversation can show what each reply cost."""
-    candidates = await _route(task)
-    if not candidates:
-        raise AIError(await route_problem(task), code="ai_not_configured")
-    last: AIError | None = None
-    for provider, model, temp, is_fallback in candidates:
-        started = time.monotonic()
-        meta: dict[str, Any] = {}
-        try:
-            temp = min(temp, CHAT_MAX_TEMPERATURE)
-            tin = tout = 0
-            for attempt in range(2):  # one quiet retry on unreadable output before the next key/model
-                text, t_in, t_out = await _retry_busy(
-                    lambda provider=provider, model=model, temp=temp: _call(
-                        provider, model, system, prompt, [], temp, json_mode=True, max_tokens=max_tokens, meta=meta))
-                tin, tout = tin + t_in, tout + t_out
-                try:
-                    result = parse_chat_json(text)
-                    break
-                except json.JSONDecodeError:
-                    if attempt:
-                        raise
-                    temp = 0.0
-            ms = int((time.monotonic() - started) * 1000)
-            cached = int(meta.get("cached_tokens") or 0)
-            await _log(provider, task, model, store_id, ok=True, is_fallback=is_fallback, latency_ms=ms,
-                       input_tokens=tin, output_tokens=tout, cached_tokens=cached)
-            return result, {"model": model, "input_tokens": tin, "output_tokens": tout, "cached_tokens": cached,
-                            "cost_toman": token_cost(provider, tin, tout, cached), "latency_ms": ms}
-        except (AIError, httpx.HTTPError, json.JSONDecodeError, KeyError) as exc:
-            err = exc if isinstance(exc, AIError) else AIError(
-                "پاسخ هوش مصنوعی قابل خواندن نبود." if isinstance(exc, (json.JSONDecodeError, KeyError))
-                else "ارتباط با سرویس هوش مصنوعی برقرار نشد.",
-                code="ai_bad_json" if isinstance(exc, (json.JSONDecodeError, KeyError)) else "ai_network",
-                detail=str(exc)[:500],
-            )
             await _log(provider, task, model, store_id, ok=False, is_fallback=is_fallback,
                        latency_ms=int((time.monotonic() - started) * 1000),
                        error_code=err.code, error_message=f"{err.message_fa} {err.detail or ''}"[:1000])

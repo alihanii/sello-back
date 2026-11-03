@@ -12,11 +12,10 @@ from fastapi.staticfiles import StaticFiles
 from app.core.config import settings
 from app.core.db import init_db
 from app.routers import (
-    admin, auth, billing, channels, chat, crawl, insights, notifications, ai_products, operations, payments, products,
+    admin, auth, billing, channels, crawl, insights, notifications, ai_products, operations, payments, products,
     proxies, stores,
 )
 from app.seed import seed
-from app.services.chat_runtime import poller_loop
 from app.services.media import public_url, use_s3
 from app.services.proxy_pool import pool, pool_loop
 from app.services.worker import worker_loop
@@ -30,12 +29,10 @@ async def lifespan(_: FastAPI):
     await seed()
     stop = asyncio.Event()
     task = asyncio.create_task(worker_loop(stop)) if settings.worker_enabled else None
-    chat = (asyncio.create_task(poller_loop(stop))
-            if settings.worker_enabled and settings.chat_transport == "polling" else None)
     proxies = asyncio.create_task(pool_loop(stop)) if settings.worker_enabled else None
     yield
     stop.set()
-    for t in (task, chat, proxies):
+    for t in (task, proxies):
         if t:
             await t
     await pool.shutdown()
@@ -59,7 +56,7 @@ async def validation_error(_: Request, exc: RequestValidationError):
 
 
 for r in (auth, stores, channels, products, operations, crawl, ai_products, insights, billing, payments, proxies, admin,
-          notifications, chat):
+          notifications):
     app.include_router(r.router, prefix="/api/v1")
 
 if use_s3():

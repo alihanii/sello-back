@@ -4,7 +4,7 @@ The admin pastes v2ray links (or plain socks/http proxies) and says which servic
 run through one local Xray process: each node gets its own SOCKS port on 127.0.0.1. Every few minutes each node
 is tested against the service it serves (api.telegram.org, graph.instagram.com) and its latency recorded.
 `request()` sends a call through the fastest healthy node and, when the connection fails before anything was
-sent, moves on to the next one, so a dead node never blocks a publish or a chat reply.
+sent, moves on to the next one, so a dead node never blocks a publish.
 
 Per service the admin picks a mode: auto (pool, then the old single-proxy field, then direct), proxy (pool and
 the old field only, never direct) or direct (no proxy at all)."""
