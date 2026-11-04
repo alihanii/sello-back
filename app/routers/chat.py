@@ -374,6 +374,8 @@ async def update_ref(ref_id: int, body: RefIn, user: CurrentUser, db: DB):
         raise HTTPException(404, "رفرنس پیدا نشد.")
     await get_store_for(db, user, r.store_id)
     _check_ref(body, r.store_id)
+    if body.image_url != r.image_url:
+        r.read_text = None  # a new image is read again
     for k, v in body.model_dump().items():
         setattr(r, k, v)
     await db.commit()
