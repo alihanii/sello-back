@@ -271,6 +271,7 @@ async def handle(db: AsyncSession, conv: ChatConversation, store: Store, agent: 
         p = await _product(db, store.id, items[idx]) if idx < len(items) else None
         options = ce.variant_options(p).get(kind, []) if p else []
         pick = t.removeprefix("✔️").strip()
+        pick = pick if pick in options else ce.picked_option(options, pick)  # typed: "قرمز میخوام"
         if p and pick in options:
             items[idx] = {**items[idx], "variant": set_choice(p, str(items[idx].get("variant") or ""), kind, pick)}
             state["order"] = {**order, "items": items}

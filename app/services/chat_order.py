@@ -20,7 +20,7 @@ from app.services.text import fa_number
 YES_BUTTON = "✅ بله، ثبت کن"
 CHANGE_BUTTON = "✏️ تغییر می‌خوام"
 SUMMARY_BUTTONS = [[YES_BUTTON, CHANGE_BUTTON]]
-SUMMARY_ASK = "همه‌چی درسته؟ اگه آره «بله» رو بفرست، وگرنه بگو چی رو عوض کنم."
+SUMMARY_ASK = "همه‌چی درسته؟ اگه درسته «بله» یا «آره» بفرست، وگرنه بگو چی رو عوض کنم."
 ASK_FIELD = {"name": "اسم و فامیلت رو بنویس 👤", "phone": "شماره موبایلت رو بفرست 📞",
              "address": "آدرس کامل رو با کد پستی بنویس 📍"}
 SEND_PHONE = "📱 ارسال شماره‌ی من"

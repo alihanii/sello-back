@@ -613,9 +613,11 @@ async def catalog_answer(db: AsyncSession, store_id: int, text: str, recent: lis
     # A colour ("مشکی") picks among the products found, it doesn't name one: "black Spider-Man hoodie" is the
     # Spider-Man hoodie, in black if it comes in black.
     colours = _colors_in(" ".join(q))
-    q = {w for w in q if not _colors_in(w)}
+    q = {w for w in q if not _colors_in(w) and not _sizes_in(w)}
+    if not q and (colours or _sizes_in(text)):
+        return ""  # "قرمز" alone answers a question (which colour?), it doesn't ask for the whole shop
     if not q:
-        return catalog_overview(_with_colour(rows, colours), exact_stock)
+        return catalog_overview(rows, exact_stock)
     # Kind words ("هودی") pick the category; the rest ("اسپایدرمن", "بتمن") must match the product itself. Only the
     # shop's categories count as kinds: the AI's free-text hint ("هودی مشکی اسپایدرمن") would make a design a kind.
     kinds = set().union(*[words(p.category or "") for p in rows]) if rows else set()
@@ -913,6 +915,64 @@ async def my_pictures(db: AsyncSession, conv: ChatConversation, store: Store, st
     return out
 
 
+_DESIGN_WANT = re.compile(r"(طرح|عکس|اینو|این\s*رو|همینو|همین\s*رو|اینه|این)")
+_DESIGN_VERB = re.compile(r"(می\s*‌?خوام|میخوام|بزن|بزنید|بزنین|چاپ|روی|رو\s*(هودی|تی|سوی|ماگ|کلاه|لیوان)|برای|واسه|میشه|می‌شه)")
+
+
+async def design_on_product(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent,
+                            state: dict[str, Any], text: str) -> list[Reply]:
+    """"I want this design on a hoodie" after sending a picture: the print product that fits the words (or the only
+    one) goes in the cart carrying that picture, and the shop asks for what the line still needs. Empty when the
+    message isn't that, or no print product fits."""
+    if not (_DESIGN_WANT.search(text) and _DESIGN_VERB.search(text)):
+        return []
+    if "؟" in text and not _WANTS_IT.search(text):
+        return []  # a question about printing: the assistant answers it
+    rows = [p for p in await catalog_rows(db, store.id) if takes_design(p) and p.status != "archived"]
+    if not rows:
+        return []
+    said = words(text)
+    named = [p for p in rows if _overlap(said, words(f"{p.title} {p.category or ''} {p.category_hint}"))]
+    if not named and "طرح" not in text:
+        return []  # "اینو میخوام" after a product photo is about that product, not a print
+    if len(named) > 1:
+        named = _rank(named, said, lambda p: f"{p.title} {p.category or ''} {p.category_hint}") or named
+    pick = named[0] if len(named) == 1 else rows[0] if len(rows) == 1 else None
+    if not pick:
+        return []
+    from app.services import chat_order
+    order = dict(state.get("order") or {})
+    items = list(order.get("items") or [])
+    design = state.pop("pending_design")
+    line = next((i for i, it in enumerate(items) if it.get("product_id") == pick.id and not it.get("design")), None)
+    if line is None:
+        items.append({"product_id": pick.id, "qty": 1, "variant": "", "design": design})
+        line = len(items) - 1
+    # The choices said in the same message ("مشکی XL، چاپ پشت") go on the line too.
+    from app.services import chat_menu
+    variant = str(items[line].get("variant") or "")
+    for kind, options in chat_order.choices(pick).items():
+        if kind == "size":
+            sizes = _sizes_in(text)
+            hit = [o for o in options if to_en_digits(o).upper() in sizes]
+            chosen = hit[0] if len(hit) == 1 else ""
+        else:
+            chosen = picked_option(options, text)
+        if chosen:
+            variant = chat_menu.set_choice(pick, variant, kind, chosen)
+    items[line] = {**items[line], "design": design, "variant": variant}
+    order["items"] = items
+    state["order"] = order
+    if state.get("awaiting") == "confirm":
+        state.pop("awaiting")  # the summary changed; it is shown again when the line is complete
+    placed = await open_order(db, store.id, state.get("order_id"))
+    step = await chat_order.next_step(db, conv, agent, state, placed)
+    lead = f"عالیه 🎨 طرحت رو روی «{pick.title[:60]}» چاپ می‌کنیم ({money(pick.price)})."
+    if not step:
+        return [Reply(lead, source="order", intent="order")]
+    return [Reply(f"{lead}\n{step.text}", source="order", intent="order", buttons=step.buttons)]
+
+
 def already_chosen(items: list[dict[str, Any]], text: str) -> str:
     """The colour/size the message names when a cart line already has exactly those ("مشکی سایز M" again); else ""."""
     colours, sizes = _colors_in(text), _sizes_in(text)
@@ -933,6 +993,8 @@ async def code_skill(db: AsyncSession, conv: ChatConversation, store: Store, age
     if skill == "browse" and agent.catalog_enabled:
         answer = await catalog_answer(db, store.id, text, state.get("recent_products") or [],
                                       policy(agent)["stock"] == "exact")
+        if not answer:
+            return False
         result.replies.append(Reply(answer, source="catalog", intent="product"))
         return True
     if skill == "status":
@@ -1054,6 +1116,13 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         # "What's my design now? / show my cart's photo": the design they sent and the product, from the cart or
         # the order itself, not a description of it.
         result.replies += shown
+        return done()
+
+    if text and not photo and agent.orders_enabled and state.get("pending_design") \
+            and (step_replies := await design_on_product(db, conv, store, agent, state, text)):
+        # "I want this design on a hoodie": the print product goes in the cart with the picture they sent, and the
+        # journey asks what it still needs (colour, size, side) with buttons, instead of a list of hoodies.
+        result.replies += step_replies
         return done()
 
     if text and not photo:
@@ -1205,6 +1274,10 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         complaint_handoff(conv, text, result, usage)
         return done()
     reply_text = clean_language(str(out.get("reply") or "").strip(), text, products, store)
+    if not re.search(r"(سلام|درود|salam|hi\b|hello)", text, re.IGNORECASE):
+        # "Greet only if greeted": the model still opened every answer with «سلام».
+        reply_text = re.sub(r"^(سلام|درود)\s*(و\s*وقت\s*بخیر|دوست\s*من|عزیزم)?\s*[!،,.🌸🙏😊]*\s*", "", reply_text).strip() \
+            or reply_text
     valid_ids = {p.id for p in products}
     shown = [int(i) for i in out.get("products") or [] if str(i).isdigit() and int(i) in valid_ids]
     if shown:
@@ -1221,8 +1294,9 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         # A product or kind named in the message: only the matching products, not the whole shop.
         answer = await catalog_answer(db, store.id, text, state.get("recent_products") or [],
                                       policy(agent)["stock"] == "exact")
-        result.replies.append(Reply(answer, source="catalog", intent="product", usage=usage))
-        return done()
+        if answer:
+            result.replies.append(Reply(answer, source="catalog", intent="product", usage=usage))
+            return done()
     if intent == "order_status" and not reply_text.strip():
         # "Where is my order?": the details come from the orders themselves. A follow-up ("why?", "when?") is
         # answered by the model in its own words, not with the same list again.
@@ -1585,7 +1659,7 @@ def _order_sig(order: dict[str, Any]) -> tuple:
     return (tuple(items), *(flat(order.get(k)) for k in ("name", "phone", "address")))
 
 
-NOT_PLACED_TEXT = "این سفارش هنوز ثبت نشده 🌸 اگه خلاصهٔ بالا درسته «بله» بفرست، یا بگو چی رو عوض کنم."
+NOT_PLACED_TEXT = "این سفارش هنوز ثبت نشده 🌸 اگه خلاصهٔ بالا درسته «بله» یا «آره» بفرست، وگرنه بگو چی رو عوض کنم."
 _YES_WORD = re.compile(r"(?<!\w)(بله|بلی|آره|اره|آری|اوکی|اکی|ok|okay|yes|باشه|حتما|حتماً|تایید|تأیید|تاییده|تأییده|"
                        r"ثبت\s*کن|ثبتش\s*کن|ثبت\s*بشه|حله|درسته|موافقم|قبوله|بزن\s*بریم|اوکیه|بفرست)(?!\w)", re.I)
 _NOT_YES = re.compile(r"(?<!\w)(نه|نخیر|خیر|ولی|اما|عوض|تغییر|اضافه|حذف|چرا|چند|سفارش\s*دیگه|یکی\s*دیگه|"
