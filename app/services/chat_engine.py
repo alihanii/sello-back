@@ -316,6 +316,11 @@ and messages them; they want the reason now or are upset -> handoff, reason "ask
 PHOTOS: asks to see a product, or says yes to your "عکسش رو بفرستم؟" -> its id in "images" (only products with "عکس"),
 short reply. Never put ids in "images" otherwise.
 REFS: asks for a reference (e.g. size chart) or says yes to your offer of it -> its id in "refs"; otherwise none.
+FIT: put a product in "order" only if it is what the customer asked for (same kind, design, a colour/size it comes in).
+Nothing in PRODUCTS fits -> say we don't have exactly that, name the closest and ask; never add another product instead.
+CUSTOMER PHOTOS: "[مشتری یک عکس فرستاد …]" is what their photo shows (the shop read it for you); never ask them to send
+a photo they already sent. A design to print that the shop kept on the order -> carry on with the product, colour,
+size and print side.
 GREETING/THANKS: answer briefly; an unpaid PLACED ORDER -> remind the amount and to send the receipt.
 SELLER RULES and STOCK beat TONE ("always شما" = formal, no عزیزم).
 HANDOFF (handoff true, still a short reply): asks for a person -> reason "asked_human"; a complaint (order, product,
@@ -627,6 +632,11 @@ async def _merge_order(db: AsyncSession, store_id: int, agent: ChatAgent, state:
                 pid = fix_product_id(int(pid), products, hint)
             p = await db.get(Product, int(pid)) if str(pid or "").isdigit() and int(pid) else None
             if p and p.store_id == store_id and p.status != "archived":
+                if (wrong := misfit(p, str(it.get("variant") or ""))):
+                    opts = variant_options(p)
+                    state["misfit"] = {"title": p.title, "wrong": wrong,
+                                       "colors": opts.get("color") or [], "sizes": opts.get("size") or []}
+                    continue
                 if p.stock_qty > 0:
                     qty = min(qty, p.stock_qty)
                 items.append({"product_id": p.id, "qty": qty, "variant": str(it.get("variant") or "")[:80]})
@@ -735,9 +745,6 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         order_state["extras"] = extras
         state["order"] = order_state
         text = (text + "\n" if text else "") + f"[مشتری فایلِ «{field_['label']}» را فرستاد و روی سفارش ثبت شد]"
-    elif photo and not text:
-        result.replies.append(Reply(PHOTO_TEXT, source="canned"))
-        return done()
 
     # 2b. An exact tracking code (S1234567): looked up in the orders, no guessing needed.
     if _TRACK_CODE.search(to_en_digits(text)):
@@ -781,6 +788,23 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                              .order_by(ChatReference.id))).scalars().all()
     shop_categories = await category_names(db, store.id) if agent.catalog_enabled else []
     system = static_prompt(store, agent, list(refs), shop_categories)
+    if photo:
+        # The customer's photo is read by the vision model (its own, stronger model in the AI routes), and the chat
+        # model gets what it shows as text.
+        seen = await read_photo(db, store, agent, photo, text)
+        if not seen:
+            if not text:
+                result.replies.append(Reply(PHOTO_TEXT, source="canned"))
+                return done()
+        else:
+            if (seen["kind"] == "design" and agent.orders_enabled and not image_fields
+                    and photo not in (state.get("order") or {}).get("extras", {}).values()):
+                # A design to print in a shop without its own image field: kept on the order all the same.
+                order_state = dict(state.get("order") or {})
+                order_state["extras"] = {**(order_state.get("extras") or {}), DESIGN_FIELD: photo}
+                state["order"] = order_state
+                seen["note"] = "روی سفارش ذخیره شد"
+            text = (text + "\n" if text else "") + photo_line(seen)
     found: list[int] = []
     products = (await search_products(db, store.id, text, state.get("recent_products") or [], found)
                 if agent.catalog_enabled else [])
@@ -902,6 +926,12 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
             state.pop("order")
     order = state.get("order") or {}
     changed = _order_sig(order) != _order_sig(before)
+    if wrong := state.pop("misfit", None):
+        # The model put a product the customer didn't ask for (another colour/size) in the cart: it stays out.
+        opts = "، ".join(wrong["colors"] if wrong["wrong"].startswith("رنگ") else wrong["sizes"])
+        reply_text = (f"ببخشید، «{wrong['title'][:80]}» {wrong['wrong']} نداره 🙏"
+                      + (f" موجودهاش: {opts}." if opts else "") + " همین رو می‌خوای یا دنبال چیز دیگه‌ای هستی؟")
+        action = "none"
     if order.get("items") and not order.get("phone") and not state.get("bad_phone") and bad_phone(text):
         state["bad_phone"] = bad_phone(text)  # the model left out a mobile of the wrong length: still say why
     bad_now = bool(state.get("bad_phone")) and state.get("bad_phone") != bad_before
@@ -997,6 +1027,95 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
             result.replies.append(Reply(HANDOFF_TEXT, source="handoff", intent="handoff", usage=usage))
         result.notify_admin.append(f"🙋 گفتگو با {conv.customer_name or 'مشتری'} به ادمین نیاز دارد: «{text[:120]}»")
     return done()
+
+
+DESIGN_FIELD = "طرح مشتری"
+VISION_SYSTEM = """You look at ONE photo a customer sent in an online shop's chat and tell the shop's sales assistant what it
+shows. Answer in Persian, 1-2 short factual sentences: what it is, main colours, any text written on it. Never guess
+prices. kind: "product" = a photo or screenshot of a product they want (maybe one of PRODUCTS), "design" = a picture,
+logo or artwork they want printed/made, "receipt" = a payment receipt, "other" = anything else.
+Reply with ONE JSON object: {"kind":"product|design|receipt|other","description":"","product_id":0}
+product_id: the "#" number of the PRODUCTS item it clearly shows, else 0."""
+
+
+async def read_photo(db: AsyncSession, store: Store, agent: ChatAgent, url: str, text: str) -> dict[str, Any] | None:
+    """What the customer's photo shows, from the "chat_vision" model; None when it can't be read (no key, no file)."""
+    from app.services import media
+    from app.services.images import to_jpeg
+
+    got = media.read_local(url)
+    if not got:
+        return None
+    data, mime = got
+    try:
+        data, mime = to_jpeg(data, max_side=1024), "image/jpeg"
+    except Exception:  # noqa: BLE001 - an odd format still goes as it is
+        pass
+    rows = await catalog_rows(db, store.id) if agent.catalog_enabled else []
+    catalog = "\n".join(f"#{p.id} {p.title[:80]}" for p in rows[:60])
+    try:
+        out = await ai.generate_json(task="chat_vision", system=VISION_SYSTEM, store_id=store.id, max_tokens=300,
+                                     images=[(data, mime)], image_res="medium",
+                                     prompt=(f"PRODUCTS:\n{catalog}\n\n" if catalog else "")
+                                     + f"<customer>{text[:500]}</customer>")
+    except Exception:  # noqa: BLE001 - no vision model or a bad answer: the chat goes on without it
+        return None
+    desc = _one_line(str(out.get("description") or ""))[:300]
+    if not desc:
+        return None
+    kind = str(out.get("kind") or "other")
+    pid = int(out["product_id"]) if str(out.get("product_id") or "").isdigit() else 0
+    return {"kind": kind if kind in ("product", "design", "receipt", "other") else "other", "description": desc,
+            "product_id": pid if any(p.id == pid for p in rows) else 0}
+
+
+def photo_line(seen: dict[str, Any]) -> str:
+    kind = {"product": "عکس محصول", "design": "طرح برای چاپ", "receipt": "فیش پرداخت", "other": "عکس"}[seen["kind"]]
+    return (f"[مشتری یک عکس فرستاد ({kind}): {seen['description']}"
+            + (f"؛ همان محصول #{seen['product_id']}" if seen.get("product_id") else "")
+            + (f"؛ {seen['note']}" if seen.get("note") else "") + "]")
+
+
+_COLORS = ["مشکی", "سفید", "قرمز", "آبی", "سبز", "زرد", "نارنجی", "بنفش", "صورتی", "طوسی", "خاکستری", "قهوه‌ای",
+           "کرم", "بژ", "سرمه‌ای", "سورمه‌ای", "یاسی", "زرشکی", "نقره‌ای", "طلایی", "شیری", "یشمی", "خردلی", "کالباسی",
+           "فیروزه‌ای", "نفتی", "لجنی", "زیتونی", "گلبهی", "black", "white", "red", "blue", "green", "gray", "grey",
+           "brown", "pink", "navy", "beige", "cream"]
+_COLOR_FORMS = {re.sub(r"[\s\u200c]", "", norm(c)): c for c in _COLORS}
+_SIZE_TOKEN = re.compile(r"(?<![A-Za-z0-9])(\d?X{0,3}[SML]|\dXL|X{1,4}L|XS|FREE)(?![A-Za-z0-9])", re.I)
+_SIZE_WORDS = {"مدیوم": "M", "لارج": "L", "اسمال": "S", "ایکس لارج": "XL", "دوایکس": "2XL", "سه ایکس": "3XL"}
+
+
+def _colors_in(text: str) -> set[str]:
+    flat = re.sub(r"[\s\u200c]", "", norm(text or ""))
+    return {c for form, c in _COLOR_FORMS.items() if form in flat}
+
+
+def _sizes_in(text: str) -> set[str]:
+    t = to_en_digits(text or "")
+    for w, v in _SIZE_WORDS.items():
+        t = t.replace(w, f" {v} ")
+    out = set()
+    for m in _SIZE_TOKEN.finditer(t):
+        x = m.group(1).upper()
+        out.add({"XXL": "2XL", "XXXL": "3XL", "XXXXL": "4XL"}.get(x, x))
+    return out
+
+
+def misfit(p: Product, variant: str) -> str:
+    """The colour or size asked for that this product doesn't come in ("" when it fits or we can't tell): a brown
+    hoodie is never put in the cart as "black"."""
+    opts = variant_options(p)
+    have = _colors_in(" ".join(opts.get("color") or [])) or _colors_in(p.title)
+    bad = sorted(_colors_in(variant) - have) if have else []
+    if bad:
+        return f"رنگ {bad[0]}"
+    sizes = opts.get("size") or []
+    have_sizes = _sizes_in(" ".join(sizes))
+    if have_sizes and len(have_sizes) == len(sizes):  # only when every listed size is a letter size
+        bad = sorted(_sizes_in(variant) - have_sizes)
+        if bad:
+            return f"سایز {bad[0]}"
+    return ""
 
 
 def _order_sig(order: dict[str, Any]) -> tuple:

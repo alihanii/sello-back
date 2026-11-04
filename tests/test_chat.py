@@ -1277,3 +1277,83 @@ def test_phone_numbers_of_the_wrong_length_are_not_cut_down():
     for good, want in (("0912 345 6789", "09123456789"), ("+98 912 345 6789", "09123456789"),
                        ("989335137843", "09335137843"), ("۰۹۱۲۳۴۵۶۷۸۹", "09123456789")):
         assert chat_engine.norm_phone(good) == want, good
+
+
+async def test_a_product_in_another_colour_is_not_put_in_the_cart(client, monkeypatch):
+    """ali's chat: "black hoodie with my design" — the model put the brown hoodie in the cart as «مشکی، M»."""
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550049")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        "enabled": True, "orders_enabled": True, "payment": {"card_number": "6037991234567890"}})
+    brown = (await client.post(f"/stores/{sid}/products", headers=h, json={
+        "title": "هودی کلاهدار قهوه‌ای", "price": 2000000, "stock_qty": 3, "attributes": {"سایز": "M، L، XL"}})).json()
+
+    async def say(text):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
+
+    await say("سلام")
+    llm.answers = [{"reply": "باشه، اضافه کردم.", "intent": "order", "order_action": "update",
+                    "order": {"items": [{"product_id": brown["id"], "qty": 1, "variant": "مشکی، سایز: M"}]}}]
+    m = await say("هودی مشکی سایز مدیوم میخوام")
+    assert "رنگ مشکی نداره" in m["text"] and "هودی کلاهدار قهوه‌ای" in m["text"]
+    llm.answers = [{"reply": "باشه", "intent": "order", "order_action": "update",
+                    "order": {"items": [{"product_id": brown["id"], "qty": 1, "variant": "3XL"}]}}]
+    m = await say("سه ایکس بده")
+    assert "سایز 3XL نداره" in m["text"] and "M، L، XL" in m["text"]
+    conv = (await client.get(f"/stores/{sid}/chat/test", headers=h)).json()
+    assert not ((conv["state"] or {}).get("order") or {}).get("items")
+    # the colour it comes in is fine
+    llm.answers = [{"reply": "باشه", "intent": "order", "order_action": "update",
+                    "order": {"items": [{"product_id": brown["id"], "qty": 1, "variant": "قهوه ای، دوایکس"}]}}]
+    await say("قهوه‌ای XL")
+    conv = (await client.get(f"/stores/{sid}/chat/test", headers=h)).json()
+    assert not ((conv["state"] or {}).get("order") or {}).get("items")  # 2XL isn't one of its sizes either
+    llm.answers = [{"reply": "باشه", "intent": "order", "order_action": "update",
+                    "order": {"items": [{"product_id": brown["id"], "qty": 1, "variant": "قهوه ای، L"}]}}]
+    await say("قهوه‌ای L")
+    conv = (await client.get(f"/stores/{sid}/chat/test", headers=h)).json()
+    assert conv["state"]["order"]["items"][0]["product_id"] == brown["id"]
+
+
+async def test_the_customers_photo_is_read_and_a_design_goes_on_the_order(client, monkeypatch):
+    """ali's chat: the design photos got «عکس رسید، اسم محصول رو بنویس» and the model kept asking for the design."""
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550050")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        "enabled": True, "orders_enabled": True, "payment": {"card_number": "6037991234567890"}})
+    from app.services import media
+    monkeypatch.setattr(media, "read_local", lambda url: (b"img", "image/png") if url.startswith("/media/") else None)
+    seen: list[dict] = []
+
+    async def vision(*, task, system, prompt, images=None, store_id=None, **kw):
+        seen.append({"task": task, "prompt": prompt, "images": images})
+        return {"kind": "design", "description": "نقاشی یک گربه‌ی سیاه با متن ABRA", "product_id": 0}
+    monkeypatch.setattr(chat_engine.ai, "generate_json", vision)
+
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
+    from app.core.db import SessionLocal
+    from sqlalchemy import select
+    async with SessionLocal() as db:
+        conv = (await db.execute(select(chat_engine.ChatConversation).where(
+            chat_engine.ChatConversation.store_id == sid, chat_engine.ChatConversation.is_test))).scalars().first()
+        rt.add_message(db, conv, role="customer", text="", image_url="/media/1/design.jpg")
+        await db.commit()
+        cid = conv.id
+    llm.answers = [{"reply": "طرح گربه رو گرفتم 🌸 روی کدوم هودی و چه سایزی چاپ کنیم؟", "intent": "order"}]
+    saved = await rt.answer(cid, send=False)
+    assert seen and seen[0]["task"] == "chat_vision" and seen[0]["images"] and "مانتو لینن کرم" in seen[0]["prompt"]
+    assert "گربه‌ی سیاه" in llm.calls[-1]["prompt"] and "طرح برای چاپ" in llm.calls[-1]["prompt"]
+    assert saved[-1].text.startswith("طرح گربه رو گرفتم")
+    async with SessionLocal() as db:
+        conv = await db.get(chat_engine.ChatConversation, cid)
+        assert conv.state["order"]["extras"] == {chat_engine.DESIGN_FIELD: "/media/1/design.jpg"}
+
+    # no vision model (or an unreadable photo): the old fixed answer, no chat model call
+    async def broken(**kw):
+        raise chat_engine.ai.AIError("x")
+    monkeypatch.setattr(chat_engine.ai, "generate_json", broken)
+    n = len(llm.calls)
+    async with SessionLocal() as db:
+        rt.add_message(db, await db.get(chat_engine.ChatConversation, cid), role="customer", text="",
+                       image_url="/media/1/other.jpg")
+        await db.commit()
+    saved = await rt.answer(cid, send=False)
+    assert saved[-1].text == chat_engine.PHOTO_TEXT and len(llm.calls) == n
