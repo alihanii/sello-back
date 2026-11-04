@@ -8,6 +8,7 @@ from typing import Any
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import case, func, select
+from sqlalchemy import delete as sa_delete
 
 from app.core.db import utcnow
 from app.core.security import decrypt_credentials, encrypt_credentials
@@ -549,6 +550,18 @@ async def resume_ai(conv_id: int, user: CurrentUser, db: DB):
     c.state = state
     await db.commit()
     return _conv_out(c)
+
+
+@router.delete("/chat/conversations/{conv_id}")
+async def delete_conversation(conv_id: int, user: AdminUser, db: DB):
+    """Wipes a chat for good: its messages, its orders and what the assistant remembers. Site admins only (to test
+    the bot from scratch); the next message from that customer starts a new chat. AI usage stays on the bill."""
+    c = await _conv_for(db, user, conv_id)
+    await db.execute(sa_delete(ChatMessage).where(ChatMessage.conversation_id == c.id))
+    await db.execute(sa_delete(AiOrder).where(AiOrder.conversation_id == c.id))
+    await db.delete(c)
+    await db.commit()
+    return {"ok": True}
 
 
 @router.post("/chat/conversations/{conv_id}/pause")
