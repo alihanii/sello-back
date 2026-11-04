@@ -3,11 +3,13 @@ step of changing the cart. Taps are answered by code, never by the model, with t
 anything typed goes on to the usual model path, so the journey stays the same for customers who type."""
 
 import re
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.text import fa_number, to_en_digits
+from app.core.db import utcnow
 from app.models import ChatAgent, ChatConversation, Product, Store
 from app.services import chat_engine as ce
 from app.services.chat_engine import Reply
@@ -104,6 +106,7 @@ async def summary(db: AsyncSession, store_id: int, state: dict[str, Any], lead: 
     if not lines:
         return None
     state["awaiting"] = "confirm"
+    state["summary_at"] = utcnow().isoformat()
     state.pop("add_to", None)
     text = "خلاصهٔ سفارشت:\n" + ce.order_summary(order, lines, total) + "\n\nهمه‌چی درسته؟"
     return _r((lead + "\n\n" if lead else "") + text, SUMMARY_BUTTONS)
@@ -215,7 +218,7 @@ async def _for_line(db: AsyncSession, store: Store, state: dict[str, Any], idx: 
 
 
 async def handle(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent, state: dict[str, Any],
-                 text: str, result: ce.TurnResult) -> list[Reply] | None:
+                 text: str, result: ce.TurnResult, sent_at: datetime | None = None) -> list[Reply] | None:
     """The answer to a button tap (or to the one thing a button step asked for); None: the model path answers."""
     if not agent.orders_enabled:
         return None
@@ -242,6 +245,11 @@ async def handle(db: AsyncSession, conv: ChatConversation, store: Store, agent: 
         return [_r(ce.order_status_text(last) if last else "هنوز سفارشی ثبت نکردی 🌸")]
     if t == YES and state.get("awaiting") == "confirm" and items:
         state.pop("menu", None)
+        shown = state.get("summary_at")
+        if sent_at and shown and sent_at < ce._aware(datetime.fromisoformat(shown)):  # noqa: SLF001
+            # Tapped under an older summary (it changed while the tap was on its way): the new one first.
+            r = await summary(db, store.id, state, "این خلاصه عوض شده؛ نسخهٔ جدیدش اینه 👇")
+            return [r] if r else [_r(EMPTY_ORDER)]
         state.pop("awaiting", None)
         placed = ce.TurnResult()
         await ce.place_order(db, conv, store, agent, state, t, "", placed)
