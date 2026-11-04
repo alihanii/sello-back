@@ -366,6 +366,7 @@ AI_TASKS: dict[str, str] = {
     "image_edit": "ساخت و تمیز کردن عکس محصول — فقط مدل تصویری",
     "chat": "دستیار چت فروش (تلگرام و بله) — یک مدل سریع و ارزان مثل flash-lite",
     "chat_vision": "خواندن عکسی که مشتری در چت می‌فرستد (طرح چاپ، عکس محصول) — یک مدل قوی که عکس می‌خواند",
+    "chat_router": "مسیریاب چت: تشخیص اینکه هر پیام مشتری مال کدام بخش خرید است — یک مدل سریع و ارزان",
 }
 # Tasks that need a model which returns an image; every other task needs a text (JSON) model.
 IMAGE_TASKS = {"image_edit"}

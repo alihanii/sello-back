@@ -6,6 +6,8 @@ import json
 import pytest
 from sqlalchemy import delete, select
 
+from app.services.chat_router import route as REAL_ROUTE  # _setup stubs the router; its own test uses the real one
+
 from app.platforms.botapi import BotApiAdapter
 from app.services import ai, chat_engine
 from app.services import chat_runtime as rt
@@ -69,6 +71,11 @@ async def _setup(client, monkeypatch, phone="09125550001"):
     monkeypatch.setattr(BotApiAdapter, "_call", fake_bot_call)
     llm = FakeLLM()
     monkeypatch.setattr(chat_engine.ai, "generate_chat", llm)
+    from app.services import chat_router
+
+    async def no_route(*a, **kw):
+        return ""  # the router's own tests set its answers
+    monkeypatch.setattr(chat_router, "route", no_route)
     admin = await login(client, "09120000000")
     r = await client.post("/admin/ai/providers", headers=admin, json={
         "name": "chat-key", "kind": "gemini", "api_key": "k-chat", "default_model": "gemini-3.6-flash"})
@@ -1744,3 +1751,50 @@ async def test_third_spiderman_chat(client, monkeypatch):
                         {"product_id": hoodie["id"], "qty": 1, "variant": "مشکی XL پشت"}]}}]
     last = (await say("همین طرح رو روی هودی مشکی XL میخوام چاپش پشت"))[-1]["text"]
     assert "سایز رو هم" not in last and ("اضافه به سفارش" in last or "خلاصهٔ سفارشت" in last)
+
+
+async def test_router_sends_each_message_to_its_skill(client, monkeypatch):
+    """ali's idea: each message is first sorted into its part of the journey; the shop's own parts answer without
+    the sales model, the rest go to it with the part named, and an unsure router changes nothing."""
+    h, sid, llm, hoodie = await _print_shop(client, monkeypatch, "09125550067")
+    from app.services import chat_router
+    seen: list[dict] = []
+
+    async def router_json(*, task, system, prompt, **kw):
+        seen.append({"task": task, "prompt": prompt, "system": system})
+        return {"skill": next_skill.pop(0), "sure": True}
+    next_skill: list[str] = []
+    monkeypatch.setattr(chat_router.ai, "generate_json", router_json)
+    monkeypatch.setattr(chat_router, "route", REAL_ROUTE)
+
+    async def say(t, skill):
+        next_skill.append(skill)
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": t})).json()["messages"]
+
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
+    n = len(llm.calls)
+    last = (await say("دیگه چه مدل هودی دارین؟", "browse"))[-1]
+    assert last["source"] == "catalog" and "هودی چاپ طرح دلخواه" in last["text"] and len(llm.calls) == n
+    assert seen[-1]["task"] == "chat_router" and "<customer>دیگه چه مدل هودی دارین؟</customer>" in seen[-1]["prompt"]
+
+    # a product question goes to the sales model, with the part named
+    llm.answers = [{"reply": "قیمتش ۹۰۰ هزار تومنه 🌸", "intent": "product", "products": [hoodie["id"]]}]
+    await say("هودی چاپی چنده؟", "product")
+    assert "ROUTER: this message is about «product»" in llm.calls[-1]["prompt"]
+
+    # "finish it" with a cart: the journey's next step, no model
+    llm.answers = [{"reply": "باشه", "intent": "order", "order_action": "update",
+                    "order": {"items": [{"product_id": hoodie["id"], "qty": 1, "variant": "سفید M"}]}}]
+    await say("هودی چاپی سفید M میخوام", "cart")
+    n = len(llm.calls)
+    last = (await say("تمومه ثبتش کن", "checkout"))[-1]
+    assert "محل چاپ" in last["text"] and last["buttons"] == [["جلو", "پشت"]] and len(llm.calls) == n
+
+    # "off_topic" from the router while a phone number is in the message: the sales model reads it
+    llm.answers = [{"reply": "شماره ثبت شد 🌸", "intent": "order"}]
+    await say("09171234567", "off_topic")
+    assert len(llm.calls) == n + 1
+
+    # a person: handed over without the model, the cart kept
+    last = (await say("آدمین رو میخوام", "human"))[-1]
+    assert last["source"] == "handoff" and (await _state(sid)).get("order")

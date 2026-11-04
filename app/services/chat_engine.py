@@ -517,7 +517,7 @@ def dynamic_prompt(text: str, history: list[ChatMessage], products: list[Product
     if order:
         lines.append("ORDER SO FAR: " + json.dumps(order, ensure_ascii=False))
     if state.get("awaiting") == "confirm":
-        lines.append("STEP: summary — your last message showed the order summary with «تأیید می‌کنی؟ (بله / خیر)»; this "
+        lines.append("STEP: summary — your last message showed the order summary and asked for «بله»; this "
                      "message answers it.")
     elif state.get("awaiting") == "receipt" and placed:
         lines.append(f"STEP: order #{placed.id} is placed; the shop waits for the payment receipt or reference.")
@@ -823,6 +823,59 @@ async def _merge_order(db: AsyncSession, store_id: int, agent: ChatAgent, state:
     return order
 
 
+async def code_skill(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent, state: dict[str, Any],
+                     text: str, skill: str, result: TurnResult) -> bool:
+    """The router's skills the shop answers without the sales model; False: the sales model answers it."""
+    items = (state.get("order") or {}).get("items") or []
+    details = bool(norm_phone(text) or bad_phone(text))  # a phone number is never off-topic or a complaint
+    if skill == "browse" and agent.catalog_enabled:
+        answer = await catalog_answer(db, store.id, text, state.get("recent_products") or [],
+                                      policy(agent)["stock"] == "exact")
+        result.replies.append(Reply(answer, source="catalog", intent="product"))
+        return True
+    if skill == "status":
+        if answer := await order_status_reply(db, conv, store, text, state):
+            result.replies.append(Reply(answer, source="status", intent="order_status"))
+            return True
+        return False
+    if skill == "confirm" and agent.orders_enabled and state.get("awaiting") == "confirm" and items \
+            and plain_yes(text):
+        state.pop("awaiting", None)
+        await place_order(db, conv, store, agent, state, text, "", result)
+        return True
+    if skill == "cart_view" and agent.orders_enabled and items:
+        from app.services import chat_menu
+        result.replies.append(Reply(await chat_menu.cart_text(db, store.id, items), source="menu", intent="order",
+                                    buttons=[[chat_menu.ORDER], [chat_menu.EDIT_CART, chat_menu.CLEAR]]))
+        return True
+    if skill == "checkout" and agent.orders_enabled and items:
+        from app.services import chat_order
+        placed = await open_order(db, store.id, state.get("order_id"))
+        step = await chat_order.next_step(db, conv, agent, state, placed)
+        if step:
+            result.replies.append(Reply(step.text, source="order", intent="order", buttons=step.buttons))
+            return True
+        return False
+    if details:
+        return False
+    if skill == "human":
+        conv.status = "needs_human"
+        result.replies.append(Reply(HANDOFF_TEXT, source="handoff", intent="handoff"))
+        result.notify_admin.append(f"🙋 گفتگو با {conv.customer_name or 'مشتری'} به ادمین نیاز دارد: «{text[:120]}»")
+        return True
+    if skill == "complaint":
+        complaint_handoff(conv, text, result)
+        return True
+    if skill == "off_topic" and not items:
+        result.replies.append(Reply(store_text(agent.off_topic_message or DEFAULT_OFF_TOPIC, store),
+                                    source="off_topic", intent="off_topic"))
+        return True
+    if skill == "abuse":
+        report_abuse(conv, state, text, result)
+        return True
+    return False
+
+
 async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent,
                    pending: list[ChatMessage]) -> TurnResult:
     """Decides the answer to the customer's pending messages. Saves nothing that isn't on `conv`/new rows;
@@ -943,6 +996,16 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         return done()
     state.pop("slowed", None)
 
+    # 4b. The router: which part of the journey this message belongs to. The parts the shop answers by itself
+    # (browsing, an order's status, the yes, the cart, a person, off-topic…) are answered here; the rest go to the
+    # sales model below with the part named. Unsure or failed: the sales model answers as before.
+    skill = ""
+    if text and not photo:
+        from app.services import chat_router
+        skill = await chat_router.route(db, conv, store, agent, state, text)
+        if skill and await code_skill(db, conv, store, agent, state, text, skill, result):
+            return done()
+
     # 5. The model reads every message first and decides what it is and how to answer; the code below only carries
     # out that decision (places the order, shows the summary, sends photos, hands over).
     refs = (await db.execute(select(ChatReference).where(ChatReference.store_id == store.id)
@@ -983,6 +1046,8 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                                        .order_by(AiOrder.id.desc()).limit(3))).scalars().all())
     prompt = dynamic_prompt(text, history, products, state, open_now, agent.catalog_enabled, photos,
                             policy(agent)["stock"] == "exact", placed, relevant_faqs(agent, text), my_orders)
+    if skill:
+        prompt += f"\nROUTER: this message is about «{skill}»."
     try:
         out, usage = await ai.generate_chat(system=system, prompt=prompt, store_id=store.id, max_tokens=MAX_OUTPUT_TOKENS)
         if mixed_language(str(out.get("reply") or ""), text, products, store):
@@ -1180,59 +1245,23 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                 return done()
     complete = agent.orders_enabled and await items_complete(db, store.id, order.get("items") or [])
     missing = _missing_fields(agent, order) if complete else []
-    # The model decided the customer wants to buy (or it said "ثبت شد" without doing it): the shop's own next step
-    # runs now. A summary that was waiting and changed is shown again; details that just got complete show it too.
+    # When the shop's own next step replaces the model's words: the model decided they want to buy, it said "ثبت شد"
+    # without doing it, a waiting summary changed, details the customer gave just completed it, or the model asks
+    # for a choice the cart already has. What that step is comes from the journey (chat_order), as for button taps.
     claims = bool(_CLAIMS_PLACED.search(reply.text) or _CLAIMS_SHIPPING.search(reply.text)) and order.get("items")
-    go_on = complete and action != "cancel" and (
+    trigger = action != "cancel" and (
         action == "confirm" or claims or (awaiting and changed)
-        or (changed and not missing and any(given_contact[k] and given_contact[k] != before.get(k)
-                                            for k in ("name", "phone", "address")))
-        # The model asks for a size/colour/design the cart already has: the shop's next step instead.
-        or (not awaiting and bool(_ASKS_KNOWN.search(reply.text))))
+        or (complete and changed and not missing and any(given_contact[k] and given_contact[k] != before.get(k)
+                                                         for k in ("name", "phone", "address")))
+        or (complete and not awaiting and bool(_ASKS_KNOWN.search(reply.text))))
     if bad_now and agent.orders_enabled and order.get("items") and "phone" in _missing_fields(agent, order):
         reply.text, reply.intent = ask_missing(agent, state, _missing_fields(agent, order), thanks=False), "order"
-        go_on = False
-    if agent.orders_enabled and order.get("items") and (action == "confirm" or claims) and not complete:
-        # They want to buy but a choice is missing (print side, size…): ask exactly that.
-        for idx, it in enumerate(order["items"]):
-            p = await db.get(Product, it.get("product_id") or 0) if it.get("product_id") else None
-            if p and (need := missing_choice(p, str(it.get("variant") or ""))):
-                reply.text = f"برای «{p.title[:60]}» {need[0]} رو هم بگو: {'، '.join(need[1])} 🌸"
-                reply.intent = "order"
-                # The same choices as buttons; a tap is written on this line.
-                kind = next((k for k, v in variant_options(p).items() if v == need[1]), "")
-                if kind:
-                    state["menu"] = {"step": "set_choice", "line": idx, "kind": kind}
-                    reply.buttons = [need[1][i:i + 3] for i in range(0, len(need[1]), 3)]
-                break
-    no_design = []
-    for it in order.get("items") or [] if go_on else []:
-        p = await db.get(Product, it.get("product_id") or 0) if it.get("product_id") else None
-        if p and takes_design(p) and not it.get("design"):
-            no_design.append(p.title)
-    if go_on and no_design:
-        reply.text, reply.intent = f"برای «{no_design[0][:60]}» طرحی که می‌خوای چاپ بشه رو همین‌جا بفرست 🌸", "order"
-        go_on = False
-    if go_on and missing:
-        reply.text = ((agent.payment or {}).get("order_form") or "").strip()[:1000] or (
-            "برای ثبت سفارش لطفاً " + "، ".join(FIELD_NAMES.get(m, m) for m in missing) + " رو بفرست 🌸")
-        reply.intent = "order"
-        if (agent.payment or {}).get("order_form"):
-            state["form_sent"] = True
-    elif go_on:
-        lines, total = await priced_lines(db, store.id, order["items"])
-        if lines:
-            state["awaiting"] = "confirm"
-            state["summary_at"] = utcnow().isoformat()  # a "yes" tapped before this was for an older summary
-            if placed:
-                state["add_to"] = placed.id
-                items = "\n".join(line_text(i) for i in lines)
-                reply.text = (f"اضافه به سفارش #{fa_number(placed.id)}:\n{items}\n💰 مبلغ این اضافه: {money(total)}"
-                              "\n\nتأیید می‌کنی؟ (بله / خیر)")
-            else:
-                state.pop("add_to", None)
-                reply.text = "خلاصهٔ سفارشت:\n" + order_summary(order, lines, total) + "\n\nتأیید می‌کنی؟ (بله / خیر)"
-            reply.intent = "order"
+        trigger = False
+    from app.services import chat_order
+    step = (await chat_order.next_step(db, conv, agent, state, placed)
+            if agent.orders_enabled and order.get("items") and trigger else None)
+    if step:
+        reply.text, reply.buttons, reply.intent = step.text, step.buttons, "order"
     elif agent.orders_enabled and not order.get("items") and _CLAIMS_PLACED.search(reply.text):
         reply.text = "برای ثبت، اسم محصول و سایز/رنگش رو بگو تا خلاصهٔ سفارش رو برات بفرستم 🌸"
     elif awaiting and not changed and action not in ("cancel",):
@@ -1243,8 +1272,6 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         # The seller's own fixed "send us these" message, once per order, instead of asking one by one.
         reply.text, reply.intent = form[:1000], "order"
         state["form_sent"] = True
-    if reply.text.startswith(("خلاصهٔ سفارشت", "اضافه به سفارش")) and state.get("awaiting") == "confirm":
-        reply.buttons = [["✅ بله، ثبت کن", "✏️ تغییر می‌خوام"]]
     if reply.text:
         result.replies.append(reply)
     elif not handoff:
