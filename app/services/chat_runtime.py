@@ -140,13 +140,14 @@ async def receive(db: AsyncSession, bot: ChatBot, inbound: tg.Inbound) -> int | 
 
 def add_message(db: AsyncSession, conv: ChatConversation, *, role: str, text: str = "", image_url: str = "",
                 source: str = "", intent: str = "", usage: dict[str, Any] | None = None,
-                external_id: str = "") -> ChatMessage:
+                external_id: str = "", buttons: list[list[str]] | None = None) -> ChatMessage:
     usage = usage or {}
     m = ChatMessage(created_at=utcnow(), conversation_id=conv.id, store_id=conv.store_id, role=role, text=text,
                     image_url=image_url, source=source, intent=intent, model=usage.get("model", ""),
                     input_tokens=usage.get("input_tokens", 0), output_tokens=usage.get("output_tokens", 0),
                     cached_tokens=usage.get("cached_tokens", 0), cost_toman=usage.get("cost_toman", 0),
-                    latency_ms=usage.get("latency_ms", 0), external_id=external_id, is_test=conv.is_test)
+                    latency_ms=usage.get("latency_ms", 0), external_id=external_id, is_test=conv.is_test,
+                    buttons=buttons or None)
     db.add(m)
     conv.message_count = (conv.message_count or 0) + 1
     conv.last_message_at = m.created_at
@@ -225,7 +226,7 @@ async def answer(conv_id: int, *, send: bool = True) -> list[ChatMessage]:
         saved: list[ChatMessage] = []
         for r in result.replies:
             saved.append(add_message(db, conv, role="ai", text=r.text, image_url=r.image_url, source=r.source,
-                                     intent=r.intent, usage=r.usage))
+                                     intent=r.intent, usage=r.usage, buttons=r.buttons))
         if result.notify_admin:
             for note in result.notify_admin:
                 # The first line is the title; the rest (e.g. what the customer chose) goes in the body.
@@ -234,7 +235,7 @@ async def answer(conv_id: int, *, send: bool = True) -> list[ChatMessage]:
         await db.commit()
         if send and not conv.is_test and conv.bot_id:
             bot = await db.get(ChatBot, conv.bot_id)
-            await deliver(db, bot, conv, result.replies, saved)
+            await deliver(db, bot, conv, result.replies, saved, menu=agent.orders_enabled)
             if result.notify_admin:
                 await notify_admin_chat(bot, "\n".join(result.notify_admin), conv)
             await db.commit()
@@ -245,25 +246,46 @@ def _conv_link(conv: ChatConversation) -> str:
     return f"/app/s/{conv.store_id}/chat?tab=conversations&c={conv.id}"
 
 
+def keyboard(buttons: list[list[str]] | None, menu: bool) -> dict[str, Any] | None:
+    """The reply's own choices (gone after a tap), or the shop's two fixed buttons under the chat."""
+    from app.services.chat_menu import MAIN_BUTTONS, SEND_PHONE
+
+    def key(label: str) -> dict[str, Any]:
+        return {"text": label, "request_contact": True} if label == SEND_PHONE else {"text": label}
+
+    if buttons:
+        return {"keyboard": [[key(b) for b in row] for row in buttons], "resize_keyboard": True,
+                "one_time_keyboard": True}
+    if menu:
+        return {"keyboard": [[key(b) for b in row] for row in MAIN_BUTTONS], "resize_keyboard": True,
+                "is_persistent": True}
+    return None
+
+
 async def deliver(db: AsyncSession, bot: ChatBot | None, conv: ChatConversation, replies: list[Reply],
-                  saved: list[ChatMessage]) -> None:
+                  saved: list[ChatMessage], menu: bool = False) -> None:
     if not bot or bot.status == "disconnected":
         return
     biz = conv.business_connection_id if conv.mode == "business" else ""
-    for reply, row in zip(replies, saved):
+    last = len(replies) - 1
+    for n, (reply, row) in enumerate(zip(replies, saved)):
+        # Buttons go on the turn's last message, in the store's own bot only (a business chat is the seller's own
+        # personal chat: plain text there; typing works the same).
+        markup = keyboard(reply.buttons, menu) if n == last and not biz else None
         try:
             if reply.image_url and (local := read_local(reply.image_url)):
                 data, mime = local
                 row.external_id = await tg.send_photo(bot, conv.external_chat_id, data, "photo" + _ext(mime),
-                                                      reply.text, biz)
+                                                      reply.text, biz, markup)
             elif reply.image_url.startswith(("http://", "https://")):
                 try:
-                    row.external_id = await tg.send_photo_url(bot, conv.external_chat_id, reply.image_url, reply.text, biz)
+                    row.external_id = await tg.send_photo_url(bot, conv.external_chat_id, reply.image_url, reply.text,
+                                                              biz, markup)
                 except PlatformError:  # the messenger could not fetch the picture: still send the caption
                     if reply.text:
-                        row.external_id = await tg.send_text(bot, conv.external_chat_id, reply.text, biz)
+                        row.external_id = await tg.send_text(bot, conv.external_chat_id, reply.text, biz, markup)
             elif reply.text:
-                row.external_id = await tg.send_text(bot, conv.external_chat_id, reply.text, biz)
+                row.external_id = await tg.send_text(bot, conv.external_chat_id, reply.text, biz, markup)
         except PlatformError as exc:
             bot.last_error = exc.message_fa
             log.warning("chat send failed: %s", exc.message_fa)

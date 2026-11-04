@@ -405,7 +405,7 @@ def _msg_out(m: ChatMessage) -> dict[str, Any]:
     return {"id": m.id, "created_at": m.created_at, "role": m.role, "text": m.text, "image_url": m.image_url,
             "source": m.source, "intent": m.intent, "model": m.model, "input_tokens": m.input_tokens,
             "output_tokens": m.output_tokens, "cached_tokens": m.cached_tokens, "cost_toman": m.cost_toman,
-            "latency_ms": m.latency_ms}
+            "latency_ms": m.latency_ms, "buttons": m.buttons or []}
 
 
 async def _test_conv(db, store_id: int, user: User) -> ChatConversation:

@@ -7,6 +7,7 @@ prices, totals, off-topic answers and the payment text."""
 
 import secrets
 import json
+import copy
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta, timezone
@@ -145,6 +146,7 @@ class Reply:
     source: str = "llm"  # llm | faq | welcome | away | canned | receipt | limit | off_topic | handoff | order
     intent: str = ""
     usage: dict[str, Any] = field(default_factory=dict)
+    buttons: list[list[str]] | None = None  # rows of tap-to-answer labels (bot mode only; typing works too)
 
 
 @dataclass
@@ -811,7 +813,9 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
     """Decides the answer to the customer's pending messages. Saves nothing that isn't on `conv`/new rows;
     the caller saves the replies and sends them."""
     result = TurnResult()
-    state = dict(conv.state or {})
+    # A deep copy: a change inside a cart line (its design, its print side) must differ from the saved state, or the
+    # JSON column sees "no change" and drops it.
+    state = copy.deepcopy(dict(conv.state or {}))
     text = "\n".join(m.text for m in pending if m.text).strip()[:MAX_INPUT_CHARS]
     photo = next((m.image_url for m in reversed(pending) if m.image_url), "")
     unsupported = all(not m.text and not m.image_url for m in pending)
@@ -854,6 +858,13 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                 result.notify_admin.append(f"🧾 فیش/کد پرداخت سفارش #{order.id} ({money(order.total_toman)}) از "
                                            f"{order.customer_name or conv.customer_name or 'مشتری'} رسید.")
                 return done()
+
+    if text and not photo:
+        # A tap on the cart / order buttons (or the one thing a button step asked for): answered by code.
+        from app.services import chat_menu
+        if (tapped := await chat_menu.handle(db, conv, store, agent, state, text, result)) is not None:
+            result.replies += tapped
+            return done()
 
     if unsupported:
         result.replies.append(Reply(UNSUPPORTED_TEXT, source="canned"))
@@ -1149,11 +1160,16 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         go_on = False
     if agent.orders_enabled and order.get("items") and (action == "confirm" or claims) and not complete:
         # They want to buy but a choice is missing (print side, size…): ask exactly that.
-        for it in order["items"]:
+        for idx, it in enumerate(order["items"]):
             p = await db.get(Product, it.get("product_id") or 0) if it.get("product_id") else None
             if p and (need := missing_choice(p, str(it.get("variant") or ""))):
                 reply.text = f"برای «{p.title[:60]}» {need[0]} رو هم بگو: {'، '.join(need[1])} 🌸"
                 reply.intent = "order"
+                # The same choices as buttons; a tap is written on this line.
+                kind = next((k for k, v in variant_options(p).items() if v == need[1]), "")
+                if kind:
+                    state["menu"] = {"step": "set_choice", "line": idx, "kind": kind}
+                    reply.buttons = [need[1][i:i + 3] for i in range(0, len(need[1]), 3)]
                 break
     no_design = []
     for it in order.get("items") or [] if go_on else []:
@@ -1192,6 +1208,8 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         # The seller's own fixed "send us these" message, once per order, instead of asking one by one.
         reply.text, reply.intent = form[:1000], "order"
         state["form_sent"] = True
+    if reply.text.startswith(("خلاصهٔ سفارشت", "اضافه به سفارش")) and state.get("awaiting") == "confirm":
+        reply.buttons = [["✅ بله، ثبت کن", "✏️ تغییر می‌خوام"]]
     if reply.text:
         result.replies.append(reply)
     elif not handoff:

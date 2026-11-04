@@ -4,6 +4,7 @@ Two ways in (spec §2): the store's own bot (`message` updates from private chat
 (`business_connection` + `business_message`), where the bot answers in the seller's personal chats."""
 
 import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -51,28 +52,35 @@ async def get_updates(bot: ChatBot, offset: int, timeout: int = 25) -> list[dict
     return data.get("result") or []
 
 
-async def send_text(bot: ChatBot, chat_id: str, text: str, business_connection_id: str = "") -> str:
+async def send_text(bot: ChatBot, chat_id: str, text: str, business_connection_id: str = "",
+                    markup: dict[str, Any] | None = None) -> str:
     data: dict[str, Any] = {"chat_id": chat_id, "text": text[:4000]}
     if business_connection_id:
         data["business_connection_id"] = business_connection_id
+    if markup:
+        data["reply_markup"] = markup
     result = await call(bot, "sendMessage", data)
     return str((result or {}).get("message_id", ""))
 
 
 async def send_photo(bot: ChatBot, chat_id: str, image: bytes, filename: str, caption: str = "",
-                     business_connection_id: str = "") -> str:
+                     business_connection_id: str = "", markup: dict[str, Any] | None = None) -> str:
     data: dict[str, Any] = {"chat_id": str(chat_id), "caption": caption[:1000]}
     if business_connection_id:
         data["business_connection_id"] = business_connection_id
+    if markup:
+        data["reply_markup"] = json.dumps(markup, ensure_ascii=False)  # a form field: JSON as text
     result = await call(bot, "sendPhoto", data, files={"photo": (filename, image)})
     return str((result or {}).get("message_id", ""))
 
 
 async def send_photo_url(bot: ChatBot, chat_id: str, url: str, caption: str = "",
-                         business_connection_id: str = "") -> str:
+                         business_connection_id: str = "", markup: dict[str, Any] | None = None) -> str:
     data: dict[str, Any] = {"chat_id": str(chat_id), "photo": url, "caption": caption[:1000]}
     if business_connection_id:
         data["business_connection_id"] = business_connection_id
+    if markup:
+        data["reply_markup"] = markup
     result = await call(bot, "sendPhoto", data)
     return str((result or {}).get("message_id", ""))
 
