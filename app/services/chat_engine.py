@@ -561,6 +561,61 @@ def catalog_overview(rows: list[Product], exact_stock: bool) -> str:
     return f"{head}\n" + "\n".join(lines) + f"\n{tail}"
 
 
+_BROWSE_WORDS = set("""دیگه دیگر دیگری مدل مدلا مدلای مدلهای مدل‌های مدلها طرح طرحا طرحای طرحهای طرح‌های نشون نشونم
+بدی بده بهم میتونی می‌تونی میشه داریم دارید ببینم چیزی چیا چیزایی چیزای هایی های رنگ رنگای سایز جنس نوع انواع بیشتر
+بقیه همه همین اون محصول محصولات محصولی جنس کار کارای لباس""".split())
+_ANOTHER = re.compile(r"(دیگه|دیگر|بقیه|غیر\s*از|به\s*جز|مشابه|شبیه)")
+
+
+def _rank(rows: list[Product], q: set[str], text_of) -> list[Product]:
+    scored = [(n, p) for p in rows if (n := _overlap(q, words(text_of(p))))]
+    top = max((n for n, _ in scored), default=0)
+    return [p for n, p in scored if n == top]
+
+
+async def catalog_answer(db: AsyncSession, store_id: int, text: str, recent: list[int], exact_stock: bool) -> str:
+    """"What do you have / other Spider-Man designs?": the products the words name (by title, category, kind and
+    tags; then by description). None of them: we don't have it, and what we do have in that category."""
+    rows = await catalog_rows(db, store_id)
+    q = {w for w in words(text) if not _overlap({w}, _BROWSE_WORDS)}  # "محصولاتی", "مدلای" are browse words too
+    if not q:
+        return catalog_overview(rows, exact_stock)
+    # Kind words ("هودی") pick the category; the rest ("اسپایدرمن", "بتمن") must match the product itself.
+    kinds = set().union(*[words(f"{p.category or ''} {p.category_hint}") for p in rows]) if rows else set()
+    specific = {w for w in q if not _overlap({w}, kinds)}
+    generic = q - specific
+    named = _rank(rows, specific or q, lambda p: f"{p.title} {p.category or ''} {p.category_hint} {' '.join(p.tags or [])}")
+    if not named:
+        named = _rank(rows, specific or q, lambda p: p.description or "")
+    if named and generic and specific:
+        named = [p for p in named if _overlap(generic, words(f"{p.title} {p.category or ''} {p.category_hint}"))] or named
+    last = next((p for p in rows if recent and p.id == recent[-1]), None)
+    asked = " ".join(sorted(q, key=lambda w: norm(text).find(w)))
+    if named and not (_ANOTHER.search(text) and all(p.id in recent for p in named)):
+        return catalog_overview(named, exact_stock)
+    # Nothing (else) like it: say so, and offer the rest of the category it belongs to.
+    cats = {p.category for p in named if p.category} or ({last.category} if last and last.category else set())
+    if generic or not cats:
+        cats = {p.category for p in rows if p.category and _overlap(generic or q, words(p.category))} or cats
+    same = [p for p in rows if p.category in cats and p not in named] if cats else []
+    if named:
+        head = (f"از «{asked}» فقط همین " + "، ".join(f"«{p.title[:60]}»" for p in named[:3]) + " رو داریم 🙏")
+    else:
+        head = f"ببخشید، «{asked}» نداریم 🙏"
+    if same:
+        lines = [f"▫️ {p.title[:80]}" + (f" (کد {p.sku})" if p.sku else "") + (f" — {money(p.price)}" if p.price else "")
+                 + (" (ناموجود)" if p.stock_qty <= 0 else "")
+                 for p in sorted(same, key=lambda p: (p.stock_qty <= 0, p.status != "ready"))[:CATALOG_SHOW]]
+        return head + f"\nاز {'، '.join(sorted(cats))} این‌ها رو داریم:\n" + "\n".join(lines) + "\nکدوم رو ببینی؟"
+    counts: dict[str, int] = {}
+    for p in rows:
+        if p.category:
+            counts[p.category] = counts.get(p.category, 0) + 1
+    if counts:
+        return head + "\nدسته‌هامون: " + "، ".join(sorted(counts, key=lambda c: -counts[c])[:12]) + "\nکدوم رو ببینی؟"
+    return head
+
+
 async def catalog_rows(db: AsyncSession, store_id: int) -> list[Product]:
     return list((await db.execute(select(Product).where(Product.store_id == store_id, Product.status != "archived")
                                   .order_by(Product.id.desc()).limit(3000))).scalars().all())
@@ -937,9 +992,9 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
     if intent == "catalog" and agent.catalog_enabled:
         # "What do you have?": the real list from the catalog, so nothing is made up.
         # A product or kind named in the message: only the matching products, not the whole shop.
-        rows = products if found else await catalog_rows(db, store.id)
-        result.replies.append(Reply(catalog_overview(rows, policy(agent)["stock"] == "exact"), source="catalog",
-                                    intent="product", usage=usage))
+        answer = await catalog_answer(db, store.id, text, state.get("recent_products") or [],
+                                      policy(agent)["stock"] == "exact")
+        result.replies.append(Reply(answer, source="catalog", intent="product", usage=usage))
         return done()
     if intent == "order_status" and not reply_text.strip():
         # "Where is my order?": the details come from the orders themselves. A follow-up ("why?", "when?") is
@@ -985,6 +1040,20 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
     else:
         # With AI ordering off this is only a note of what they chose, for the admin who takes the order.
         hint = " ".join([text, str(out.get("reply") or "")] + [m.text for m in history if m.role == "customer"][-3:])
+        given = out.get("order") if isinstance(out.get("order"), dict) else {}
+        last = (state.get("recent_products") or [None])[-1]
+        have = (state.get("order") or {}).get("items") or []
+        if (agent.orders_enabled and last and not given.get("items") and not placed
+                and (not have or (len(have) == 1 and have[0].get("product_id") == last))
+                and (_WANTS_IT.search(text) or have) and (_sizes_in(text) or _colors_in(text))):
+            # The model answered "yes, 2XL black is in stock" but left the cart empty: the product being talked
+            # about goes in with what they picked (a later pick changes only that choice), so the summary follows.
+            old = str(have[0].get("variant") or "") if have else ""
+            pick = " ".join(sorted(_colors_in(text) or _colors_in(old)) + sorted(_sizes_in(text) or _sizes_in(old)))
+            if not have or _flat(pick) != _flat(old):
+                out["order"] = {**given, "items": [{"product_id": last, "qty": int(have[0].get("qty") or 1) if have
+                                                    else 1, "variant": pick}]}
+                action = "update" if action == "none" else action
         state["order"] = await _merge_order(db, store.id, agent, state, out.get("order"), products, hint, action)
         if not state["order"]:
             state.pop("order")
@@ -1126,7 +1195,7 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         # Photos first, then the words: "here it is, which size?" must not arrive before the picture.
         at = result.replies.index(reply) if reply in result.replies else len(result.replies)
         result.replies[at:at] = sent
-    elif with_photos and not offering and _PHOTOS_HERE.search(reply.text):
+    elif with_photos and not offering and (_PHOTOS_HERE.search(reply.text) or _WANTS_PHOTO.search(text)):
         # The reply says "here are its photos" but the model named none: the product being talked about.
         ids = resolve_mentioned(with_photos, shown or (state.get("recent_products") or [])[-1:], reply.text)
         sent = await product_photos(db, with_photos, ids[:1], text)
@@ -1342,6 +1411,7 @@ async def items_complete(db: AsyncSession, store_id: int, items: list[dict[str, 
     return True
 
 
+_WANTS_IT = re.compile(r"(می\s*‌?خوام|میخوام|بردار|برمی\s*‌?دارم|ثبت|سفارش|بفرست\s*برام|بگیرم|می\s*‌?گیرم|میگیرم)")
 _CLAIMS_PLACED = re.compile(r"(ثبت\s*(شد|کردم|کردیم|گردید)|سفارش(ت|تون)?\s*(رو\s*)?(ثبت|گذاشتم|زدم)|در\s*نظر\s*گرفتم|"
                             r"براتون\s*(گذاشتم|کنار\s*گذاشتم)|برات\s*(گذاشتم|کنار\s*گذاشتم))")
 
@@ -1406,8 +1476,11 @@ _MORE_PHOTOS = re.compile(r"عکس\s*‌?(ها|های|اش|اشو|ا)\b|عکسا
 MAX_PHOTOS = 3
 
 
-_PHOTOS_HERE = re.compile(r"(اینم\s*عکس|این\s*(هم\s*)?عکس|عکس\S{0,4}\s*(رو\s*)?(براتون|برات|براش)?\s*"
-                          r"(فرستادم|می\s*‌?فرستم|میفرستم|ارسال\s*کردم))")
+_PHOTOS_HERE = re.compile(r"(اینم\s*عکس|این\s*(هم\s*)?عکس|(عکس|تصویر)[^.!؟?\n]{0,60}?"
+                          r"(فرستادم|می\s*‌?فرستم|میفرستم|ارسال\s*کردم|ارسال\s*می\s*‌?کنم|براتون\s*می\s*‌?ذارم))")
+# The customer asks to see it ("ببینم عکسش", "عکس خود کار رو بفرست"): a photo goes even when the model forgot.
+_WANTS_PHOTO = re.compile(r"(عکس|تصویر|فیلم)\S*[^.!؟?\n]{0,25}?(ببینم|بفرست|بده|نشون|بذار|داری)|"
+                          r"(ببینم|بفرست|نشونم\s*بده)[^.!؟?\n]{0,25}?(عکس|تصویر)")
 _OFFER = re.compile(r"(بفرستم|بفرستیم|ببینی|ببینید|می‌خوای|میخوای|می‌خواید|میخواید)")
 
 

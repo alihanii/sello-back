@@ -1469,3 +1469,48 @@ async def test_size_chart_image_is_read_once(client, monkeypatch):
     await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
     await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "عرض سایز M چنده؟"})
     assert calls == ["chat_vision"] and "M: عرض 56، قد 72" in llm.calls[-1]["system"]
+
+
+async def test_spiderman_chat_photo_cart_and_other_designs(client, monkeypatch):
+    """ali's chat: the promised photo never came, «سایز دوایکس رو میخوام رنگ مشکی» left the cart empty, and
+    «دیگه چه مدلایی از اسپایدرمن موجوده؟» got the whole catalog."""
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550062")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        "enabled": True, "orders_enabled": True, "payment": {"card_number": "6037991234567890"}})
+    from app.core.db import SessionLocal
+    from app.models import Product, ProductImage
+    async with SessionLocal() as db:
+        spider = Product(store_id=sid, title="ست هودی اسپایدرمن", price=2000000, stock_qty=5, category="هودی",
+                         attributes={"رنگ": "مشکی", "سایز": "L، XL، 2XL"})
+        octo = Product(store_id=sid, title="هودی اختاپوس", price=2000000, stock_qty=1, category="هودی")
+        jean = Product(store_id=sid, title="شلوار جین مام فیت", price=3000000, stock_qty=1, category="شلوار")
+        db.add_all([spider, octo, jean])
+        await db.flush()
+        db.add(ProductImage(product_id=spider.id, url="/media/x/spider.jpg"))
+        await db.commit()
+        sp, oc = spider.id, octo.id
+
+    async def say(t):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": t})).json()["messages"]
+
+    await say("سلام")
+    llm.answers = [{"reply": "سلام! ست هودی اسپایدرمن رو داریم که رنگ مشکی داره.", "intent": "product",
+                    "products": [sp]}]
+    await say("هودی مشکی اسپایدرمن میخوام")
+    llm.answers = [{"reply": "حتما، عکس ست هودی اسپایدرمن رو براتون می‌فرستم.", "intent": "product"}]
+    msgs = await say("ببینم عکس خود کاررو")
+    assert "/media/x/spider.jpg" in [m["image_url"] for m in msgs]
+
+    llm.answers = [{"reply": "حتما، سایز 2XL رنگ مشکی موجود هست.", "intent": "product"}]
+    await say("سایز دوایکس رو میخوام رنگ مشکی")
+    st = await _state(sid)
+    assert st["order"]["items"][0]["product_id"] == sp and "2XL" in st["order"]["items"][0]["variant"]
+
+    llm.answers = [{"reply": "", "intent": "catalog"}]
+    last = (await say("یه طرح دیگه میتونی بهم نشون بدی؟دیگه چه مدلایی از اسپایدرمن موجوده؟"))[-1]["text"]
+    assert "فقط همین «ست هودی اسپایدرمن»" in last and "هودی اختاپوس" in last and "شلوار" not in last
+
+    llm.answers = [{"reply": "", "intent": "catalog"}]
+    last = (await say("هودی بتمن دارین؟"))[-1]["text"]
+    assert "نداریم" in last and "هودی اختاپوس" in last and "جین" not in last
+    assert oc
