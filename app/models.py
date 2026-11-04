@@ -508,6 +508,8 @@ class ChatReference(TimestampMixin, Base):
     keywords: Mapped[str] = mapped_column(String(300), default="")
     text: Mapped[str] = mapped_column(Text, default="")
     image_url: Mapped[str] = mapped_column(String(1000), default="")
+    # What the image says (a size chart's numbers…), read once by the vision model; None = not read yet.
+    read_text: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class ChatAnswerCache(Base):
