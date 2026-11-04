@@ -569,11 +569,25 @@ def catalog_overview(rows: list[Product], exact_stock: bool) -> str:
 _BROWSE_WORDS = set("""دیگه دیگر دیگری مدل مدلا مدلای مدلهای مدل‌های مدلها طرح طرحا طرحای طرحهای طرح‌های نشون نشونم
 بدی بده بهم میتونی می‌تونی میشه داریم دارید ببینم چیزی چیا چیزایی چیزای هایی های رنگ رنگای سایز جنس نوع انواع بیشتر
 بقیه همه همین اون محصول محصولات محصولی جنس کار کارای لباس""".split())
+# "other designs / what models of X do you have": the shop's own search answers, even when the model missed it.
+_BROWSE_Q = re.compile(r"((مدل|طرح)\S*\s*(های|‌های)?\s*(دیگه|دیگر|دیگری)|یه\s*(طرح|مدل)\s*دیگه|دیگه\s*چه\s*(مدل|طرح)|"
+                       r"(چه|کدوم|چند)\s*(تا\s*)?(مدل|طرح)\S*\s*(از|اسپ|دارین|دارید|داری|موجود))")
 _ANOTHER = re.compile(r"(دیگه|دیگر|بقیه|غیر\s*از|به\s*جز|مشابه|شبیه)")
 
 
-def _rank(rows: list[Product], q: set[str], text_of) -> list[Product]:
-    scored = [(n, p) for p in rows if (n := _overlap(q, words(text_of(p))))]
+def _strict_overlap(query: set[str], target: set[str]) -> int:
+    """Words in common, allowing only a short Persian suffix ("اسپایدرمنی"), not any shared beginning."""
+    n = 0
+    for w in query:
+        if any(w == t or (len(w) >= 3 and t.startswith(w) and len(t) - len(w) <= 3)
+               or (len(t) >= 5 and w.startswith(t) and len(w) - len(t) <= 3) for t in target):
+            n += 1
+    return n
+
+
+def _rank(rows: list[Product], q: set[str], text_of, strict: bool = False) -> list[Product]:
+    match = _strict_overlap if strict else _overlap
+    scored = [(n, p) for p in rows if (n := match(q, words(text_of(p))))]
     top = max((n for n, _ in scored), default=0)
     return [p for n, p in scored if n == top]
 
@@ -589,9 +603,10 @@ async def catalog_answer(db: AsyncSession, store_id: int, text: str, recent: lis
     kinds = set().union(*[words(f"{p.category or ''} {p.category_hint}") for p in rows]) if rows else set()
     specific = {w for w in q if not _overlap({w}, kinds)}
     generic = q - specific
-    named = _rank(rows, specific or q, lambda p: f"{p.title} {p.category or ''} {p.category_hint} {' '.join(p.tags or [])}")
+    named = _rank(rows, specific or q, lambda p: f"{p.title} {p.category or ''} {p.category_hint} {' '.join(p.tags or [])}",
+                  strict=bool(specific))
     if not named:
-        named = _rank(rows, specific or q, lambda p: p.description or "")
+        named = _rank(rows, specific or q, lambda p: p.description or "", strict=bool(specific))
     if named and generic and specific:
         named = [p for p in named if _overlap(generic, words(f"{p.title} {p.category or ''} {p.category_hint}"))] or named
     last = next((p for p in rows if recent and p.id == recent[-1]), None)
@@ -819,6 +834,7 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
     text = "\n".join(m.text for m in pending if m.text).strip()[:MAX_INPUT_CHARS]
     photo = next((m.image_url for m in reversed(pending) if m.image_url), "")
     unsupported = all(not m.text and not m.image_url for m in pending)
+    seen_early: dict[str, Any] | None = None  # the photo, when it was already read at the receipt step
 
     def done() -> TurnResult:
         conv.state = state
@@ -843,7 +859,16 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         ref = re.search(r"\d[\d\s-]{3,}\d", t)
         is_ref = bool(ref and len(re.sub(r"\D", "", ref.group())) >= 4 and not norm_phone(t) and not bad_phone(t)
                       and (_PAID.search(text) or not re.sub(r"[\d\s-]", "", t)))
-        if photo or is_ref:
+        if photo and not is_ref:
+            # Any photo used to count as the receipt: a design sent for the next order was lost as "payment".
+            seen_early = await read_photo(db, store, agent, photo, text)
+            if seen_early and seen_early["kind"] in ("design", "product"):
+                photo_is_receipt = False
+            else:
+                photo_is_receipt = True
+        else:
+            photo_is_receipt = bool(photo)
+        if photo_is_receipt or is_ref:
             order = await db.get(AiOrder, state["order_id"])
             if order and order.status == "awaiting_payment":
                 if photo:
@@ -862,7 +887,8 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
     if text and not photo:
         # A tap on the cart / order buttons (or the one thing a button step asked for): answered by code.
         from app.services import chat_menu
-        if (tapped := await chat_menu.handle(db, conv, store, agent, state, text, result)) is not None:
+        sent_at = _aware(pending[-1].created_at) if pending and pending[-1].created_at else None
+        if (tapped := await chat_menu.handle(db, conv, store, agent, state, text, result, sent_at)) is not None:
             result.replies += tapped
             return done()
 
@@ -927,7 +953,7 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
     if photo:
         # The customer's photo is read by the vision model (its own, stronger model in the AI routes), and the chat
         # model gets what it shows as text.
-        seen = await read_photo(db, store, agent, photo, text)
+        seen = seen_early if seen_early is not None else await read_photo(db, store, agent, photo, text)
         if not seen:
             if not text:
                 result.replies.append(Reply(PHOTO_TEXT, source="canned"))
@@ -1003,7 +1029,9 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         result.replies.append(Reply(store_text(agent.off_topic_message or DEFAULT_OFF_TOPIC, store), source="off_topic",
                                     intent="off_topic", usage=usage))
         return done()
-    if intent == "catalog" and agent.catalog_enabled:
+    browsing = (intent not in ("catalog", "order", "order_status") and not shown and bool(_BROWSE_Q.search(text))
+                and bool({w for w in words(text) if not _overlap({w}, _BROWSE_WORDS)}))
+    if (intent == "catalog" or browsing) and agent.catalog_enabled:
         # "What do you have?": the real list from the catalog, so nothing is made up.
         # A product or kind named in the message: only the matching products, not the whole shop.
         answer = await catalog_answer(db, store.id, text, state.get("recent_products") or [],
@@ -1104,6 +1132,9 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
     if policy(agent)["stock"] == "available":
         reply_text = hide_stock_counts(reply_text)
     reply = Reply(reply_text[:1500], source="llm", intent=intent, usage=usage)
+    # What the customer gave in this chat; details carried over from an earlier order don't count as "just given"
+    # (else "I want the Spider-Man hoodie" jumped straight to a summary).
+    given_contact = {k: order.get(k) for k in ("name", "phone", "address")}
     earlier = placed or (await last_order(db, conv) if agent.orders_enabled and order.get("items") else None)
     if agent.orders_enabled and earlier and order.get("items"):
         # Adding to a placed order, or a new order after an earlier one: the contact details carry over, nothing is
@@ -1154,7 +1185,10 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
     claims = bool(_CLAIMS_PLACED.search(reply.text) or _CLAIMS_SHIPPING.search(reply.text)) and order.get("items")
     go_on = complete and action != "cancel" and (
         action == "confirm" or claims or (awaiting and changed)
-        or (changed and not missing and any(order.get(k) != before.get(k) for k in ("name", "phone", "address"))))
+        or (changed and not missing and any(given_contact[k] and given_contact[k] != before.get(k)
+                                            for k in ("name", "phone", "address")))
+        # The model asks for a size/colour/design the cart already has: the shop's next step instead.
+        or (not awaiting and bool(_ASKS_KNOWN.search(reply.text))))
     if bad_now and agent.orders_enabled and order.get("items") and "phone" in _missing_fields(agent, order):
         reply.text, reply.intent = ask_missing(agent, state, _missing_fields(agent, order), thanks=False), "order"
         go_on = False
@@ -1189,6 +1223,7 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         lines, total = await priced_lines(db, store.id, order["items"])
         if lines:
             state["awaiting"] = "confirm"
+            state["summary_at"] = utcnow().isoformat()  # a "yes" tapped before this was for an older summary
             if placed:
                 state["add_to"] = placed.id
                 items = "\n".join(line_text(i) for i in lines)
@@ -1459,6 +1494,8 @@ async def items_complete(db: AsyncSession, store_id: int, items: list[dict[str, 
 # "Being prepared / on its way": only true of a placed order, never of a cart that waits for its summary.
 _CLAIMS_SHIPPING = re.compile(r"(در\s*حال\s*(آماده|اماده|ارسال|پردازش)|آماده\s*‌?(سازی|ی\s*ارسال)|ارسال\s*(شد|کردیم|می\s*‌?شه|میشه)"
                               r"|فرستادیم|پست\s*(شد|کردیم))")
+_ASKS_KNOWN = re.compile(r"(سایز|رنگ|محل\s*چاپ|طرح)[^.!؟?\n]{0,40}?(بفرمایید|بگید|بگو|بفرستید|بفرست|مد\s*نظر|"
+                         r"می\s*‌?خوای|میخوای|می\s*‌?خواید|میخواید|انتخاب\s*کن)")
 _QUESTION = re.compile(r"[؟?]|چجوری|چطوری|چطوره|چنده|چقدره|چیه|چند\s*(سانت|سانتی)|ابعاد|جدول")
 _WANTS_IT = re.compile(r"(می\s*‌?خوام|میخوام|بردار|برمی\s*‌?دارم|ثبت|سفارش|بفرست\s*برام|بگیرم|می\s*‌?گیرم|میگیرم)")
 _CLAIMS_PLACED = re.compile(r"(ثبت\s*(شد|کردم|کردیم|گردید|می\s*‌?کنم|میکنم|می\s*‌?کنیم)|سفارش(ت|تون)?\s*(رو\s*)?(ثبت|گذاشتم|زدم)|در\s*نظر\s*گرفتم|"

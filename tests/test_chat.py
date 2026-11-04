@@ -4,7 +4,7 @@ import re
 import json
 
 import pytest
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from app.platforms.botapi import BotApiAdapter
 from app.services import ai, chat_engine
@@ -1671,3 +1671,76 @@ async def test_cart_buttons_cancel_and_typing(client, monkeypatch):
     await say(menu.CH_CANCEL)
     assert (await say(menu.YES_CANCEL))[-1]["text"] == menu.CANCELLED
     assert "order" not in (await _state(sid))
+
+
+async def test_third_spiderman_chat(client, monkeypatch):
+    """ali's third try: an old order's details jumped to a summary, a design photo was taken as order #6's receipt,
+    «سایز رو بفرمایید» repeated with the size in the cart, a yes tapped under an older summary, «مدل‌های دیگه»
+    answered vaguely, and «هودی وارداتی» came up as Spider-Man."""
+    h, sid, llm, hoodie = await _print_shop(client, monkeypatch, "09125550066")
+    from app.core.db import SessionLocal
+    from app.models import AiOrder, Product, ProductImage
+    from app.services import chat_menu as menu
+    async with SessionLocal() as db:
+        spider = Product(store_id=sid, title="ست هودی اسپایدرمن", price=2000000, stock_qty=5, category="هودی",
+                         attributes={"رنگ": "مشکی"})
+        imported = Product(store_id=sid, title="هودی وارداتی", price=2000000, stock_qty=5, category="هودی",
+                           tags=["اسپ"])
+        db.add_all([spider, imported])
+        await db.flush()
+        db.add(ProductImage(product_id=spider.id, url="/media/x/spider.jpg"))
+        await db.commit()
+        sp = spider.id
+
+    async def say(t):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": t})).json()["messages"]
+
+    await say("سلام")
+    async with SessionLocal() as db:
+        conv = (await db.execute(select(chat_engine.ChatConversation).where(
+            chat_engine.ChatConversation.store_id == sid, chat_engine.ChatConversation.is_test))).scalars().first()
+        db.add(AiOrder(store_id=sid, conversation_id=conv.id, customer_name="سید علی هانی", customer_phone="09233333333",
+                       customer_address="قم دورشهر کوچه ۲", items=[], status="confirmed", is_test=True))
+        await db.commit()
+
+    # 1. wanting it is not yet the summary, even with an old order's details at hand
+    llm.answers = [{"reply": "ست هودی اسپایدرمن مشکی رو داریم 🌸", "intent": "product", "products": [sp]}]
+    assert "خلاصهٔ سفارشت" not in (await say("هودی مشکی اسپایدرمن میخوام"))[-1]["text"]
+
+    # 2. "other Spider-Man models?" read by the model as a product chat: the shop's search answers
+    llm.answers = [{"reply": "سلام! بله حتماً. طرح‌های دیگه رو توی محصولاتمون ببینید.", "intent": "product"}]
+    last = (await say("یه طرح دیگه میتونی بهم نشون بدی؟دیگه چه مدلایی از اسپایدرمن موجوده؟"))[-1]["text"]
+    assert "فقط همین «ست هودی اسپایدرمن»" in last and "وارداتی" not in last.split("داریم:")[0]
+
+    # 3. a yes tapped under an older summary shows the new one first
+    llm.answers = [{"reply": "", "intent": "order", "order_action": "confirm",
+                    "order": {"items": [{"product_id": sp, "qty": 1, "variant": "مشکی"}]}}]
+    assert "خلاصهٔ سفارشت" in (await say("همین رو ثبت کن"))[-1]["text"]
+    from datetime import timedelta
+    async with SessionLocal() as db:
+        conv = await db.get(chat_engine.ChatConversation, conv.id)
+        conv.state = {**conv.state, "summary_at": (chat_engine.utcnow() + timedelta(seconds=30)).isoformat()}
+        await db.commit()
+    assert (await say(menu.YES))[-1]["text"].startswith("این خلاصه عوض شده")
+    msgs = await say(menu.YES)
+    assert msgs[-1]["source"] == "order"
+
+    # 4. waiting for order's receipt, the customer sends a design for a new print hoodie: not a receipt
+    llm.answers = [{"reply": "طرح رسید 🌸 روی چه رنگ و سایزی؟", "intent": "order"}]
+    cid = await _send_photo(client, h, sid, "/media/1/mine.jpg")
+
+    async def vision(*, task, system, prompt, images=None, store_id=None, **kw):
+        return {"kind": "design", "description": "طرح دلخواه", "product_id": 0}
+    monkeypatch.setattr(chat_engine.ai, "generate_json", vision)
+    saved = await rt.answer(cid, send=False)
+    assert "دریافت شد" not in saved[-1].text and (await _state(sid))["pending_design"] == "/media/1/mine.jpg"
+    orders = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
+    rows = orders.get("items", orders) if isinstance(orders, dict) else orders
+    assert all(o["status"] != "payment_submitted" for o in rows)
+
+    # 5. the model asks for the size the cart already has: the shop's next step instead
+    llm.answers = [{"reply": "باشه، پشت چاپ میشه. سایز رو هم لطفاً بفرمایید.", "intent": "order",
+                    "order_action": "update", "order": {"items": [
+                        {"product_id": hoodie["id"], "qty": 1, "variant": "مشکی XL پشت"}]}}]
+    last = (await say("همین طرح رو روی هودی مشکی XL میخوام چاپش پشت"))[-1]["text"]
+    assert "سایز رو هم" not in last and ("اضافه به سفارش" in last or "خلاصهٔ سفارشت" in last)
