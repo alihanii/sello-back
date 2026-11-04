@@ -310,6 +310,9 @@ WHAT WE HAVE: "چی دارین؟", "محصولاتتون؟", "لیست بده" (
 shop sends its real list). A named kind, design or product ("طرح دیگه‌ای از اسپایدرمن دارین؟") is NOT catalog: answer
 from PRODUCTS.
 NUMBERS: sizes, measurements, materials only as written in PRODUCTS, REFS or FAQ; not written -> say so, never guess. "چه رنگایی/سایزایی داری؟" with no product named and none clear from the chat -> ask which one.
+NOT PLACED: an order is placed only by the shop after the customer's "بله" to the summary. Never write that it is
+registered, being prepared or sent unless it is in MY ORDERS; items still in CART are not placed: say what is
+still needed (a choice, the design, the yes to the summary).
 MY ITEMS: wants to see what is in their placed order ("آیتم‌هام", "چی سفارش دادم", "چرا این مبلغ") -> intent
 "order_status", reply "" (the shop lists it); never put those items in "order" again.
 ORDER STATUS: asks for the status of an order already placed ("سفارشم چی شد؟", "وضعیت سفارش") -> intent
@@ -1045,7 +1048,7 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         have = (state.get("order") or {}).get("items") or []
         if (agent.orders_enabled and last and not given.get("items") and not placed
                 and (not have or (len(have) == 1 and have[0].get("product_id") == last))
-                and (_WANTS_IT.search(text) or have) and (_sizes_in(text) or _colors_in(text))):
+                and _WANTS_IT.search(text) and not _QUESTION.search(text) and (_sizes_in(text) or _colors_in(text))):
             # The model answered "yes, 2XL black is in stock" but left the cart empty: the product being talked
             # about goes in with what they picked (a later pick changes only that choice), so the summary follows.
             old = str(have[0].get("variant") or "") if have else ""
@@ -1108,6 +1111,14 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                 it["design"] = state.pop("pending_design")
                 changed = True
                 break
+    if agent.orders_enabled and order.get("items"):
+        for it in order["items"]:
+            p = await db.get(Product, it.get("product_id") or 0) if it.get("product_id") else None
+            need = missing_choice(p, str(it.get("variant") or "")) if p else None
+            if need and (pick := picked_option(need[1], text)):
+                # "پشت" to "محل چاپ رو هم بگو": the shop writes it down, whatever the model did with it.
+                it["variant"] = (str(it.get("variant") or "") + " " + pick).strip()[:80]
+                changed = True
     if placed and order.get("items"):
         # Lines already on the placed order are never added again ("show my items" read as "add them").
         # A line without a design matches the placed one whatever its design (the model drops it when re-listing).
@@ -1129,13 +1140,14 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
     missing = _missing_fields(agent, order) if complete else []
     # The model decided the customer wants to buy (or it said "ثبت شد" without doing it): the shop's own next step
     # runs now. A summary that was waiting and changed is shown again; details that just got complete show it too.
+    claims = bool(_CLAIMS_PLACED.search(reply.text) or _CLAIMS_SHIPPING.search(reply.text)) and order.get("items")
     go_on = complete and action != "cancel" and (
-        action == "confirm" or bool(_CLAIMS_PLACED.search(reply.text)) or (awaiting and changed)
+        action == "confirm" or claims or (awaiting and changed)
         or (changed and not missing and any(order.get(k) != before.get(k) for k in ("name", "phone", "address"))))
     if bad_now and agent.orders_enabled and order.get("items") and "phone" in _missing_fields(agent, order):
         reply.text, reply.intent = ask_missing(agent, state, _missing_fields(agent, order), thanks=False), "order"
         go_on = False
-    if agent.orders_enabled and order.get("items") and action == "confirm" and not complete:
+    if agent.orders_enabled and order.get("items") and (action == "confirm" or claims) and not complete:
         # They want to buy but a choice is missing (print side, size…): ask exactly that.
         for it in order["items"]:
             p = await db.get(Product, it.get("product_id") or 0) if it.get("product_id") else None
@@ -1201,6 +1213,9 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         sent = await product_photos(db, with_photos, ids[:1], text)
         at = result.replies.index(reply) if reply in result.replies else len(result.replies)
         result.replies[at:at] = sent
+        if sent and reply in result.replies and _NO_PHOTO.search(reply.text):
+            # "we don't have its photo, shall I send…" right under the photo: the photo and its caption say enough.
+            result.replies.remove(reply)
 
     ref_ids = [r.id for r in refs if str(r.id) in {str(x) for x in (out.get("refs") or [])[:2]}]
     if ref_ids and not offering:
@@ -1304,6 +1319,18 @@ def _option_chosen(kind: str, options: list[str], variant: str) -> bool:
     if kind == "size":
         return bool(_sizes_in(variant) & _sizes_in(" ".join(options)))
     return False
+
+
+def picked_option(options: list[str], text: str) -> str:
+    """The option the customer's words name: as written, or one letter off ("بشت" for "پشت"); "" when none or many."""
+    said = [w for w in norm(text).replace("‌", " ").split() if w]
+    hits = []
+    for o in options:
+        on = norm(o)
+        if on and (on in norm(text) or any(len(w) >= 3 and len(w) == len(on)
+                                           and sum(a != b for a, b in zip(w, on)) == 1 for w in said)):
+            hits.append(o)
+    return hits[0] if len(hits) == 1 else ""
 
 
 def missing_choice(p: Product, variant: str) -> tuple[str, list[str]] | None:
@@ -1411,8 +1438,12 @@ async def items_complete(db: AsyncSession, store_id: int, items: list[dict[str, 
     return True
 
 
+# "Being prepared / on its way": only true of a placed order, never of a cart that waits for its summary.
+_CLAIMS_SHIPPING = re.compile(r"(در\s*حال\s*(آماده|اماده|ارسال|پردازش)|آماده\s*‌?(سازی|ی\s*ارسال)|ارسال\s*(شد|کردیم|می\s*‌?شه|میشه)"
+                              r"|فرستادیم|پست\s*(شد|کردیم))")
+_QUESTION = re.compile(r"[؟?]|چجوری|چطوری|چطوره|چنده|چقدره|چیه|چند\s*(سانت|سانتی)|ابعاد|جدول")
 _WANTS_IT = re.compile(r"(می\s*‌?خوام|میخوام|بردار|برمی\s*‌?دارم|ثبت|سفارش|بفرست\s*برام|بگیرم|می\s*‌?گیرم|میگیرم)")
-_CLAIMS_PLACED = re.compile(r"(ثبت\s*(شد|کردم|کردیم|گردید)|سفارش(ت|تون)?\s*(رو\s*)?(ثبت|گذاشتم|زدم)|در\s*نظر\s*گرفتم|"
+_CLAIMS_PLACED = re.compile(r"(ثبت\s*(شد|کردم|کردیم|گردید|می\s*‌?کنم|میکنم|می\s*‌?کنیم)|سفارش(ت|تون)?\s*(رو\s*)?(ثبت|گذاشتم|زدم)|در\s*نظر\s*گرفتم|"
                             r"براتون\s*(گذاشتم|کنار\s*گذاشتم)|برات\s*(گذاشتم|کنار\s*گذاشتم))")
 
 
@@ -1481,6 +1512,8 @@ _PHOTOS_HERE = re.compile(r"(اینم\s*عکس|این\s*(هم\s*)?عکس|(عکس
 # The customer asks to see it ("ببینم عکسش", "عکس خود کار رو بفرست"): a photo goes even when the model forgot.
 _WANTS_PHOTO = re.compile(r"(عکس|تصویر|فیلم)\S*[^.!؟?\n]{0,25}?(ببینم|بفرست|بده|نشون|بذار|داری)|"
                           r"(ببینم|بفرست|نشونم\s*بده)[^.!؟?\n]{0,25}?(عکس|تصویر)")
+_NO_PHOTO = re.compile(r"(عکس|تصویر)[^.!؟?\n]{0,40}?(نداریم|ندارم|موجود\s*نیست)|(نداریم|ندارم)[^.!؟?\n]{0,40}?(عکس|تصویر)"
+                       r"|می\s*‌?تونم[^.!؟?\n]{0,40}?(عکس|تصویر)[^.!؟?\n]{0,40}?بفرستم")
 _OFFER = re.compile(r"(بفرستم|بفرستیم|ببینی|ببینید|می‌خوای|میخوای|می‌خواید|میخواید)")
 
 
