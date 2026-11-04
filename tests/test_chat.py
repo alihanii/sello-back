@@ -1514,3 +1514,51 @@ async def test_spiderman_chat_photo_cart_and_other_designs(client, monkeypatch):
     last = (await say("هودی بتمن دارین؟"))[-1]["text"]
     assert "نداریم" in last and "هودی اختاپوس" in last and "جین" not in last
     assert oc
+
+
+async def test_second_spiderman_chat(client, monkeypatch):
+    """ali's second try: a size-chart question became the summary, «بشت»/«پشت» never reached the order, «ثبت شد» and
+    «در حال ارساله» were said of a cart, and «عکسش رو نداریم» came right under the photo."""
+    h, sid, llm, hoodie = await _print_shop(client, monkeypatch, "09125550063")
+    from app.core.db import SessionLocal
+    from app.models import Product, ProductImage
+    async with SessionLocal() as db:
+        spider = Product(store_id=sid, title="ست هودی اسپایدرمن", price=2000000, stock_qty=5, category="هودی",
+                         attributes={"رنگ": "مشکی", "سایز": "L، XL، 2XL"})
+        db.add(spider)
+        await db.flush()
+        db.add(ProductImage(product_id=spider.id, url="/media/x/spider.jpg"))
+        await db.commit()
+        sp = spider.id
+
+    async def say(t):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": t})).json()["messages"]
+
+    await say("سلام")
+    llm.answers = [{"reply": "ست هودی اسپایدرمن رو داریم 🌸", "intent": "product", "products": [sp]}]
+    await say("ست هودی اسپایدرمن دارین؟")
+    llm.answers = [{"reply": "عکس خود کار رو نداریم، ولی می‌تونم عکس ست هودی اسپایدرمن رو براتون بفرستم.",
+                    "intent": "product"}]
+    msgs = await say("ببینم عکس خود کاررو")
+    assert msgs[-1]["image_url"] == "/media/x/spider.jpg" and "نداریم" not in msgs[-1]["text"]
+
+    llm.answers = [{"reply": "قد و عرض 2XL توی جدول نوشته نشده 🙏", "intent": "product"}]
+    msgs = await say("دوایکس داخل جدول ابعادش چجوریه قد و عرض کار؟")
+    assert msgs[-1]["text"].startswith("قد و عرض") and not (await _state(sid)).get("order")
+
+    # the print hoodie with its design, then the print side in a typo
+    cid = await _send_photo(client, h, sid, "/media/1/mine.jpg")
+    llm.answers = [{"reply": "طرح رسید 🌸", "intent": "order"}]
+    await rt.answer(cid, send=False)
+    llm.answers = [{"reply": "", "intent": "order", "order_action": "confirm", "order": {
+        "items": [{"product_id": hoodie["id"], "qty": 1, "variant": "مشکی XL"}], "name": "علی هانی",
+        "phone": "09121112233", "address": "قم دورشهر کوچه ۲"}}]
+    assert "محل چاپ" in (await say("ثبت کنید برام"))[-1]["text"]
+    llm.answers = [{"reply": "چاپ پشت هودی ثبت شد.", "intent": "order", "order_action": "update"}]
+    last = (await say("بشت"))[-1]["text"]
+    assert "خلاصهٔ سفارشت" in last and "پشت" in last and "ثبت شد" not in last
+
+    # "when do you send it?" of a cart: never "it's on its way"
+    llm.answers = [{"reply": "سفارشتون در حال آماده‌سازی و ارساله.", "intent": "order_status"}]
+    last = (await say("خب کی میفرستی"))[-1]["text"]
+    assert "در حال" not in last and ("خلاصهٔ سفارشت" in last or "ثبت نشده" in last)
