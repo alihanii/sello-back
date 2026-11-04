@@ -1562,3 +1562,112 @@ async def test_second_spiderman_chat(client, monkeypatch):
     llm.answers = [{"reply": "سفارشتون در حال آماده‌سازی و ارساله.", "intent": "order_status"}]
     last = (await say("خب کی میفرستی"))[-1]["text"]
     assert "در حال" not in last and ("خلاصهٔ سفارشت" in last or "ثبت نشده" in last)
+
+
+async def test_cart_and_order_buttons(client, monkeypatch):
+    """The two fixed buttons, the summary's yes / change, and changing an option from the product's own choices:
+    answered by code (no model call), with the keyboard on the bot's last message."""
+    h, sid, llm, hoodie = await _print_shop(client, monkeypatch, "09125550064")
+    from app.services import chat_menu as menu
+    scheduled: list[int] = []
+    monkeypatch.setattr(rt, "schedule", lambda cid: scheduled.append(cid))
+    bot = (await client.post(f"/stores/{sid}/chat/bots", headers=h, json={
+        "platform": "telegram", "mode": "bot", "bot_token": "445:menu-token"})).json()
+    n = 0
+
+    async def tap(text, **extra):
+        nonlocal n
+        n += 1
+        await _customer(bot["id"], 2002, text, n, **extra)
+        return await rt.answer(scheduled[-1])
+
+    await tap("/start")
+    SENT.clear()
+    saved = await tap(menu.CART)
+    assert saved[-1].text == menu.EMPTY and not llm.calls
+    markup = SENT[-1][1]["reply_markup"]
+    assert markup["keyboard"] == [[{"text": menu.CART}, {"text": menu.ORDER}]] and markup["is_persistent"]
+    assert (await tap(menu.ORDER))[-1].text == menu.EMPTY_ORDER
+
+    # the model puts the print hoodie in the cart, with no print side or design yet
+    llm.answers = [{"reply": "گذاشتمش توی سبد 🌸", "intent": "order", "order_action": "update",
+                    "order": {"items": [{"product_id": hoodie["id"], "qty": 1, "variant": "مشکی L"}]}}]
+    await tap("هودی چاپی مشکی L میخوام")
+    calls = len(llm.calls)
+    saved = await tap(menu.ORDER)
+    assert "محل چاپ" in saved[-1].text and saved[-1].buttons == [["جلو", "پشت"]]
+    assert SENT[-1][1]["reply_markup"]["one_time_keyboard"]
+    saved = await tap("پشت")
+    assert saved[-1].text.startswith(menu.DONE) and "طرحی که می‌خوای چاپ بشه" in saved[-1].text
+    assert len(llm.calls) == calls
+
+    # the design photo goes the usual way (the model reads it), then the order button asks the details one by one
+    llm.answers = [{"reply": "طرح رسید 🌸", "intent": "order"}]
+    from app.services import media
+    assert media
+    monkeypatch.setattr(rt, "save_bytes", lambda store_id, data, name: "/media/1/d.jpg")
+    monkeypatch.setattr(rt.tg, "download", lambda bot, fid: _async((b"img", "d.jpg")))
+    await tap("", photo=[{"file_id": "f1"}])
+    from app.core.db import SessionLocal
+    async with SessionLocal() as db:
+        conv = await db.get(chat_engine.ChatConversation, scheduled[-1])
+        assert conv.state["order"]["items"][0].get("design") == "/media/1/d.jpg"
+    assert (await tap(menu.ORDER))[-1].text == menu.ASK_FIELD["name"]
+    saved = await tap("سارا کریمی")
+    assert saved[-1].text == menu.ASK_FIELD["phone"] and saved[-1].buttons == [[menu.SEND_PHONE]]
+    assert SENT[-1][1]["reply_markup"]["keyboard"] == [[{"text": menu.SEND_PHONE, "request_contact": True}]]
+    assert "درست نیست" in (await tap("0912"))[-1].text
+    await tap("", contact={"phone_number": "+989171234567"})
+    saved = await tap("شیراز، معالی آباد، کوچه ۳، کد پستی ۱۲۳۴۵")
+    assert saved[-1].text.startswith("خلاصهٔ سفارشت") and saved[-1].buttons == menu.SUMMARY_BUTTONS
+    assert "پشت" in saved[-1].text and "09171234567" in saved[-1].text
+
+    # change → options → colour, from the product's own choices
+    assert (await tap(menu.CHANGE))[-1].buttons[0] == [menu.CH_OPTS, menu.CH_QTY]
+    saved = await tap(menu.CH_OPTS)
+    assert saved[-1].text.startswith("برای «هودی چاپ طرح دلخواه» کدوم") and saved[-1].buttons == [["رنگ", "سایز", "محل چاپ"]]
+    saved = await tap("رنگ")
+    assert saved[-1].buttons == [["✔️ مشکی", "سفید"]]
+    saved = await tap("سفید")
+    assert saved[-1].text.startswith(menu.DONE) and "(سفید L پشت)" in saved[-1].text
+    await tap(menu.CHANGE)
+    await tap(menu.CH_QTY)
+    saved = await tap("۲")
+    assert "× ۲" in saved[-1].text and len(llm.calls) == calls + 1
+
+    # yes places it, with the payment text
+    saved = await tap(menu.YES)
+    assert saved[-1].source == "order" and "6037991234567890" in saved[-1].text
+    orders = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
+    rows = orders.get("items", orders) if isinstance(orders, dict) else orders
+    assert rows[0]["items"][0]["variant"] == "سفید L پشت" and rows[0]["items"][0]["qty"] == 2
+    assert (await tap(menu.CART))[-1].buttons == [[menu.DETAILS]]
+    assert "#" in (await tap(menu.DETAILS))[-1].text
+
+
+async def _async(v):
+    return v
+
+
+async def test_cart_buttons_cancel_and_typing(client, monkeypatch):
+    h, sid, llm, hoodie = await _print_shop(client, monkeypatch, "09125550065")
+    from app.services import chat_menu as menu
+
+    async def say(t):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": t})).json()["messages"]
+
+    await say("سلام")
+    llm.answers = [{"reply": "باشه", "intent": "order", "order_action": "update",
+                    "order": {"items": [{"product_id": hoodie["id"], "qty": 1, "variant": "سفید M جلو"}]}}]
+    await say("هودی چاپی سفید M جلو")
+    msgs = await say(menu.CART)
+    assert "🛒 سبد خریدت" in msgs[-1]["text"] and msgs[-1]["buttons"] == [[menu.ORDER], [menu.EDIT_CART, menu.CLEAR]]
+    await say(menu.EDIT_CART)
+    # typing instead of tapping leaves the step: the model answers
+    llm.answers = [{"reply": "ارسال ۳ روزه 🌸", "intent": "faq"}]
+    assert (await say("ارسال چند روزه؟"))[-1]["text"] == "ارسال ۳ روزه 🌸"
+    assert "menu" not in (await _state(sid))
+    await say(menu.CHANGE)
+    await say(menu.CH_CANCEL)
+    assert (await say(menu.YES_CANCEL))[-1]["text"] == menu.CANCELLED
+    assert "order" not in (await _state(sid))

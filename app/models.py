@@ -577,6 +577,8 @@ class ChatMessage(Base):
     latency_ms: Mapped[int] = mapped_column(Integer, default=0)
     external_id: Mapped[str] = mapped_column(String(60), default="")
     is_test: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Tap-to-answer choices sent with an assistant message (rows of button labels); None = none.
+    buttons: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
 
 class AiOrder(TimestampMixin, Base):
