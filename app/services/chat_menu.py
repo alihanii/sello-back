@@ -9,17 +9,17 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.text import fa_number, to_en_digits
-from app.core.db import utcnow
 from app.models import ChatAgent, ChatConversation, Product, Store
 from app.services import chat_engine as ce
+from app.services import chat_order as co
 from app.services.chat_engine import Reply
 
 CART = "🛒 سبد خرید من"
 ORDER = "✅ ثبت سفارش"
 MAIN_BUTTONS = [[CART, ORDER]]
-YES = "✅ بله، ثبت کن"
-CHANGE = "✏️ تغییر می‌خوام"
-SUMMARY_BUTTONS = [[YES, CHANGE]]
+YES = co.YES_BUTTON
+CHANGE = co.CHANGE_BUTTON
+SUMMARY_BUTTONS = co.SUMMARY_BUTTONS
 EDIT_CART = "✏️ تغییر سبد"
 CLEAR = "🗑 خالی کردن سبد"
 DETAILS = "📦 جزئیات سفارشم"
@@ -27,15 +27,14 @@ CH_OPTS, CH_QTY, CH_DEL = "🎨 گزینه‌های محصول", "🔢 تعدا�
 CH_CONTACT, CH_CANCEL, BACK = "👤 اسم، شماره یا آدرس", "❌ لغو سفارش", "↩️ برگشت به خلاصه"
 YES_CLEAR, YES_CANCEL, NO_BACK = "بله، خالی کن", "بله، لغو کن", "نه، برگرد"
 NAME, PHONE, ADDRESS = "اسم", "شماره", "آدرس"
-SEND_PHONE = "📱 ارسال شماره‌ی من"
+SEND_PHONE = co.SEND_PHONE
 QTY_BUTTONS = [["۱", "۲", "۳", "۴", "۵"]]
 DONE = "عوض شد ✅"
 EMPTY = "سبد خریدت خالیه 🌸 اسم محصولی که می‌خوای رو بنویس یا عکسش رو بفرست تا برات بذارمش توی سبد."
 EMPTY_ORDER = "سبدت هنوز خالیه 🌸 اول بگو چی می‌خوای (اسم یا عکس محصول) تا برات بذارمش توی سبد."
 CLEARED = "سبدت خالی شد 🌸 هر وقت خواستی، اسم محصول رو بنویس."
 CANCELLED = "سفارش لغو شد 🌸 هر وقت خواستی، دوباره از «🛒 سبد خرید من» شروع کن."
-ASK_FIELD = {"name": "اسم و فامیلت رو بنویس 👤", "phone": "شماره موبایلت رو بفرست 📞",
-             "address": "آدرس کامل رو با کد پستی بنویس 📍"}
+ASK_FIELD = co.ASK_FIELD
 NEW_FIELD = {"name": "اسم جدید رو بنویس 👤", "phone": "شماره‌ی جدید رو بفرست 📞",
              "address": "آدرس جدید رو با کد پستی بنویس 📍"}
 _KIND_NAMES = {"color": "رنگ", "size": "سایز"}
@@ -100,16 +99,14 @@ async def cart_text(db: AsyncSession, store_id: int, items: list[dict[str, Any]]
     return "🛒 سبد خریدت:\n" + "\n".join(rows) + f"\n💰 جمع: {ce.money(total)}"
 
 
-async def summary(db: AsyncSession, store_id: int, state: dict[str, Any], lead: str = "") -> Reply | None:
-    order = state.get("order") or {}
-    lines, total = await ce.priced_lines(db, store_id, order.get("items") or [])
-    if not lines:
+async def summary(db: AsyncSession, conv: ChatConversation, agent: ChatAgent, state: dict[str, Any],
+                  lead: str = "") -> Reply | None:
+    """The cart's next step (the summary when nothing is missing), with `lead` before it."""
+    placed = await ce.open_order(db, conv.store_id, state.get("order_id"))
+    step = await co.next_step(db, conv, agent, state, placed, one_by_one=True)
+    if not step:
         return None
-    state["awaiting"] = "confirm"
-    state["summary_at"] = utcnow().isoformat()
-    state.pop("add_to", None)
-    text = "خلاصهٔ سفارشت:\n" + ce.order_summary(order, lines, total) + "\n\nهمه‌چی درسته؟"
-    return _r((lead + "\n\n" if lead else "") + text, SUMMARY_BUTTONS)
+    return _r((lead + "\n\n" if lead else "") + step.text, step.buttons)
 
 
 def ask_choice(state: dict[str, Any], idx: int, p: Product, kind: str, options: list[str], variant: str,
@@ -134,51 +131,14 @@ async def next_step(db: AsyncSession, conv: ChatConversation, store: Store, agen
 
 async def _next_step(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent,
                      state: dict[str, Any], lead: str = "") -> list[Reply] | None:
-    """«ثبت سفارش»: the first thing still missing (a choice, the design, a detail), else the summary. None: the
-    model path takes it (an addition to an order already placed has its own flow there)."""
-    order = dict(state.get("order") or {})
-    items = order.get("items") or []
-    if not items:
+    """«ثبت سفارش»: the journey's next step (chat_order), the same one a typed message gets."""
+    if not (state.get("order") or {}).get("items"):
         placed = await ce.open_order(db, store.id, state.get("order_id"))
         if placed and placed.status == "awaiting_payment":
             state["awaiting"] = "receipt"
             return [_r(f"سفارش #{fa_number(placed.id)} منتظر پرداخته 🌸\n" + ce.payment_text(agent, placed))]
         return [_r(EMPTY_ORDER)]
-    if await ce.open_order(db, store.id, state.get("order_id")):
-        return None
-    for idx, it in enumerate(items):
-        p = await _product(db, store.id, it)
-        if not p:
-            continue
-        variant = str(it.get("variant") or "")
-        for kind, options in _choices(p).items():
-            if not _current(kind, options, variant):
-                return [ask_choice(state, idx, p, kind, options, variant, missing=True)]
-        if ce.takes_design(p) and not it.get("design"):
-            state.pop("menu", None)
-            return [_r(f"برای «{p.title[:60]}» طرحی که می‌خوای چاپ بشه رو همین‌جا بفرست (عکس یا فایل) 🎨")]
-    earlier = await ce.last_order(db, conv)
-    if earlier:
-        for k, v in (("name", earlier.customer_name), ("phone", earlier.customer_phone),
-                     ("address", earlier.customer_address)):
-            if v and not order.get(k):
-                order[k] = v
-        state["order"] = order
-    missing = ce._missing_fields(agent, order)  # noqa: SLF001
-    if missing:
-        form = str((agent.payment or {}).get("order_form") or "").strip()
-        if form and len([m for m in missing if m in ASK_FIELD]) > 1:
-            state.pop("menu", None)
-            state["form_sent"] = True
-            return [_r(form[:1000])]
-        field_ = missing[0]
-        if field_ in ASK_FIELD:
-            state["menu"] = {"step": "field", "field": field_, "then": "next"}
-            return [_r(ASK_FIELD[field_], [[SEND_PHONE]] if field_ == "phone" else None)]
-        state.pop("menu", None)
-        return [_r(ce.ask_missing(agent, state, missing, thanks=False))]
-    state.pop("menu", None)
-    r = await summary(db, store.id, state, lead)
+    r = await summary(db, conv, agent, state, lead)
     return [r] if r else [_r(EMPTY_ORDER)]
 
 
@@ -187,7 +147,8 @@ async def _change_menu(state: dict[str, Any]) -> list[Reply]:
     return [_r("چی رو عوض کنم؟", [[CH_OPTS, CH_QTY], [CH_DEL, CH_CONTACT], [CH_CANCEL, BACK]])]
 
 
-async def _for_line(db: AsyncSession, store: Store, state: dict[str, Any], idx: int, then: str) -> list[Reply]:
+async def _for_line(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent, state: dict[str, Any],
+                    idx: int, then: str) -> list[Reply]:
     items = (state.get("order") or {}).get("items") or []
     it = items[idx]
     p = await _product(db, store.id, it)
@@ -213,7 +174,7 @@ async def _for_line(db: AsyncSession, store: Store, state: dict[str, Any], idx: 
     head = f"«{title}» از سبد حذف شد ✅"
     if not items:
         return [_r(f"{head}\n{CLEARED}")]
-    r = await summary(db, store.id, state, head)
+    r = await summary(db, conv, agent, state, head)
     return [r] if r else [_r(head)]
 
 
@@ -248,7 +209,7 @@ async def handle(db: AsyncSession, conv: ChatConversation, store: Store, agent: 
         shown = state.get("summary_at")
         if sent_at and shown and sent_at < ce._aware(datetime.fromisoformat(shown)):  # noqa: SLF001
             # Tapped under an older summary (it changed while the tap was on its way): the new one first.
-            r = await summary(db, store.id, state, "این خلاصه عوض شده؛ نسخهٔ جدیدش اینه 👇")
+            r = await summary(db, conv, agent, state, "این خلاصه عوض شده؛ نسخهٔ جدیدش اینه 👇")
             return [r] if r else [_r(EMPTY_ORDER)]
         state.pop("awaiting", None)
         placed = ce.TurnResult()
@@ -293,11 +254,11 @@ async def handle(db: AsyncSession, conv: ChatConversation, store: Store, agent: 
                 lines, _ = await ce.priced_lines(db, store.id, items)
                 state["menu"] = {"step": "pick_line", "then": then}
                 return [_r("کدوم آیتم؟", _line_buttons(lines))]
-            return await _for_line(db, store, state, 0, then)
+            return await _for_line(db, conv, store, agent, state, 0, then)
     elif step == "pick_line":
         idx = _line_no(t, len(items))
         if idx is not None:
-            return await _for_line(db, store, state, idx, menu.get("then", "opts"))
+            return await _for_line(db, conv, store, agent, state, idx, menu.get("then", "opts"))
     elif step == "pick_kind":
         idx = int(menu.get("line") or 0)
         p = await _product(db, store.id, items[idx]) if idx < len(items) else None
