@@ -1920,3 +1920,37 @@ async def test_a_question_is_answered_before_the_next_step(client, monkeypatch):
     last = (await client.post(f"/stores/{sid}/chat/test", headers=h,
                               json={"text": "طرح دلخواه چاپ میکنید؟"})).json()["messages"][-1]["text"]
     assert last.startswith("بله، طرح دلخواهت") and "طرحی که می‌خوای چاپ بشه" in last
+
+
+async def test_this_design_on_a_hoodie(client, monkeypatch):
+    """ali's chat: after sending a picture, «این طرح رو میخوام برای هودی» got a list of hoodies (twice), every answer
+    opened with «سلام», and «قرمز» to «which colour?» got the whole catalog."""
+    h, sid, llm, _ = await _print_shop(client, monkeypatch, "09125550073")
+
+    async def say(t):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": t})).json()["messages"]
+
+    await say("سلام")
+    llm.answers = [{"reply": "سلام، طرح مورد نظرتون رو روی هودی چاپ می‌کنیم.", "intent": "product"}]
+    cid = await _send_photo(client, h, sid, "/media/1/tee.jpg")
+    saved = await rt.answer(cid, send=False)
+    assert not saved[-1].text.startswith("سلام")  # greeted once is enough
+    assert (await _state(sid))["pending_design"] == "/media/1/tee.jpg"
+
+    msgs = await say("این طرح رو‌میخوام برای هودی")
+    last = msgs[-1]
+    assert "هودی چاپ طرح دلخواه" in last["text"] and "رنگ" in last["text"] and last["buttons"]
+    st = await _state(sid)
+    assert st["order"]["items"][0]["design"] == "/media/1/tee.jpg" and "pending_design" not in st
+
+    last = (await say("سفید"))[-1]
+    assert "سایز" in last["text"] and "این‌ها رو داریم" not in last["text"]
+    assert "سفید" in (await _state(sid))["order"]["items"][0]["variant"]
+
+
+async def test_a_bare_colour_is_not_a_catalog_ask(client, monkeypatch):
+    h, sid, llm, _ = await _print_shop(client, monkeypatch, "09125550074")
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
+    llm.answers = [{"reply": "قرمز نداریم 🙏 مشکی و سفید داریم.", "intent": "catalog"}]
+    last = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "قرمز"})).json()["messages"][-1]
+    assert last["text"] == "قرمز نداریم 🙏 مشکی و سفید داریم."
