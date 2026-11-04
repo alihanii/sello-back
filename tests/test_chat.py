@@ -1820,3 +1820,103 @@ async def test_colour_word_doesnt_hide_the_product(client, monkeypatch):
         assert "نداریم" not in text and "ست هودی اسپایدرمن" in text and "اختاپوس" not in text
         text = await ce.catalog_answer(db, sid, "هودی مشکی دارین؟", [], False)
         assert "ست هودی اسپایدرمن" in text and "اختاپوس" in text and "کاپلی" not in text
+
+
+async def _set_state(sid, **kw):
+    from app.core.db import SessionLocal
+    async with SessionLocal() as db:
+        conv = (await db.execute(select(chat_engine.ChatConversation).where(
+            chat_engine.ChatConversation.store_id == sid, chat_engine.ChatConversation.is_test))).scalars().first()
+        conv.state = {**(conv.state or {}), **kw}
+        await db.commit()
+        return conv.id
+
+
+async def _age_messages(conv_id, hours):
+    from datetime import timedelta
+
+    from app.core.db import SessionLocal
+    from app.models import ChatMessage
+    async with SessionLocal() as db:
+        for m in (await db.execute(select(ChatMessage).where(ChatMessage.conversation_id == conv_id))).scalars():
+            m.created_at = m.created_at - timedelta(hours=hours)
+        await db.commit()
+
+
+async def test_chat_starts_over_after_two_quiet_hours(client, monkeypatch):
+    """ali: a chat quiet for 2 hours starts from scratch (the messages stay), and the assistant says welcome back."""
+    h, sid, llm, hoodie = await _print_shop(client, monkeypatch, "09125550069")
+
+    async def say(t):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": t})).json()["messages"]
+
+    await say("سلام")
+    cid = await _set_state(sid, order={"items": [{"product_id": hoodie["id"], "qty": 1, "variant": "مشکی M"}]},
+                           recent_products=[hoodie["id"]], awaiting="confirm")
+    await _age_messages(cid, 1)
+    llm.answers = [{"reply": "بله", "intent": "product"}]
+    await say("قیمتش چنده؟")
+    assert (await _state(sid))["order"]["items"]  # an hour is not long enough
+
+    await _age_messages(cid, 3)
+    msgs = await say("سلام")
+    assert msgs[-1]["text"] == chat_engine.WELCOME_BACK
+    st = await _state(sid)
+    assert "order" not in st and "recent_products" not in st and "awaiting" not in st and st["welcomed"]
+    llm.answers = [{"reply": "سلام! چی لازم داری؟", "intent": "greeting"}]
+    await say("یه هودی میخوام")
+    assert "قیمتش چنده" not in llm.calls[-1]["prompt"]  # the model no longer reads the old chat
+
+    msgs = await say("/start")
+    assert [m["text"] for m in msgs[1:]] == [chat_engine.WELCOME_BACK]
+
+
+async def test_my_design_is_shown_and_a_repeated_choice_isnt_a_canned_no(client, monkeypatch):
+    """ali's chat: «مشکی سایز مدیوم این طرح رو میخوام» under the summary got «هنوز ثبت نشده», and «الان طرحم چیه بهم
+    بگو ببینم» got the order as text with no picture."""
+    h, sid, llm, hoodie = await _print_shop(client, monkeypatch, "09125550070")
+
+    async def say(t):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": t})).json()["messages"]
+
+    await say("سلام")
+    order = {"items": [{"product_id": hoodie["id"], "qty": 1, "variant": "مشکی، سایز: M، محل چاپ: پشت",
+                        "design": "/media/1/my-design.jpg"}],
+             "name": "سارا کریمی", "phone": "09171234567", "address": "شیراز، معالی آباد"}
+    await _set_state(sid, order=order, awaiting="confirm")
+    llm.answers = [{"reply": "سفارشت ثبت شد", "intent": "order", "order_action": "confirm", "order": order}]
+    msgs = await say("مشکی سایز مدیوم این طرحی که روی این هودی رو میخوام")
+    assert "همینه که توی خلاصه‌ست" in msgs[-1]["text"] and msgs[-1]["buttons"]
+
+    msgs = await say("الان طرحم چیه بهم بگو بیینم")
+    assert "/media/1/my-design.jpg" in [m["image_url"] for m in msgs]
+    assert "سبد خریدت" in msgs[-1]["text"]
+
+    llm.answers = [{"reply": "", "intent": "order", "order_action": "confirm", "order": order}]
+    assert "ثبت شد" in (await say("بله"))[-1]["text"]
+    msgs = await say("طرح اوکی شد؟الان طرحم چیه بهم بگو بیینم😂")
+    assert "/media/1/my-design.jpg" in [m["image_url"] for m in msgs]
+    assert "روی سفارش #" in msgs[-1]["text"] and "همین طرح چاپ می‌شه" in msgs[-1]["text"]
+
+
+async def test_only_a_site_admin_can_wipe_a_chat(client, monkeypatch):
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550071")
+    llm.answers = [{"reply": "سلام", "intent": "greeting"}]
+    cid = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})).json()["conversation_id"]
+    assert (await client.delete(f"/chat/conversations/{cid}", headers=h)).status_code == 403
+    admin = await login(client, "09120000000")
+    assert (await client.delete(f"/chat/conversations/{cid}", headers=admin)).status_code == 200
+    again = (await client.get(f"/stores/{sid}/chat/test", headers=h)).json()
+    assert again["messages"] == [] and not again["state"]
+
+
+async def test_a_question_is_answered_before_the_next_step(client, monkeypatch):
+    """«طرح دلخواه چاپ میکنید؟» got only «طرحت رو بفرست»: the yes comes first now."""
+    h, sid, llm, hoodie = await _print_shop(client, monkeypatch, "09125550072")
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "سلام"})
+    llm.answers = [{"reply": "بله، طرح دلخواهت رو روی هودی چاپ می‌کنیم 🌸", "intent": "order",
+                    "order_action": "confirm",
+                    "order": {"items": [{"product_id": hoodie["id"], "qty": 1, "variant": "مشکی M پشت"}]}}]
+    last = (await client.post(f"/stores/{sid}/chat/test", headers=h,
+                              json={"text": "طرح دلخواه چاپ میکنید؟"})).json()["messages"][-1]["text"]
+    assert last.startswith("بله، طرح دلخواهت") and "طرحی که می‌خوای چاپ بشه" in last

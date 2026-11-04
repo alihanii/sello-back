@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import ChatAgent, ChatConversation, ChatMessage, Store
 from app.services import ai
+from app.services import chat_engine as ce
 
 log = logging.getLogger("sello.chat")
 
@@ -48,7 +49,8 @@ async def route(db: AsyncSession, conv: ChatConversation, store: Store, agent: C
                 text: str) -> str:
     """The skill for this message ("" when the router can't tell or fails: the sales model answers as before)."""
     history = (await db.execute(select(ChatMessage).where(
-        ChatMessage.conversation_id == conv.id, ChatMessage.role.in_(["customer", "ai", "seller"]))
+        ChatMessage.conversation_id == conv.id, ChatMessage.role.in_(["customer", "ai", "seller"]),
+        *ce.since_filter(state))
         .order_by(ChatMessage.id.desc()).limit(7))).scalars().all()
     recent = "\n".join(f"{'customer' if m.role == 'customer' else 'shop'}: {(m.text or '[photo]')[:160]}"
                        for m in reversed(history[1:]))

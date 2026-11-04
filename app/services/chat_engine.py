@@ -33,6 +33,10 @@ MAX_OUTPUT_TOKENS = 700  # Persian costs ~2-3 tokens a word; a tight cap cut the
 RATE_WINDOW = timedelta(minutes=10)
 RATE_MAX_REPLIES = 30  # model answers per conversation per window; only stops floods, a busy buyer is fine
 AWAY_REPEAT = timedelta(hours=6)
+# A chat quiet this long starts over: the cart, what was talked about and the model's memory of it are cleared (the
+# messages stay in the panel). A placed order still waiting for its receipt stays open.
+RESET_AFTER = timedelta(hours=2)
+WELCOME_BACK = "سلام، خوش اومدی دوباره 🌸 گفت‌وگوی قبلی‌مون بسته شد و از اول شروع می‌کنیم؛ بگو چی لازم داری."
 DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]  # index = datetime.weekday()
 
 DEFAULT_WELCOME = "سلام، به {store} خوش اومدی 🌸\nمن دستیار فروشگاهم؛ دربارهٔ محصولات، قیمت، موجودی و ثبت سفارش هر سؤالی داری بپرس."
@@ -837,6 +841,90 @@ async def _merge_order(db: AsyncSession, store_id: int, agent: ChatAgent, state:
     return order
 
 
+def fresh_state(state: dict[str, Any]) -> dict[str, Any]:
+    """The chat from scratch, keeping only what isn't this chat's memory: the welcome, a placed order still waiting for
+    its receipt, and the limits already announced."""
+    keep = {k: state[k] for k in ("welcomed", "order_id", "away_sent_at", "limit_notified") if k in state}
+    if state.get("awaiting") == "receipt":
+        keep["awaiting"] = "receipt"
+    keep["since"] = utcnow().isoformat()
+    return keep
+
+
+def since_filter(state: dict[str, Any]) -> list[Any]:
+    """Only the messages after the chat last started over."""
+    try:
+        since = datetime.fromisoformat(str(state["since"])) if state.get("since") else None
+    except ValueError:
+        since = None
+    return [ChatMessage.created_at >= since] if since else []
+
+
+async def quiet_since(db: AsyncSession, conv: ChatConversation, pending: list[ChatMessage]) -> bool:
+    """Nothing was said in this chat for RESET_AFTER before these messages."""
+    first = min((_aware(m.created_at) for m in pending if m.created_at), default=None) or utcnow()
+    last = await db.scalar(select(func.max(ChatMessage.created_at)).where(
+        ChatMessage.conversation_id == conv.id, ChatMessage.id.not_in([m.id for m in pending] or [0])))
+    last = _aware(last)
+    return bool(last and first - last > RESET_AFTER)
+
+
+_SEE_MINE = re.compile(r"(طرحم|طرح\s*(من|خودم)|طرحی\s*که\s*(فرستادم|دادم|داده\s*بودم)|"
+                       r"(عکس|تصویر)\S*\s*(سفارش|سبد|خرید)\S*|(سفارشم|سبدم|سبد\s*خریدم|خریدم)\S*\s*(رو|را)?\s*"
+                       r"(ببینم|بیینم|نشون))")
+_CHANGE_ASK = re.compile(r"(عوض|تغییر|حذف|جدید|دیگه|دیگر|اضافه|کنسل|لغو)")
+
+
+async def my_pictures(db: AsyncSession, conv: ChatConversation, store: Store, state: dict[str, Any],
+                      text: str) -> list[Reply]:
+    """"What's my design? / let me see my order": the design each line carries and the product's photo, from the cart,
+    else the latest order of this chat. Empty when the message isn't that ask or there is nothing to show."""
+    if not _SEE_MINE.search(text) or _CHANGE_ASK.search(text):
+        return []
+    items = (state.get("order") or {}).get("items") or []
+    placed = None
+    if not items:
+        placed = await open_order(db, store.id, state.get("order_id")) or await last_order(db, conv)
+        items = list(placed.items or []) if placed else []
+    if not items:
+        return []
+    out: list[Reply] = []
+    for it in items[:MAX_PHOTOS]:
+        title = str(it.get("title") or "")
+        p = await db.get(Product, it.get("product_id") or 0) if it.get("product_id") else None
+        title = title or (p.title if p else "")
+        url = await db.scalar(select(ProductImage.url).where(ProductImage.product_id == p.id)
+                              .order_by(ProductImage.position, ProductImage.id).limit(1)) if p else None
+        if url:
+            out.append(Reply(title[:80] + (f" ({it['variant']})" if it.get("variant") else ""), image_url=url,
+                             source="canned", intent="product"))
+        if it.get("design"):
+            out.append(Reply(f"🎨 طرحی که برای «{title[:60]}» فرستادی", image_url=str(it["design"]), source="canned",
+                             intent="order"))
+    if not out:
+        return []
+    designs = any(it.get("design") for it in items)
+    if placed:
+        tail = (f"این‌ها روی سفارش #{fa_number(placed.id)} ثبت شدن" + (" و همین طرح چاپ می‌شه ✅" if designs else " ✅")
+                + f"\nوضعیت سفارش: {STATUS_FA.get(placed.status, placed.status)}")
+    else:
+        tail = "این‌ها توی سبد خریدت هستن 🛒" + (" و همین طرح چاپ می‌شه." if designs else "")
+    out.append(Reply(tail.strip(), source="canned", intent="order"))
+    return out
+
+
+def already_chosen(items: list[dict[str, Any]], text: str) -> str:
+    """The colour/size the message names when a cart line already has exactly those ("مشکی سایز M" again); else ""."""
+    colours, sizes = _colors_in(text), _sizes_in(text)
+    if not (colours or sizes):
+        return ""
+    for it in items:
+        variant = str(it.get("variant") or "")
+        if colours <= _colors_in(variant) and sizes <= _sizes_in(variant):
+            return f"{str(it.get('title') or '')[:60]}، {variant}" if variant else str(it.get("title") or "")[:60]
+    return ""
+
+
 async def code_skill(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent, state: dict[str, Any],
                      text: str, skill: str, result: TurnResult) -> bool:
     """The router's skills the shop answers without the sales model; False: the sales model answers it."""
@@ -907,6 +995,17 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         conv.state = state
         return result
 
+    # 0. Back after a long quiet, or "/start" again: the chat starts over (the messages stay in the panel).
+    restart = bool(state.get("welcomed")) and (text.strip() == "/start" or await quiet_since(db, conv, pending))
+    if restart:
+        state = fresh_state(state)
+        back = WELCOME_BACK
+        if state.get("awaiting") == "receipt" and (o := await open_order(db, store.id, state.get("order_id"))):
+            back += f"\nسفارش #{fa_number(o.id)} هنوز منتظر پرداخته؛ فیش یا کد پیگیریش رو هر وقت خواستی همین‌جا بفرست."
+        result.replies.append(Reply(back, source="welcome", intent="greeting"))
+        if not text or text.startswith("/start") or _GREETING.match(text):
+            return done()
+
     # 1. Welcome: the first time this customer writes. A bare "/start" or "hi" gets only the welcome.
     if not state.get("welcomed"):
         state["welcomed"] = True
@@ -950,6 +1049,12 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                 result.notify_admin.append(f"🧾 فیش/کد پرداخت سفارش #{order.id} ({money(order.total_toman)}) از "
                                            f"{order.customer_name or conv.customer_name or 'مشتری'} رسید.")
                 return done()
+
+    if text and not photo and agent.orders_enabled and (shown := await my_pictures(db, conv, store, state, text)):
+        # "What's my design now? / show my cart's photo": the design they sent and the product, from the cart or
+        # the order itself, not a description of it.
+        result.replies += shown
+        return done()
 
     if text and not photo:
         # A tap on the cart / order buttons (or the one thing a button step asked for): answered by code.
@@ -1051,7 +1156,8 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
             ProductImage.product_id.in_([p.id for p in products])).group_by(ProductImage.product_id))).all())
     pending_ids = {m.id for m in pending}
     history = (await db.execute(select(ChatMessage).where(ChatMessage.conversation_id == conv.id,
-                                                          ChatMessage.role.in_(["customer", "ai", "seller"]))
+                                                          ChatMessage.role.in_(["customer", "ai", "seller"]),
+                                                          *since_filter(state))
                                 .order_by(ChatMessage.id.desc()).limit(HISTORY_MESSAGES + len(pending)))).scalars().all()
     history = [m for m in reversed(history) if m.id not in pending_ids][-HISTORY_MESSAGES:]
     placed = await open_order(db, store.id, state.get("order_id")) if agent.orders_enabled else None
@@ -1198,9 +1304,16 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         # The model read a yes into something that isn't one ("یه سفارش دیگه هم میخوام"): placing an order can't be
         # undone, so the summary waits for a plain yes.
         state["awaiting"] = awaiting
+        from app.services import chat_order
+        if same := already_chosen(order.get("items") or [], text):
+            # "black, size M, this design" when the summary already says so: say that, not a canned "not placed".
+            result.replies.append(Reply(f"همینه که توی خلاصه‌ست ✅ ({same})\nاگه درسته «بله» رو بزن تا ثبت بشه، "
+                                        "یا بگو چی رو عوض کنم.", source="order", intent="order", usage=usage,
+                                        buttons=chat_order.SUMMARY_BUTTONS))
+            return done()
         lead = reply_text if reply_text and not _CLAIMS_PLACED.search(reply_text) else ""
         result.replies.append(Reply((lead + "\n\n" if lead else "") + NOT_PLACED_TEXT, source="llm", intent="order",
-                                    usage=usage))
+                                    usage=usage, buttons=chat_order.SUMMARY_BUTTONS))
         return done()
 
     if not agent.orders_enabled and action == "confirm":
@@ -1275,7 +1388,12 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
     step = (await chat_order.next_step(db, conv, agent, state, placed)
             if agent.orders_enabled and order.get("items") and trigger else None)
     if step:
-        reply.text, reply.buttons, reply.intent = step.text, step.buttons, "order"
+        lead = ""
+        if (step.stage in ("choice", "design") and _QUESTION.search(text) and not claims and reply.text
+                and not _ASKS_KNOWN.search(reply.text)):
+            # "Do you print your own design?": the answer first, then what the order needs next.
+            lead = reply.text.strip() + "\n\n"
+        reply.text, reply.buttons, reply.intent = lead + step.text, step.buttons, "order"
     elif agent.orders_enabled and not order.get("items") and _CLAIMS_PLACED.search(reply.text):
         reply.text = "برای ثبت، اسم محصول و سایز/رنگش رو بگو تا خلاصهٔ سفارش رو برات بفرستم 🌸"
     elif awaiting and not changed and action not in ("cancel",):
