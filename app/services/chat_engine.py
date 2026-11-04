@@ -592,15 +592,29 @@ def _rank(rows: list[Product], q: set[str], text_of, strict: bool = False) -> li
     return [p for n, p in scored if n == top]
 
 
+def _with_colour(rows: list[Product], colours: set[str]) -> list[Product]:
+    """The products that come in the colour asked for (its options, title or tags), else all of them."""
+    if not colours:
+        return rows
+    has = [p for p in rows if colours & _colors_in(" ".join([p.title, p.category_hint, " ".join(p.tags or []),
+                                                               " ".join(variant_options(p).get("color", []))]))]
+    return has or rows
+
+
 async def catalog_answer(db: AsyncSession, store_id: int, text: str, recent: list[int], exact_stock: bool) -> str:
     """"What do you have / other Spider-Man designs?": the products the words name (by title, category, kind and
     tags; then by description). None of them: we don't have it, and what we do have in that category."""
     rows = await catalog_rows(db, store_id)
     q = {w for w in words(text) if not _overlap({w}, _BROWSE_WORDS)}  # "محصولاتی", "مدلای" are browse words too
+    # A colour ("مشکی") picks among the products found, it doesn't name one: "black Spider-Man hoodie" is the
+    # Spider-Man hoodie, in black if it comes in black.
+    colours = _colors_in(" ".join(q))
+    q = {w for w in q if not _colors_in(w)}
     if not q:
-        return catalog_overview(rows, exact_stock)
-    # Kind words ("هودی") pick the category; the rest ("اسپایدرمن", "بتمن") must match the product itself.
-    kinds = set().union(*[words(f"{p.category or ''} {p.category_hint}") for p in rows]) if rows else set()
+        return catalog_overview(_with_colour(rows, colours), exact_stock)
+    # Kind words ("هودی") pick the category; the rest ("اسپایدرمن", "بتمن") must match the product itself. Only the
+    # shop's categories count as kinds: the AI's free-text hint ("هودی مشکی اسپایدرمن") would make a design a kind.
+    kinds = set().union(*[words(p.category or "") for p in rows]) if rows else set()
     specific = {w for w in q if not _overlap({w}, kinds)}
     generic = q - specific
     named = _rank(rows, specific or q, lambda p: f"{p.title} {p.category or ''} {p.category_hint} {' '.join(p.tags or [])}",
@@ -612,7 +626,7 @@ async def catalog_answer(db: AsyncSession, store_id: int, text: str, recent: lis
     last = next((p for p in rows if recent and p.id == recent[-1]), None)
     asked = " ".join(sorted(q, key=lambda w: norm(text).find(w)))
     if named and not (_ANOTHER.search(text) and all(p.id in recent for p in named)):
-        return catalog_overview(named, exact_stock)
+        return catalog_overview(_with_colour(named, colours), exact_stock)
     # Nothing (else) like it: say so, and offer the rest of the category it belongs to.
     cats = {p.category for p in named if p.category} or ({last.category} if last and last.category else set())
     if generic or not cats:

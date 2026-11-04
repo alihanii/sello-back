@@ -1798,3 +1798,25 @@ async def test_router_sends_each_message_to_its_skill(client, monkeypatch):
     # a person: handed over without the model, the cart kept
     last = (await say("آدمین رو میخوام", "human"))[-1]
     assert last["source"] == "handoff" and (await _state(sid)).get("order")
+
+
+async def test_colour_word_doesnt_hide_the_product(client, monkeypatch):
+    """ali's fourth chat: «هودی مشکی اسپایدرمن میخوام» got «نداریم» though the Spider-Man hoodie set is there: the AI's
+    free-text hints made «اسپایدرمن» a kind word and «مشکی» was then the only word the product had to have."""
+    _, sid, *_ = await _setup(client, monkeypatch, "09125550068")
+    from app.core.db import SessionLocal
+    from app.models import Product
+    from app.services import chat_engine as ce
+    async with SessionLocal() as db:
+        db.add_all([
+            Product(store_id=sid, title="ست هودی اسپایدرمن", price=2000000, stock_qty=5, category="هودی",
+                    category_hint="هودی اسپایدرمن", attributes={"رنگ": "قرمز، مشکی"}),
+            Product(store_id=sid, title="هودی اختاپوس", price=2000000, stock_qty=1, category="هودی",
+                    category_hint="هودی مشکی"),
+            Product(store_id=sid, title="هودی کاپلی", price=2000000, stock_qty=1, category="هودی"),
+        ])
+        await db.commit()
+        text = await ce.catalog_answer(db, sid, "هودی مشکی اسپایدرمن میخوام", [], False)
+        assert "نداریم" not in text and "ست هودی اسپایدرمن" in text and "اختاپوس" not in text
+        text = await ce.catalog_answer(db, sid, "هودی مشکی دارین؟", [], False)
+        assert "ست هودی اسپایدرمن" in text and "اختاپوس" in text and "کاپلی" not in text
