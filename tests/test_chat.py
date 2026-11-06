@@ -1954,3 +1954,40 @@ async def test_a_bare_colour_is_not_a_catalog_ask(client, monkeypatch):
     llm.answers = [{"reply": "قرمز نداریم 🙏 مشکی و سفید داریم.", "intent": "catalog"}]
     last = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "قرمز"})).json()["messages"][-1]
     assert last["text"] == "قرمز نداریم 🙏 مشکی و سفید داریم."
+
+
+async def test_can_i_see_them_after_a_list(client, monkeypatch):
+    """ali's chat: after «دورس داری؟» listed two products, «اره میشه ببینمشون» got «ببخشید، «اره» نداریم», «میشه
+    ببینمشون» the whole shop, «دورس ها رو میشه ببینمشو» the list again and «خب میشه ببینمشون» ««خب» نداریم»."""
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550075")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True})
+    from app.core.db import SessionLocal
+    from app.models import Product, ProductImage
+    async with SessionLocal() as db:
+        a = Product(store_id=sid, title="New autumn collection", price=2400000, stock_qty=3, category="هودی",
+                    description="هودی دورس پنبه، سه نخ", attributes={"رنگ": "مشکی، کرم", "سایز": "L، XL"})
+        b = Product(store_id=sid, title="ست از پارت پاییزه", price=2400000, stock_qty=3, category="هودی",
+                    description="ست دورس با شلوار")
+        c = Product(store_id=sid, title="تیشرت نخی", price=900000, stock_qty=3, category="تیشرت")
+        db.add_all([a, b, c])
+        await db.flush()
+        db.add_all([ProductImage(product_id=a.id, url="/media/x/a.jpg"), ProductImage(product_id=b.id, url="/media/x/b.jpg")])
+        await db.commit()
+        ids = {a.id, b.id}
+
+    async def say(t):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": t})).json()["messages"]
+
+    await say("سلام")
+    llm.answers = [{"reply": "", "intent": "catalog"}]
+    listed = (await say("دورس داری؟"))[-1]["text"]
+    assert "New autumn collection" in listed and "ست از پارت پاییزه" in listed and "تیشرت" not in listed
+
+    calls = len(llm.calls)
+    for ask in ("اره میشه ببینمشون", "میشه ببینمشون", "خب میشه ببینمشون", "دورس ها رو میشه ببینمشو"):
+        msgs = await say(ask)
+        assert {"/media/x/a.jpg", "/media/x/b.jpg"} <= {m["image_url"] for m in msgs}, ask
+        assert not any("نداریم" in m["text"] for m in msgs) and "کدوم رو می‌خوای" in msgs[-1]["text"]
+    assert len(llm.calls) == calls  # answered by the shop, no model call
+    assert "رنگ: مشکی، کرم" in next(m["text"] for m in msgs if m["image_url"] == "/media/x/a.jpg")
+    assert ids
