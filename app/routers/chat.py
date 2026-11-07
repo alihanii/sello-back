@@ -327,6 +327,14 @@ async def extract_faq(store_id: int, user: CurrentUser, db: DB, text: str = Form
     return {"items": items, "truncated": len(body) > chat_faq.MAX_CHARS, "usage": usage}
 
 
+@router.get("/stores/{store_id}/chat/faq/suggested")
+async def suggested_faq(store_id: int, user: CurrentUser, db: DB):
+    """The questions buyers usually ask that this shop's FAQ (and settings) don't answer yet, with a sample answer."""
+    await get_store_for(db, user, store_id)
+    from app.services import chat_common
+    return {"items": chat_common.suggestions(await get_agent(db, store_id))}
+
+
 # ---------- knowledge: references ----------
 
 
