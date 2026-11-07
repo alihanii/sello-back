@@ -188,12 +188,10 @@ async def test_full_chat_flow(client, monkeypatch):
     await _customer(bot["id"], 1001, "/start", 1)
     assert scheduled == []
 
-    # 2. FAQ: the model reads the question first and answers from the seller's FAQ
+    # 2. FAQ: a common question the seller's FAQ answers gets that answer, with no model call
     await _customer(bot["id"], 1001, "هزینه ارسال چقدره", 2)
-    llm.answers.append({"reply": "ارسال ۷۰ هزار تومانه 🌸", "intent": "faq"})
     saved = await rt.answer(conv_id)
-    assert saved[0].source == "llm" and "۷۰" in saved[0].text and len(llm.calls) == 1
-    assert "هزینه ارسال" in llm.calls[0]["system"]
+    assert saved[0].source == "faq" and saved[0].text == "ارسال ۷۰ هزار تومان است." and llm.calls == []
 
     # 3. burst of two messages -> one model call with only matching products
     await _customer(bot["id"], 1001, "سلام مانتو لینن", 3)
@@ -201,8 +199,8 @@ async def test_full_chat_flow(client, monkeypatch):
     llm.answers.append({"reply": "بله، مانتو لینن کرم سایز ۴۰ موجوده؛ ۱٬۲۵۰٬۰۰۰ تومان.", "intent": "product",
                         "products": [p1["id"], 99999]})
     saved = await rt.answer(conv_id)
-    assert len(llm.calls) == 2 and saved[0].source == "llm" and saved[0].input_tokens == 1200
-    call = llm.calls[1]
+    assert len(llm.calls) == 1 and saved[0].source == "llm" and saved[0].input_tokens == 1200
+    call = llm.calls[0]
     assert "مانتو لینن کرم" in call["prompt"] and "<customer>سلام مانتو لینن\nسایز ۴۰ دارید؟</customer>" in call["prompt"]
     assert "هزینه ارسال" in call["system"] and "6037" not in call["system"]  # FAQ cached in the prefix, no card number
     assert call["max_tokens"] == chat_engine.MAX_OUTPUT_TOKENS
@@ -264,12 +262,12 @@ async def test_full_chat_flow(client, monkeypatch):
     # 9. usage for the seller and the admin
     u = (await client.get(f"/stores/{sid}/chat/usage", headers=h)).json()
     t = u["totals"]
-    assert t["llm_calls"] == 6 and t["without_llm"] >= 2 and t["cached_tokens"] == 4800 and t["orders"] == 1
+    assert t["llm_calls"] == 5 and t["without_llm"] >= 2 and t["cached_tokens"] == 4000 and t["orders"] == 1
     admin = await login(client, "09120000000")
     au = (await client.get("/admin/chat/usage", headers=admin)).json()
-    assert any(s["store_id"] == sid and s["llm_calls"] == 6 for s in au["stores"])
+    assert any(s["store_id"] == sid and s["llm_calls"] == 5 for s in au["stores"])
     ov = (await client.get(f"/stores/{sid}/chat/overview", headers=h)).json()
-    assert ov["enabled"] and ov["month"]["ai_messages"] == 6
+    assert ov["enabled"] and ov["month"]["ai_messages"] == 5
 
 
 async def test_business_owner_message_pauses_ai(client, monkeypatch):
@@ -1161,7 +1159,7 @@ async def test_every_message_goes_to_the_model_first(client, monkeypatch):
         return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
 
     await say("سلام")
-    texts = ("سایز بندی رو لطف میکنی؟", "موجوده؟", "خب میخوام سفارش بدم", "۴۰", "سلام", "مرسی", "هزینه ارسال چقدره؟",
+    texts = ("سایز بندی رو لطف میکنی؟", "موجوده؟", "خب میخوام سفارش بدم", "۴۰", "سلام", "مرسی",
              "می‌خوام با ادمین صحبت کنم", "چه رنگایی داری", "قهوه‌ای رو میخوام")
     for i, t in enumerate(texts, 1):
         m = await say(t)
@@ -2060,3 +2058,45 @@ def test_reply_to_a_bot_photo_names_it():
     msg = {"chat": {"id": 5, "type": "private"}, "from": {"id": 5}, "message_id": 9, "text": "این رو میخوام",
            "reply_to_message": {"from": {"id": 1, "is_bot": True}, "caption": "پولوشرت هیکو (کد 22) — ۲٬۴۰۰٬۰۰۰ تومان\nتوضیح"}}
     assert tg.parse_message(bot, msg, False).text == "این رو میخوام\n[در جواب: پولوشرت هیکو (کد 22) — ۲٬۴۰۰٬۰۰۰ تومان]"
+
+
+async def test_common_questions_answer_from_faq_settings_or_tell_the_seller(client, monkeypatch):
+    """ali: «چطوری سفارش بدم؟» got «نام، شماره و آدرس رو بفرستید». The common buyer questions are answered from the
+    FAQ when it has them, from the shop's settings (order taking on/off, payment) for how to order/pay, and for the
+    facts only the seller knows the seller is told once to add them to the FAQ."""
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550091")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True, "orders_enabled": False})
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "چطوری سفارش بدم؟"})).json()
+    off = r["messages"][-1]["text"]
+    assert "همکارم" in off and "از کدوم محصول" in off and llm.calls == []
+
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        "orders_enabled": True, "payment": {"card_number": "6037991234567890", "require_receipt": True}})
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "چجوری باید خرید کنم"})).json()
+    on = r["messages"][-1]["text"]
+    assert "شماره کارت" in on and "فیش" in on and "کد رهگیری" in on and llm.calls == []
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "روش پرداخت چیه؟"})).json()
+    assert "کارت‌به‌کارت" in r["messages"][-1]["text"] and llm.calls == []
+
+    # not in the FAQ: the model answers without guessing, and the seller hears about it once
+    from app.services import chat_common
+    keys = [s["key"] for s in (await client.get(f"/stores/{sid}/chat/faq/suggested", headers=h)).json()["items"]]
+    assert "shipping_cost" in keys and "how_to_order" not in keys and "payment" not in keys
+    llm.answers = [{"reply": "می‌پرسم و خبرت می‌کنم", "intent": "other"}]
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "هزینه ارسال چقدره؟"})
+    assert "COMMON QUESTION" in llm.calls[-1]["prompt"]
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "هزینه پست چنده"})
+    assert sum("❓" in n for n in await _notes(sid)) == 1
+
+    # in the FAQ: its answer, no model, and no longer suggested
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        "faqs": [{"q": "هزینه ارسال چقدره؟", "a": "پست پیشتاز ۸۰ هزار تومان."},
+                 {"q": "نحوه سفارش", "a": "از دایرکت پیام بده."}]})
+    n = len(llm.calls)
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "ارسال رایگان دارید؟"})).json()
+    assert r["messages"][-1]["text"] == "پست پیشتاز ۸۰ هزار تومان."
+    r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "چطوری سفارش بدم؟"})).json()
+    assert r["messages"][-1]["text"] == "از دایرکت پیام بده." and len(llm.calls) == n
+    keys = [s["key"] for s in (await client.get(f"/stores/{sid}/chat/faq/suggested", headers=h)).json()["items"]]
+    assert "shipping_cost" not in keys and "returns" in keys
+    assert chat_common.match("سلام هودی مشکی دارید؟") is None

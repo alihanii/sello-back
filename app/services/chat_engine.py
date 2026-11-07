@@ -1200,6 +1200,40 @@ async def code_skill(db: AsyncSession, conv: ChatConversation, store: Store, age
     return False
 
 
+COMMON_MAX_CHARS = 70  # a longer message asks more than the common question: the model answers all of it
+
+
+async def common_question(db: AsyncSession, conv: ChatConversation, agent: ChatAgent, state: dict[str, Any], text: str,
+                          result: TurnResult) -> tuple[list[Reply], str]:
+    """A common buyer question: (the replies when the shop answers it by itself, a prompt line otherwise)."""
+    from app.services import chat_common, chat_order
+    c = chat_common.match(text)
+    if not c:
+        return [], ""
+    short = len(text.strip()) <= COMMON_MAX_CHARS
+    if (entry := chat_common.faq_entry(agent, c)) is not None:
+        if short:
+            return [Reply(str(entry["a"]).strip(), source="faq", intent="faq")], ""
+        return [], f"\nCOMMON QUESTION «{c.question}»: answer it from this FAQ entry: {faq_line(entry)}"
+    if c.built and (answer := chat_common.built_answer(agent, c.key)):
+        if not short:
+            return [], f"\nCOMMON QUESTION «{c.question}»: the shop's answer is: {answer.replace(chr(10), ' ')}"
+        if c.key == "how_to_order" and agent.orders_enabled:
+            placed = await open_order(db, conv.store_id, state.get("order_id"))
+            if (step := await chat_order.next_step(db, conv, agent, state, placed)) is not None:
+                return [Reply(f"برای ثبت همین سبدت فقط این مونده 🌸\n{step.text}", source="order", intent="order",
+                              buttons=step.buttons)], ""
+        return [Reply(answer, source="common", intent="faq")], ""
+    if c.built:
+        return [], ""
+    asked = list(state.get("faq_gaps") or [])
+    if c.key not in asked:
+        state["faq_gaps"] = [*asked, c.key]
+        result.notify_admin.append(chat_common.gap_note(c, text))
+    return [], (f"\nCOMMON QUESTION «{c.question}»: the shop hasn't said (not in FAQ/SHOP/RULES). Don't guess: say "
+                "you'll check with the seller and they'll answer soon, then help with the rest.")
+
+
 async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent,
                    pending: list[ChatMessage]) -> TurnResult:
     """Decides the answer to the customer's pending messages. Saves nothing that isn't on `conv`/new rows;
@@ -1300,6 +1334,15 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         sent_at = _aware(pending[-1].created_at) if pending and pending[-1].created_at else None
         if (tapped := await chat_menu.handle(db, conv, store, agent, state, text, result, sent_at)) is not None:
             result.replies += tapped
+            return done()
+
+    common_hint = ""
+    if text and not photo and not unsupported:
+        # The questions every shop gets ("how do I order / pay", "shipping cost?"…): the FAQ's own answer when it has
+        # one, the shop's settings for the ones they answer, and otherwise the seller is told once to add it.
+        answered, common_hint = await common_question(db, conv, agent, state, text, result)
+        if answered:
+            result.replies += answered
             return done()
 
     if unsupported:
@@ -1406,6 +1449,8 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                             policy(agent)["stock"] == "exact", placed, relevant_faqs(agent, text), my_orders)
     if skill:
         prompt += f"\nROUTER: this message is about «{skill}»."
+    if common_hint:
+        prompt += common_hint
     try:
         out, usage = await ai.generate_chat(system=system, prompt=prompt, store_id=store.id, max_tokens=MAX_OUTPUT_TOKENS)
         if mixed_language(str(out.get("reply") or ""), text, products, store):
