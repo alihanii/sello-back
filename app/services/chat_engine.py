@@ -310,8 +310,11 @@ Never say an order is placed, completed or shipped, and never guess an order's s
 WHICH PRODUCT: "this/همین/اون" = LAST PRODUCT. Vague -> ONE short question naming up to 3 (intent "clarify"). "خودت
 انتخاب کن" -> you pick one.
 SIMILAR: same دسته as LAST PRODUCT, closest price first, 1-3 names with price; none -> say so.
-VARIANTS: colours/sizes are in the details; one not listed -> say so, list the listed ones. A swapped product keeps
-the chosen size/colour.
+VARIANTS: colours/sizes are in the details; one not listed -> say so, list the listed ones. No colours/sizes in a
+product's details -> never say a colour or size is available: say they aren't listed and the seller confirms after the
+order. A swapped product keeps the chosen size/colour.
+PRINT: only products whose title says چاپ/طرح دلخواه take the customer's design. Printing on another kind (a t-shirt
+when only hoodies are printed) -> say first, plainly, that we don't print on that kind, then name what we print on.
 FIRST read what the customer means in this message, with RECENT CHAT and STEP, then choose how to answer.
 WHAT WE HAVE: "چی دارین؟", "محصولاتتون؟", "لیست بده" (no specific kind of product) -> intent "catalog", reply "" (the
 shop sends its real list). A named kind, design or product ("طرح دیگه‌ای از اسپایدرمن دارین؟") is NOT catalog: answer
@@ -574,7 +577,8 @@ def catalog_overview(rows: list[Product], exact_stock: bool) -> str:
 _BROWSE_WORDS = set("""دیگه دیگر دیگری مدل مدلا مدلای مدلهای مدل‌های مدلها طرح طرحا طرحای طرحهای طرح‌های نشون نشونم
 بدی بده بهم میتونی می‌تونی میشه داریم دارید ببینم چیزی چیا چیزایی چیزای هایی های رنگ رنگای سایز جنس نوع انواع بیشتر
 بقیه همه همین اون محصول محصولات محصولی جنس کار کارای لباس ببینمشون ببینمش ببینمشو ببینمشونو ببینیم دیدن عکس عکسش
-عکساش عکسشون عکسا عکسای تصویر تصاویر جزئیات جزییات توضیح توضیحات بفرست بفرستی بفرستید نشونشون""".split())
+عکساش عکسشون عکسا عکسای تصویر تصاویر جزئیات جزییات توضیح توضیحات بفرست بفرستی بفرستید نشونشون یکی دوتا دو سه چهار
+تا تاش تاشو تاشون تاییش چندتا چندتاش رنگشون رنگش رنگاش سایزش سایزشون""".split())
 # "other designs / what models of X do you have": the shop's own search answers, even when the model missed it.
 _BROWSE_Q = re.compile(r"((مدل|طرح)\S*\s*(های|‌های)?\s*(دیگه|دیگر|دیگری)|یه\s*(طرح|مدل)\s*دیگه|دیگه\s*چه\s*(مدل|طرح)|"
                        r"(چه|کدوم|چند)\s*(تا\s*)?(مدل|طرح)\S*\s*(از|اسپ|دارین|دارید|داری|موجود))")
@@ -602,13 +606,24 @@ def _with_colour(rows: list[Product], colours: set[str]) -> list[Product]:
     """The products that come in the colour asked for (its options, title or tags), else all of them."""
     if not colours:
         return rows
-    has = [p for p in rows if colours & _colors_in(" ".join([p.title, p.category_hint, " ".join(p.tags or []),
-                                                               " ".join(variant_options(p).get("color", []))]))]
+    has = [p for p in rows if colours & (colours_of(p) | _colors_in(p.category_hint))]
     return has or rows
 
 
+_NOT_THIS = re.compile(r"(?<!\w)(نه|ن)\s+(\S+)")
+_NOT_WANT = re.compile(r"(\S+)\s+(نمی\s*‌?خوام|نمیخوام)(?!\w)")
+
+
 def _query_words(text: str) -> set[str]:
-    return {w for w in words(text) if not _overlap({w}, _BROWSE_WORDS)}  # "محصولاتی", "مدلای" are browse words too
+    """The words that name what they want: not browse words ("محصولاتی", "مدلای"), and not what they said no to
+    ("تیشرت میخوام نه هودی", "هودی نمیخوام")."""
+    t = norm(text)
+    refused = set()
+    for m in _NOT_THIS.finditer(t):
+        refused |= words(m.group(2))
+    for m in _NOT_WANT.finditer(t):
+        refused |= words(m.group(1))
+    return {w for w in words(t) if not _overlap({w}, _BROWSE_WORDS) and w not in refused and w not in ("نه", "ن")}
 
 
 def _named(rows: list[Product], q: set[str]) -> tuple[list[Product], set[str], set[str]]:
@@ -656,7 +671,10 @@ async def catalog_answer(db: AsyncSession, store_id: int, text: str, recent: lis
     asked = " ".join(sorted(q, key=lambda w: norm(text).find(w)))
     if named and not (_ANOTHER.search(text) and all(p.id in recent for p in named)):
         listed[:] = [p.id for p in _first(_with_colour(named, colours))]
-        return catalog_overview(_with_colour(named, colours), exact_stock)
+        missing = colours and not any(colours & (colours_of(p) | _colors_in(p.category_hint)) for p in named)
+        note = (f"رنگ {'، '.join(sorted(colours))} رو توی «{asked}» پیدا نکردم 🙏 رنگ هرکدوم رو بخوای می‌پرسم.\n"
+                if missing else "")
+        return note + catalog_overview(_with_colour(named, colours), exact_stock)
     # Nothing (else) like it: say so, and offer the rest of the category it belongs to.
     cats = {p.category for p in named if p.category} or ({last.category} if last and last.category else set())
     if generic or not cats:
@@ -999,23 +1017,97 @@ async def design_on_product(db: AsyncSession, conv: ChatConversation, store: Sto
 
 
 _KIND_FA = {"color": "رنگ", "size": "سایز"}
+_CONTACT_FORM = re.compile(r"(نام\s*و\s*نام\s*خانوادگی|شماره\s*موبایل|آدرس|ادرس|کد\s*پستی)")
+
+
+_AVAILABLE_CLAIM = re.compile(r"(داریم|موجوده|موجود\s*(هست|است|داریم|می\s*‌?باشه)|(?<!ن)هست(?!\w))")
+
+
+def sizes_of(p: Product) -> set[str]:
+    opts = variant_options(p).get("size") or []
+    return _sizes_in(" ".join(opts)) if opts else _sizes_in(" ".join([p.title, p.description or ""]))
+
+
+def colours_of(p: Product) -> set[str]:
+    """The colours a product comes in: its colour options, else what its title, tags and description say."""
+    opts = variant_options(p).get("color") or []
+    if opts:
+        return _colors_in(" ".join(opts))
+    return _colors_in(" ".join([p.title, " ".join(p.tags or []), p.description or ""]))
+
+
+_ORDINALS = {"اول": 0, "یکم": 0, "دوم": 1, "سوم": 2, "چهارم": 3, "پنجم": 4, "ششم": 5}
+_ORDINAL = re.compile(r"(?<!\w)((اول|یکم|دوم|سوم|چهارم|پنجم|ششم)(ی|ین|یش|یه|ین\s*\S*)|آخری\S*|اخری\S*|آخرین|اخرین|"
+                      r"([1-6])\s*(ام|امی|امیش|مین|مینی|ـمی|می|ومی)\S*)(?!\w)")
+
+
+async def pick_by_order(db: AsyncSession, store: Store, state: dict[str, Any], text: str) -> str:
+    """"سومی رنگ مشکی", "اخری قهوه‌ای", a reply to a product's photo: the product it means, written into the message
+    (and as the last product talked about) so the assistant and the search know which one."""
+    rows: list[Product] | None = None
+    m = re.search(r"\[در جواب: ([^\]]*)\]", text)
+    if m and (code := re.search(r"کد\s*([\w-]+)", to_en_digits(m.group(1)))):
+        rows = await catalog_rows(db, store.id)
+        p = next((p for p in rows if p.sku and to_en_digits(p.sku) == code.group(1)), None)
+        if p:
+            state["recent_products"] = (list(state.get("recent_products") or []) + [p.id])[-4:]
+            state["listed"] = [p.id]
+            return text.replace(m.group(0), f"[منظورش «{p.title[:80]}» (#{p.id}) است]")
+    listed = state.get("listed") or []
+    o = _ORDINAL.search(to_en_digits(text))
+    if not listed or not o:
+        return text
+    word = o.group(0)
+    if word.startswith(("آخر", "اخر")):
+        idx = len(listed) - 1
+    elif o.group(2):
+        idx = _ORDINALS[o.group(2)]
+    else:
+        idx = int(o.group(4)) - 1
+    if not 0 <= idx < len(listed):
+        return text
+    rows = rows or await catalog_rows(db, store.id)
+    p = next((p for p in rows if p.id == listed[idx]), None)
+    if not p:
+        return text
+    state["recent_products"] = (list(state.get("recent_products") or []) + [p.id])[-4:]
+    state["listed"] = [p.id]
+    return to_en_digits(text).replace(word, f"«{p.title[:80]}» (#{p.id})", 1)
 _SEE_THEM = re.compile(r"(ببینم|ببینیم|نشون\S*\s*(بده|بدین|بدید|میدی|میدین)|نشونم|عکس|تصویر|تصاویر|جزئیات|جزییات|"
-                       r"توضیح\S*\s*(بیشتر|بده|بدین)|بیشتر\s*توضیح|بفرست)")
+                       r"توضیح\S*\s*(بیشتر|بده|بدین)|بیشتر\s*توضیح)")
 
 
 async def see_them(db: AsyncSession, store: Store, agent: ChatAgent, state: dict[str, Any], text: str) -> list[Reply]:
     """The photo and details of each product the customer asks to see: the ones the words name, else the ones the
     last answer listed. Empty when it isn't that ask (another design, the order…) or there is nothing to show."""
-    if not _SEE_THEM.search(text) or _ANOTHER.search(text) or _MY_ORDER.search(text) or _PAID.search(text):
-        return []
+    if (not _SEE_THEM.search(text) or _ANOTHER.search(text) or _MY_ORDER.search(text) or _PAID.search(text)
+            or norm_phone(text) or bad_phone(text) or _CONTACT_FORM.search(text) or len(text) > 160):
+        return []  # a filled-in contact form ("…توی یک پیام بفرست") is the order's details, never a photo ask
     rows = await catalog_rows(db, store.id)
+    by_id = {p.id: p for p in rows}
+    listed = [by_id[i] for i in state.get("listed") or [] if i in by_id]
     q = {w for w in _query_words(text) if not _colors_in(w) and not _sizes_in(w)}
-    if q:
+    colours = _colors_in(text)
+    narrowed = (_rank(listed, q, lambda p: f"{p.title} {p.category or ''} {' '.join(p.tags or [])}", strict=True)
+                if listed and q else [])
+    from_list = bool(listed) and (not q or bool(narrowed))
+    if from_list:
+        # "the two or three of them in black": out of the list just shown, never the whole shop by stray words.
+        products = narrowed or listed
+    elif q:
         products = _first(_named(rows, q)[0])
     else:
-        by_id = {p.id: p for p in rows}
-        products = [by_id[i] for i in state.get("listed") or [] if i in by_id]
-    if len(products) < 2:
+        return []
+    if colours:
+        has = [p for p in products if colours & colours_of(p)]
+        if not has:
+            asked = "، ".join(sorted(colours))
+            lines = [f"▫️ {p.title[:70]}: " + ("، ".join(sorted(colours_of(p))) or "رنگ‌بندیش ثبت نشده")
+                     for p in products[:CATALOG_SHOW]]
+            return [Reply(f"از این‌ها رنگ {asked} پیدا نکردم 🙏 رنگ‌هاشون:\n" + "\n".join(lines)
+                          + "\nرنگ دیگه‌ای می‌خوای یا یکی‌شون رو ببینی؟", source="catalog", intent="product")]
+        products = has
+    if len(products) < 2 and not (from_list and colours):
         # One product ("عکس هودی اختاپوس", "عکسشو ببینم"): the assistant sends that product's photos itself.
         return []
     out: list[Reply] = []
@@ -1179,6 +1271,9 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                 result.notify_admin.append(f"🧾 فیش/کد پرداخت سفارش #{order.id} ({money(order.total_toman)}) از "
                                            f"{order.customer_name or conv.customer_name or 'مشتری'} رسید.")
                 return done()
+
+    if text and agent.catalog_enabled:
+        text = await pick_by_order(db, store, state, text)
 
     if text and not photo and agent.orders_enabled and (shown := await my_pictures(db, conv, store, state, text)):
         # "What's my design now? / show my cart's photo": the design they sent and the product, from the cart or
@@ -1472,6 +1567,16 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         await order_handoff(db, conv, store, state, result, usage)
         return done()
 
+    if reply_text and _AVAILABLE_CLAIM.search(reply_text) and (_colors_in(reply_text) or _sizes_in(reply_text)):
+        # "مشکی و سورمه‌ای 2XL داریم" about a product whose colours/sizes the shop never wrote down: not a promise the
+        # assistant can make. It offers to take the order and have the seller confirm instead.
+        focus = ([it.get("product_id") for it in order.get("items") or [] if it.get("product_id")][-1:]
+                 or shown[-1:] or (state.get("recent_products") or [])[-1:])
+        fp = await db.get(Product, focus[0]) if focus else None
+        if fp and fp.store_id == store.id and ((_colors_in(reply_text) and not colours_of(fp))
+                                               or (_sizes_in(reply_text) and not sizes_of(fp))):
+            reply_text = (f"رنگ‌بندی و سایزبندی موجودِ «{fp.title[:60]}» توی اطلاعات فروشگاه ثبت نشده 🙏 می‌تونم "
+                          "سفارشت رو با همین انتخاب ثبت کنم و فروشنده قبل از ارسال موجودیش رو تأیید می‌کنه؛ ثبت کنم؟")
     if policy(agent)["stock"] == "available":
         reply_text = hide_stock_counts(reply_text)
     reply = Reply(reply_text[:1500], source="llm", intent=intent, usage=usage)

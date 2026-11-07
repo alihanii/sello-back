@@ -1991,3 +1991,72 @@ async def test_can_i_see_them_after_a_list(client, monkeypatch):
     assert len(llm.calls) == calls  # answered by the shop, no model call
     assert "رنگ: مشکی، کرم" in next(m["text"] for m in msgs if m["image_url"] == "/media/x/a.jpg")
     assert ids
+
+
+async def test_tshirt_chat_list_picks_and_unlisted_variants(client, monkeypatch):
+    """ali's t-shirt chat: «دو سه تاش که مشکی باشه» sent a hoodie and an overshirt, the filled-in contact form
+    («…توی یک پیام بفرست») was read as «send photos» and lost, «3امی»/«اخری» and a reply to a photo were ignored, and
+    the assistant said «مشکی 2XL داریم» of a product with no colours or sizes written down."""
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550076")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        "enabled": True, "orders_enabled": True, "payment": {"card_number": "6037991234567890"}})
+    from app.core.db import SessionLocal
+    from app.models import Product, ProductImage
+    async with SessionLocal() as db:
+        t1 = Product(store_id=sid, title="ست تیشرت و جین", price=2400000, stock_qty=3, category="تیشرت", sku="35")
+        t2 = Product(store_id=sid, title="تیشرت+شلوار Arawiel", price=2400000, stock_qty=3, category="تیشرت", sku="39")
+        t3 = Product(store_id=sid, title="تیشرت کالکشن تابستونی", price=2400000, stock_qty=3, category="تیشرت", sku="33")
+        polo = Product(store_id=sid, title="پولوشرت هیکو", price=2400000, stock_qty=3, category="پولوشرت", sku="22",
+                       description="اطلاع از سایزبندی و رنگبندی باقی مونده دایرکت")
+        over = Product(store_id=sid, title="اورشرت Win Again", price=2400000, stock_qty=3, category="اورشرت", sku="27",
+                       description="سایزبندی S,M,L,Xl در دو رنگ قهویی و سورمه ای")
+        brown = Product(store_id=sid, title="هودی کلاهدار قهوه‌ای", price=2100000, stock_qty=3, category="هودی",
+                        attributes={"رنگ": "مشکی"})
+        db.add_all([t1, t2, t3, polo, over, brown])
+        await db.flush()
+        db.add_all([ProductImage(product_id=p.id, url=f"/media/x/{p.sku or p.id}.jpg")
+                    for p in (t1, t2, t3, polo, over, brown)])
+        await db.commit()
+        third, polo_id = t3.id, polo.id
+
+    async def say(t):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": t})).json()["messages"]
+
+    await say("سلام")
+    llm.answers = [{"reply": "", "intent": "catalog"}]
+    listed = (await say("تیشرت میخوام نه هودی"))[-1]["text"]
+    assert "ست تیشرت و جین" in listed and "هودی" not in listed.split("\n", 1)[1]
+
+    msgs = await say("ببینم دو سه تاش ک رنگشون مشکی باشه")
+    assert "رنگ مشکی پیدا نکردم" in msgs[-1]["text"] and not any(m["image_url"] for m in msgs)
+    assert "اورشرت" not in msgs[-1]["text"] and "هودی" not in msgs[-1]["text"]
+
+    llm.answers = [{"reply": "باشه", "intent": "product"}]
+    await say("سومی رنگ مشکی سایز 2xl")
+    assert "تیشرت کالکشن تابستونی" in llm.calls[-1]["prompt"] and f"#{third}" in llm.calls[-1]["prompt"]
+
+    llm.answers = [{"reply": "ممنون 🌸", "intent": "order"}]
+    msgs = await say("برای ثبت سفارش لطفاً اینها رو توی یک پیام بفرست 🌸\nنام و نام خانوادگی: سارا کریمی\n"
+                     "شماره موبایل: 09171234567\nآدرس کامل با کد پستی: شیراز، معالی آباد 7134567890")
+    assert not any(m["image_url"] for m in msgs) and "سارا کریمی" in llm.calls[-1]["prompt"]
+
+    # a reply to the polo's photo, and an availability the shop never wrote down
+    llm.answers = [{"reply": "قهوه‌ایش رو موجود نداریم، اما رنگ مشکی و سورمه‌ای سایز 2XL رو داریم. همین رو ثبت کنم؟",
+                    "intent": "product", "products": [polo_id]}]
+    last = (await say("این رو میخوام\n[در جواب: پولوشرت هیکو (کد 22) — ۲٬۴۰۰٬۰۰۰ تومان]"))[-1]["text"]
+    assert "پولوشرت هیکو" in llm.calls[-1]["prompt"]
+    assert "ثبت نشده" in last and "فروشنده" in last and "2XL رو داریم" not in last
+
+    llm.answers = [{"reply": "", "intent": "catalog"}]
+    last = (await say("تیشرت مشکی ن هودی مشکی"))[-1]["text"]
+    assert last.startswith("رنگ مشکی رو توی «تیشرت» پیدا نکردم") and "هودی کلاهدار" not in last
+
+
+def test_reply_to_a_bot_photo_names_it():
+    from types import SimpleNamespace
+
+    from app.services import chat_messenger as tg
+    bot = SimpleNamespace(business_user_id="")
+    msg = {"chat": {"id": 5, "type": "private"}, "from": {"id": 5}, "message_id": 9, "text": "این رو میخوام",
+           "reply_to_message": {"from": {"id": 1, "is_bot": True}, "caption": "پولوشرت هیکو (کد 22) — ۲٬۴۰۰٬۰۰۰ تومان\nتوضیح"}}
+    assert tg.parse_message(bot, msg, False).text == "این رو میخوام\n[در جواب: پولوشرت هیکو (کد 22) — ۲٬۴۰۰٬۰۰۰ تومان]"

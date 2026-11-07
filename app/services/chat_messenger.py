@@ -138,6 +138,12 @@ def parse_message(bot: ChatBot, msg: dict[str, Any], business: bool) -> Inbound 
     )
     if business:
         inbound.from_owner = bool(bot.business_user_id) and inbound.from_id == bot.business_user_id
+    quoted = msg.get("reply_to_message") or {}
+    if quoted and (quoted.get("from") or {}).get("is_bot"):
+        # A reply to one of the bot's messages ("این رو میخوام" under a product photo): which one it answers.
+        line = next((x.strip() for x in str(quoted.get("caption") or quoted.get("text") or "").splitlines() if x.strip()), "")
+        if line:
+            inbound.text = (inbound.text + f"\n[در جواب: {line[:160].replace(']', ' ')}]").strip()
     if contact := msg.get("contact"):
         inbound.text = (inbound.text + " " + str(contact.get("phone_number", ""))).strip()
         inbound.unsupported = ""
