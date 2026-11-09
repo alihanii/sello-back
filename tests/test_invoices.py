@@ -42,6 +42,10 @@ async def test_invoice_link_receipt_and_orders(client):
                           files={"file": ("r.png", io.BytesIO(PNG), "image/png")})
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "payment_submitted" and r.json()["receipt_sent"]
+    assert r.json()["closed"] and r.json()["payment"]["card_number"] == ""
+    # The link is closed now: no second receipt while the seller checks the first.
+    again = await client.post(f"/public/invoices/{inv['code']}/receipt", data={"payment_ref": "77"})
+    assert again.status_code == 409
 
     orders = (await client.get(f"/stores/{sid}/orders", headers=h)).json()
     assert orders["total"] == 1 and orders["items"][0]["kind"] == "invoice"
@@ -77,3 +81,38 @@ async def test_invoice_link_receipt_and_orders(client):
     # Other sellers can't see it.
     other = await login(client, "09128810002")
     assert (await client.get(f"/invoices/{inv['id']}", headers=other)).status_code == 404
+
+
+async def test_rejected_receipt_reopens_and_cancelled_or_expired_closes(client):
+    h = await login(client, "09128810003")
+    sid = (await client.post("/stores", json={"name": "بسته"}, headers=h)).json()["id"]
+    await client.put(f"/stores/{sid}/invoice-settings", headers=h, json={"card_number": "6037991112345678", "require_receipt": False,
+                                                                         "ask_address": False, "ask_phone": False})
+    mk = lambda: client.post(f"/stores/{sid}/invoices", headers=h, json={"items": [{"title": "x", "unit_price": 1000}]})
+    inv = (await mk()).json()
+    assert (await client.post(f"/public/invoices/{inv['code']}/receipt", data={"payment_ref": "1"})).status_code == 200
+    await client.patch(f"/invoices/{inv['id']}", headers=h, json={"status": "rejected"})
+    pub = (await client.get(f"/public/invoices/{inv['code']}")).json()
+    assert not pub["closed"] and pub["payment"]["card_number"]
+    assert (await client.post(f"/public/invoices/{inv['code']}/receipt", data={"payment_ref": "2"})).status_code == 200
+
+    inv = (await mk()).json()
+    await client.patch(f"/invoices/{inv['id']}", headers=h, json={"status": "cancelled"})
+    pub = (await client.get(f"/public/invoices/{inv['code']}")).json()
+    assert pub["closed"] and pub["payment"]["card_number"] == ""
+    assert (await client.post(f"/public/invoices/{inv['code']}/receipt", data={"payment_ref": "3"})).status_code == 409
+
+    from datetime import timedelta
+    from app.core.db import SessionLocal, utcnow
+    from app.models import Invoice
+    inv = (await mk()).json()
+    async with SessionLocal() as db:
+        row = await db.get(Invoice, inv["id"])
+        row.expires_at = utcnow() - timedelta(hours=1)
+        await db.commit()
+    pub = (await client.get(f"/public/invoices/{inv['code']}")).json()
+    assert pub["expired"] and pub["closed"] and pub["payment"]["card_number"] == ""
+    assert (await client.post(f"/public/invoices/{inv['code']}/receipt", data={"payment_ref": "4"})).status_code == 409
+
+    cal = (await client.get(f"/stores/{sid}/calendar?start=2020-01-01&end=2030-01-01", headers=h)).json()
+    assert sum(v["own_orders"] for v in cal["days"].values()) == 1

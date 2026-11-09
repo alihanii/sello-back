@@ -37,7 +37,7 @@ async def _daily(db, store_id: int, start: date, end: date) -> dict[str, dict[st
     return out
 
 
-CHAT_TYPES = ["orders", "orders_toman", "chats_answered", "ai_replies"]
+CHAT_TYPES = ["orders", "orders_toman", "own_orders", "own_orders_toman", "chats_answered", "ai_replies"]
 
 
 def _day_key(v) -> str:
@@ -57,6 +57,15 @@ async def _chat_daily(db, store_id: int, start: date, end: date) -> dict[str, di
             .group_by(oday))).all():
         row = out.setdefault(_day_key(d), {t: 0 for t in CHAT_TYPES})
         row["orders"], row["orders_toman"] = int(n), int(toman or 0)
+    # The seller's own orders: invoices the customer sent a receipt for, and chat orders logged by hand.
+    iday = func.date(Invoice.submitted_at)
+    ilive = Invoice.status.notin_(["cancelled", "rejected"])
+    for d, n, toman in (await db.execute(
+            select(iday, func.count(), func.coalesce(func.sum(case((ilive, Invoice.total_toman), else_=0)), 0))
+            .where(Invoice.store_id == store_id, Invoice.submitted_at >= lo, Invoice.submitted_at < hi)
+            .group_by(iday))).all():
+        row = out.setdefault(_day_key(d), {t: 0 for t in CHAT_TYPES})
+        row["own_orders"], row["own_orders_toman"] = int(n), int(toman or 0)
     mday = func.date(ChatMessage.created_at)
     for d, convs, msgs in (await db.execute(
             select(mday, func.count(func.distinct(ChatMessage.conversation_id)), func.count())

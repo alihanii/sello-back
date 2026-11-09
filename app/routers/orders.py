@@ -346,9 +346,11 @@ async def _public(db, code: str) -> tuple[Invoice, Store]:
 
 
 def _public_out(inv: Invoice, conf: dict[str, Any]) -> dict[str, Any]:
-    pay = {k: conf.get(k) or "" for k in ("card_number", "sheba", "holder", "bank_name", "pay_link")}
+    # Once the receipt is in, or the invoice is paid, cancelled or expired, the link only shows its state.
+    closed = inv.status in ("payment_submitted", "confirmed", "cancelled") or _expired(inv)
+    pay = {k: "" if closed else conf.get(k) or "" for k in ("card_number", "sheba", "holder", "bank_name", "pay_link")}
     return {
-        "number": inv.number, "status": inv.status, "expired": _expired(inv), "expires_at": inv.expires_at,
+        "number": inv.number, "status": inv.status, "expired": _expired(inv), "closed": closed, "expires_at": inv.expires_at,
         "created_at": inv.created_at, "items": [{k: i.get(k) for k in ("title", "variant", "qty", "unit_price", "image_url")}
                                                 for i in inv.items or []],
         "subtotal_toman": inv.subtotal_toman, "discount_toman": inv.discount_toman,
@@ -376,8 +378,9 @@ async def public_receipt(code: str, db: DB, file: UploadFile | None = File(None)
                          name: str = Form(""), phone: str = Form(""), address: str = Form(""), note: str = Form("")):
     inv, store = await _public(db, code)
     conf = await invoice_settings(db, store)
-    if inv.status in ("confirmed", "cancelled"):
-        raise HTTPException(409, "این فاکتور بسته شده است." if inv.status == "cancelled" else "پرداخت این فاکتور تأیید شده است.")
+    if inv.status in ("confirmed", "cancelled", "payment_submitted"):
+        raise HTTPException(409, {"cancelled": "این فاکتور لغو شده است.", "confirmed": "پرداخت این فاکتور تأیید شده است.",
+                                  "payment_submitted": "فیش این فاکتور قبلاً ارسال شده و منتظر تأیید فروشنده است."}[inv.status])
     if _expired(inv):
         raise HTTPException(409, "مهلت پرداخت این فاکتور تمام شده؛ از فروشنده فاکتور تازه بخواه.")
     ref = _latin_digits(payment_ref)[:120]
