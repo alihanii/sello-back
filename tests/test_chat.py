@@ -269,6 +269,16 @@ async def test_full_chat_flow(client, monkeypatch):
     ov = (await client.get(f"/stores/{sid}/chat/overview", headers=h)).json()
     assert ov["enabled"] and ov["month"]["ai_messages"] == 5
 
+    # 10. the calendar counts the order and the answered chat on today
+    from app.core.db import utcnow
+    today = utcnow().date().isoformat()
+    cal = (await client.get(f"/stores/{sid}/calendar?start={today}&end={today}", headers=h)).json()
+    d = cal["days"][today]
+    assert d["orders"] == 1 and d["orders_toman"] == 3750000 and d["chats_answered"] == 1 and d["ai_replies"] >= 5
+    day = (await client.get(f"/stores/{sid}/calendar/day/{today}", headers=h)).json()
+    assert day["stats"]["orders"] == 1 and day["orders"][0]["id"] == order["id"]
+    assert day["chats"][0]["id"] == conv_id and day["chats"][0]["ai_replies"] == d["ai_replies"]
+
 
 async def test_business_owner_message_pauses_ai(client, monkeypatch):
     h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550004")
