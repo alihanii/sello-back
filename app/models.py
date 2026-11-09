@@ -198,7 +198,7 @@ class CrawlSource(TimestampMixin, Base):
     channel_id: Mapped[int | None] = mapped_column(ForeignKey("channels.id"))
     url: Mapped[str] = mapped_column(String(1000), default="")
     schedule: Mapped[str] = mapped_column(String(20), default="manual")  # manual | hourly | daily | weekly
-    extraction_mode: Mapped[str] = mapped_column(String(8), default="auto")  # auto | regex | llm
+    extraction_mode: Mapped[str] = mapped_column(String(8), default="llm")  # auto | regex | llm
     # instagram_profile: {"include_reels": bool}; `url` holds the username.
     options: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
