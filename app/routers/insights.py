@@ -3,11 +3,11 @@
 from datetime import date, datetime, time, timedelta, timezone
 
 from fastapi import APIRouter
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 
 from app.core.db import utcnow
 from app.deps import DB, CurrentUser, get_store_for
-from app.models import ActivityEvent, AiOrder, Channel, ChatConversation, ChannelListing, CrawlSource, Operation, Plan, Product
+from app.models import ActivityEvent, AiOrder, Channel, ChatConversation, ChatMessage, ChannelListing, CrawlSource, Operation, Plan, Product
 from app.schemas import OperationOut
 from app.services.ai import ai_available, route_problem
 from app.services.plans import active_subscription, limits_for
@@ -36,10 +36,51 @@ async def _daily(db, store_id: int, start: date, end: date) -> dict[str, dict[st
     return out
 
 
+CHAT_TYPES = ["orders", "orders_toman", "chats_answered", "ai_replies"]
+
+
+def _day_key(v) -> str:
+    return v.isoformat() if hasattr(v, "isoformat") else str(v)[:10]
+
+
+async def _chat_daily(db, store_id: int, start: date, end: date) -> dict[str, dict[str, int]]:
+    """Per day: orders the assistant took and chats it answered (test chats left out)."""
+    lo = datetime.combine(start, time.min, tzinfo=timezone.utc)
+    hi = datetime.combine(end + timedelta(days=1), time.min, tzinfo=timezone.utc)
+    out: dict[str, dict[str, int]] = {}
+    oday = func.date(AiOrder.created_at)
+    live = AiOrder.status.notin_(["cancelled", "rejected"])
+    for d, n, toman in (await db.execute(
+            select(oday, func.count(), func.coalesce(func.sum(case((live, AiOrder.total_toman), else_=0)), 0))
+            .where(AiOrder.store_id == store_id, ~AiOrder.is_test, AiOrder.created_at >= lo, AiOrder.created_at < hi)
+            .group_by(oday))).all():
+        row = out.setdefault(_day_key(d), {t: 0 for t in CHAT_TYPES})
+        row["orders"], row["orders_toman"] = int(n), int(toman or 0)
+    mday = func.date(ChatMessage.created_at)
+    for d, convs, msgs in (await db.execute(
+            select(mday, func.count(func.distinct(ChatMessage.conversation_id)), func.count())
+            .where(ChatMessage.store_id == store_id, ChatMessage.role == "ai", ~ChatMessage.is_test,
+                   ChatMessage.created_at >= lo, ChatMessage.created_at < hi)
+            .group_by(mday))).all():
+        row = out.setdefault(_day_key(d), {t: 0 for t in CHAT_TYPES})
+        row["chats_answered"], row["ai_replies"] = int(convs), int(msgs)
+    return out
+
+
+async def _all_daily(db, store_id: int, start: date, end: date) -> dict[str, dict[str, int]]:
+    days = await _daily(db, store_id, start, end)
+    for k, chat in (await _chat_daily(db, store_id, start, end)).items():
+        days.setdefault(k, {t: 0 for t in EVENT_TYPES}).update(chat)
+    for v in days.values():
+        for t in CHAT_TYPES:
+            v.setdefault(t, 0)
+    return days
+
+
 @router.get("/stores/{store_id}/calendar")
 async def calendar(store_id: int, user: CurrentUser, db: DB, start: date, end: date):
     await get_store_for(db, user, store_id)
-    days = await _daily(db, store_id, start, end)
+    days = await _all_daily(db, store_id, start, end)
     # Days where a scheduled crawl source existed but no crawl ran: flagged on the calendar.
     sources = (await db.execute(select(CrawlSource).where(CrawlSource.store_id == store_id, CrawlSource.is_active,
                                                           CrawlSource.schedule != "manual"))).scalars().all()
@@ -74,8 +115,25 @@ async def calendar_day(store_id: int, day: date, user: CurrentUser, db: DB):
     ops = (await db.execute(select(Operation).where(Operation.store_id == store_id, Operation.created_at >= start,
                                                     Operation.created_at < start + timedelta(days=1))
                             .order_by(Operation.created_at))).scalars().all()
-    stats = (await _daily(db, store_id, day, day)).get(day.isoformat(), {t: 0 for t in EVENT_TYPES})
-    return {"day": day, "stats": stats, "operations": [OperationOut.model_validate(o) for o in ops]}
+    stats = (await _all_daily(db, store_id, day, day)).get(day.isoformat(), {t: 0 for t in EVENT_TYPES + CHAT_TYPES})
+    end = start + timedelta(days=1)
+    orders = (await db.execute(select(AiOrder).where(
+        AiOrder.store_id == store_id, ~AiOrder.is_test, AiOrder.created_at >= start, AiOrder.created_at < end)
+        .order_by(AiOrder.created_at))).scalars().all()
+    replies = func.count(ChatMessage.id)
+    chats = (await db.execute(
+        select(ChatConversation.id, ChatConversation.customer_name, ChatConversation.customer_username,
+               ChatConversation.platform, replies, func.max(ChatMessage.created_at))
+        .join(ChatMessage, ChatMessage.conversation_id == ChatConversation.id)
+        .where(ChatMessage.store_id == store_id, ChatMessage.role == "ai", ~ChatMessage.is_test,
+               ChatMessage.created_at >= start, ChatMessage.created_at < end)
+        .group_by(ChatConversation.id).order_by(func.max(ChatMessage.created_at).desc()).limit(100))).all()
+    return {"day": day, "stats": stats, "operations": [OperationOut.model_validate(o) for o in ops],
+            "orders": [{"id": o.id, "created_at": o.created_at, "customer_name": o.customer_name,
+                        "total_toman": o.total_toman, "status": o.status, "tracking_code": o.tracking_code,
+                        "conversation_id": o.conversation_id, "platform": o.platform} for o in orders],
+            "chats": [{"id": cid, "customer_name": name or (f"@{uname}" if uname else ""), "platform": plat,
+                       "ai_replies": int(n), "last_at": last} for cid, name, uname, plat, n, last in chats]}
 
 
 @router.get("/stores/{store_id}/dashboard")
