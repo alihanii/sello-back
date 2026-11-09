@@ -261,7 +261,7 @@ class ActivityEvent(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), index=True)
     day: Mapped[date] = mapped_column(Date, index=True)
-    # crawl_run | crawl_item | product_created | publish_ok | publish_failed | crawl_failed
+    # crawl_run | crawl_item | product_created | publish_ok | publish_failed | crawl_failed | sale_toman (count = toman)
     type: Mapped[str] = mapped_column(String(24), index=True)
     count: Mapped[int] = mapped_column(Integer, default=1)
     operation_id: Mapped[int | None] = mapped_column(ForeignKey("operations.id"))

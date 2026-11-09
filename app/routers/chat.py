@@ -21,8 +21,9 @@ from app.services import chat_messenger as tg
 from app.services import chat_runtime as rt
 from app.services import chat_faq
 from app.services.ai import AIError, route_problem
+from app.services.ops import record_event
 from app.services.chat_engine import (
-    MAX_ANSWER_RULES, MAX_ORDER_FIELDS, due_toman, order_fields, policy,
+    MAX_ANSWER_RULES, MAX_ORDER_FIELDS, due_toman, newly_confirmed_toman, order_fields, policy,
     DEFAULT_AWAY, DEFAULT_OFF_TOPIC, DEFAULT_WELCOME, chat_limit, get_agent, month_ai_messages,
 )
 
@@ -629,7 +630,9 @@ async def update_order(order_id: int, body: OrderPatch, user: CurrentUser, db: D
                 if p and p.store_id == o.store_id:
                     p.stock_qty = max(0, p.stock_qty - int(it.get("qty") or 0))
         if body.status == "confirmed":
-            o.items = [{**i, "paid": True} for i in o.items or []]  # the seller says it's paid
+            if o.status != "confirmed" and not o.is_test:  # today's income: what this confirmation adds
+                await record_event(db, o.store_id, "sale_toman", newly_confirmed_toman(o), payload={"order_id": o.id})
+            o.items = [{**i, "paid": True, "confirmed": True} for i in o.items or []]  # the seller says it's paid
         o.status = body.status
         conv = await db.get(ChatConversation, o.conversation_id)
         if conv:

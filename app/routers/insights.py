@@ -10,6 +10,7 @@ from app.deps import DB, CurrentUser, get_store_for
 from app.models import ActivityEvent, AiOrder, Channel, ChatConversation, ChatMessage, ChannelListing, CrawlSource, Operation, Plan, Product
 from app.schemas import OperationOut
 from app.services.ai import ai_available, route_problem
+from app.services.chat_engine import confirmed_toman
 from app.services.plans import active_subscription, limits_for
 
 router = APIRouter(tags=["insights"])
@@ -22,7 +23,7 @@ async def ai_status(user: CurrentUser):
     # The technical reason (keys, quota, billing) is for the admin only; sellers just don't see the feature.
     return {"available": await ai_available("product_generate"),
             "image_edit": not image_problem, "image_edit_problem": image_problem if user.role == "admin" else ""}
-EVENT_TYPES = ["crawl_run", "crawl_item", "crawl_failed", "product_created", "publish_ok", "publish_failed"]
+EVENT_TYPES = ["crawl_run", "crawl_item", "crawl_failed", "product_created", "publish_ok", "publish_failed", "sale_toman"]
 
 
 async def _daily(db, store_id: int, start: date, end: date) -> dict[str, dict[str, int]]:
@@ -144,7 +145,7 @@ async def dashboard(store_id: int, user: CurrentUser, db: DB):
         Product.store_id == store_id, Product.status != "archived"))
     published_any = await db.scalar(select(func.count(func.distinct(ChannelListing.product_id))).join(Product).where(
         Product.store_id == store_id, ChannelListing.status == "published"))
-    series = await _daily(db, store_id, today - timedelta(days=29), today)
+    series = await _all_daily(db, store_id, today - timedelta(days=29), today)
     t = series.get(today.isoformat(), {})
     ok30 = sum(v.get("publish_ok", 0) for v in series.values())
     fail30 = sum(v.get("publish_failed", 0) for v in series.values())
@@ -172,6 +173,13 @@ async def dashboard(store_id: int, user: CurrentUser, db: DB):
         ChatConversation.store_id == store_id, ~ChatConversation.is_test, ChatConversation.status == "needs_human"))
     if needs_human:
         attention.append({"type": "chat", "text": f"{needs_human} گفتگوی چت منتظر جواب ادمین"})
+    # All-time sales: confirmed orders in full, plus lines already confirmed on orders that grew since (test orders left out).
+    sales_total = int(await db.scalar(select(func.coalesce(func.sum(AiOrder.total_toman), 0)).where(
+        AiOrder.store_id == store_id, ~AiOrder.is_test, AiOrder.status == "confirmed")) or 0)
+    for o in (await db.execute(select(AiOrder).where(
+            AiOrder.store_id == store_id, ~AiOrder.is_test,
+            AiOrder.status.in_(["awaiting_payment", "payment_submitted"])))).scalars():
+        sales_total += confirmed_toman(o)
     month_start = datetime.combine(today.replace(day=1), time.min, tzinfo=timezone.utc)
     publishes_month = await db.scalar(select(func.count()).select_from(Operation).where(
         Operation.store_id == store_id, Operation.type == "publish", Operation.status == "succeeded",
@@ -182,6 +190,9 @@ async def dashboard(store_id: int, user: CurrentUser, db: DB):
     return {
         "kpis": {"products": products, "published_any": published_any, "unpublished": products - published_any,
                  "published_today": t.get("publish_ok", 0), "crawled_today": t.get("crawl_item", 0),
+                 "income_today": t.get("sale_toman", 0), "sales_total": sales_total,
+                 "orders_today": t.get("orders", 0), "chats_answered_today": t.get("chats_answered", 0),
+                 "ai_replies_today": t.get("ai_replies", 0),
                  "success_rate": round(100 * ok30 / (ok30 + fail30)) if ok30 + fail30 else None},
         "series": series,
         "attention": attention,
