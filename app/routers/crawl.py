@@ -24,7 +24,7 @@ class SourceIn(BaseModel):
     channel_id: int | None = None
     url: str = ""
     schedule: str = "manual"
-    extraction_mode: str = "auto"
+    extraction_mode: str = "llm"
     is_active: bool = True
     include_reels: bool = False  # instagram_profile: also take reels, as their cover image only
 
