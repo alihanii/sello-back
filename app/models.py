@@ -625,3 +625,42 @@ class ProxyNode(TimestampMixin, Base):
     purposes: Mapped[list[str]] = mapped_column(JSON, default=list)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     health: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+# ---------- invoices & orders the seller makes ----------
+
+
+class Invoice(TimestampMixin, Base):
+    """An order the seller makes: an invoice (`source="invoice"`) the customer opens by a link, pays (card-to-card or
+    the seller's own payment link) and uploads the receipt on; or an order the seller took in a chat by hand
+    (`source="chat"`: Instagram DM, WhatsApp...), logged without a link. Statuses match AiOrder's, so the unified orders
+    list treats both alike. Prices are copied at creation."""
+
+    __tablename__ = "invoices"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), index=True)
+    number: Mapped[int] = mapped_column(Integer, default=0)  # per store, shown as «فاکتور ۱۰۲۴»
+    source: Mapped[str] = mapped_column(String(10), default="invoice", index=True)  # invoice | chat
+    code: Mapped[str] = mapped_column(String(24), unique=True, index=True)  # the public link: /i/<code>
+    platform: Mapped[str] = mapped_column(String(20), default="")  # where the customer is: instagram, telegram, ...
+    customer_name: Mapped[str] = mapped_column(String(160), default="")
+    customer_phone: Mapped[str] = mapped_column(String(30), default="")
+    customer_address: Mapped[str] = mapped_column(Text, default="")
+    # [{"product_id", "title", "variant", "qty", "unit_price", "image_url"}]
+    items: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    subtotal_toman: Mapped[int] = mapped_column(BigInteger, default=0)
+    discount_toman: Mapped[int] = mapped_column(BigInteger, default=0)
+    shipping_toman: Mapped[int] = mapped_column(BigInteger, default=0)
+    total_toman: Mapped[int] = mapped_column(BigInteger, default=0)
+    note: Mapped[str] = mapped_column(Text, default="")  # shown to the customer
+    seller_note: Mapped[str] = mapped_column(Text, default="")  # the seller's own
+    # awaiting_payment | payment_submitted | confirmed | rejected | cancelled
+    status: Mapped[str] = mapped_column(String(20), default="awaiting_payment", index=True)
+    receipt_url: Mapped[str] = mapped_column(String(1000), default="")
+    payment_ref: Mapped[str] = mapped_column(String(120), default="")
+    payer_note: Mapped[str] = mapped_column(Text, default="")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    viewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    stock_taken: Mapped[bool] = mapped_column(Boolean, default=False)

@@ -7,7 +7,7 @@ from sqlalchemy import case, func, select
 
 from app.core.db import utcnow
 from app.deps import DB, CurrentUser, get_store_for
-from app.models import ActivityEvent, AiOrder, Channel, ChatConversation, ChatMessage, ChannelListing, CrawlSource, Operation, Plan, Product
+from app.models import ActivityEvent, AiOrder, Invoice, Channel, ChatConversation, ChatMessage, ChannelListing, CrawlSource, Operation, Plan, Product
 from app.schemas import OperationOut
 from app.services.ai import ai_available, route_problem
 from app.services.chat_engine import confirmed_toman
@@ -121,6 +121,9 @@ async def calendar_day(store_id: int, day: date, user: CurrentUser, db: DB):
     orders = (await db.execute(select(AiOrder).where(
         AiOrder.store_id == store_id, ~AiOrder.is_test, AiOrder.created_at >= start, AiOrder.created_at < end)
         .order_by(AiOrder.created_at))).scalars().all()
+    own = (await db.execute(select(Invoice).where(
+        Invoice.store_id == store_id, Invoice.submitted_at >= start, Invoice.submitted_at < end)
+        .order_by(Invoice.submitted_at))).scalars().all()
     replies = func.count(ChatMessage.id)
     chats = (await db.execute(
         select(ChatConversation.id, ChatConversation.customer_name, ChatConversation.customer_username,
@@ -132,7 +135,10 @@ async def calendar_day(store_id: int, day: date, user: CurrentUser, db: DB):
     return {"day": day, "stats": stats, "operations": [OperationOut.model_validate(o) for o in ops],
             "orders": [{"id": o.id, "created_at": o.created_at, "customer_name": o.customer_name,
                         "total_toman": o.total_toman, "status": o.status, "tracking_code": o.tracking_code,
-                        "conversation_id": o.conversation_id, "platform": o.platform} for o in orders],
+                        "conversation_id": o.conversation_id, "platform": o.platform, "kind": "ai"} for o in orders]
+            + [{"id": i.id, "created_at": i.submitted_at, "customer_name": i.customer_name, "total_toman": i.total_toman,
+                "status": i.status, "tracking_code": "", "conversation_id": None, "platform": i.platform,
+                "kind": i.source, "number": i.number} for i in own],
             "chats": [{"id": cid, "customer_name": name or (f"@{uname}" if uname else ""), "platform": plat,
                        "ai_replies": int(n), "last_at": last} for cid, name, uname, plat, n, last in chats]}
 
@@ -169,6 +175,10 @@ async def dashboard(store_id: int, user: CurrentUser, db: DB):
         AiOrder.store_id == store_id, ~AiOrder.is_test, AiOrder.status == "payment_submitted"))
     if receipts:
         attention.append({"type": "ai_orders", "text": f"{receipts} سفارش چت با فیش پرداخت منتظر تأیید"})
+    inv_receipts = await db.scalar(select(func.count()).select_from(Invoice).where(
+        Invoice.store_id == store_id, Invoice.status == "payment_submitted"))
+    if inv_receipts:
+        attention.append({"type": "orders", "text": f"{inv_receipts} فاکتور با فیش پرداخت منتظر تأیید"})
     needs_human = await db.scalar(select(func.count()).select_from(ChatConversation).where(
         ChatConversation.store_id == store_id, ~ChatConversation.is_test, ChatConversation.status == "needs_human"))
     if needs_human:
@@ -176,6 +186,12 @@ async def dashboard(store_id: int, user: CurrentUser, db: DB):
     # All-time sales: confirmed orders in full, plus lines already confirmed on orders that grew since (test orders left out).
     sales_total = int(await db.scalar(select(func.coalesce(func.sum(AiOrder.total_toman), 0)).where(
         AiOrder.store_id == store_id, ~AiOrder.is_test, AiOrder.status == "confirmed")) or 0)
+    sales_total += int(await db.scalar(select(func.coalesce(func.sum(Invoice.total_toman), 0)).where(
+        Invoice.store_id == store_id, Invoice.status == "confirmed")) or 0)
+    day_lo = datetime.combine(today, time.min, tzinfo=timezone.utc)
+    own_orders_today = int(await db.scalar(select(func.count()).select_from(Invoice).where(
+        Invoice.store_id == store_id, Invoice.submitted_at >= day_lo,
+        Invoice.status.notin_(["cancelled", "rejected"]))) or 0)
     for o in (await db.execute(select(AiOrder).where(
             AiOrder.store_id == store_id, ~AiOrder.is_test,
             AiOrder.status.in_(["awaiting_payment", "payment_submitted"])))).scalars():
@@ -191,7 +207,7 @@ async def dashboard(store_id: int, user: CurrentUser, db: DB):
         "kpis": {"products": products, "published_any": published_any, "unpublished": products - published_any,
                  "published_today": t.get("publish_ok", 0), "crawled_today": t.get("crawl_item", 0),
                  "income_today": t.get("sale_toman", 0), "sales_total": sales_total,
-                 "orders_today": t.get("orders", 0), "chats_answered_today": t.get("chats_answered", 0),
+                 "orders_today": t.get("orders", 0), "all_orders_today": t.get("orders", 0) + own_orders_today, "chats_answered_today": t.get("chats_answered", 0),
                  "ai_replies_today": t.get("ai_replies", 0),
                  "success_rate": round(100 * ok30 / (ok30 + fail30)) if ok30 + fail30 else None},
         "series": series,

@@ -12,8 +12,8 @@ from fastapi.staticfiles import StaticFiles
 from app.core.config import settings
 from app.core.db import init_db
 from app.routers import (
-    admin, auth, billing, channels, chat, crawl, insights, notifications, ai_products, operations, payments, products,
-    proxies, stores,
+    admin, auth, billing, channels, chat, crawl, insights, notifications, ai_products, operations, orders, payments,
+    products, proxies, stores,
 )
 from app.seed import seed
 from app.services.chat_runtime import poller_loop
@@ -59,7 +59,7 @@ async def validation_error(_: Request, exc: RequestValidationError):
 
 
 for r in (auth, stores, channels, products, operations, crawl, ai_products, insights, billing, payments, proxies, admin,
-          notifications, chat):
+          notifications, chat, orders):
     app.include_router(r.router, prefix="/api/v1")
 
 if use_s3():
