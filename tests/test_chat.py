@@ -279,6 +279,16 @@ async def test_full_chat_flow(client, monkeypatch):
     assert day["stats"]["orders"] == 1 and day["orders"][0]["id"] == order["id"]
     assert day["chats"][0]["id"] == conv_id and day["chats"][0]["ai_replies"] == d["ai_replies"]
 
+    # 11. the dashboard: today's income is the confirmed receipt, chats and orders show on today
+    dash = (await client.get(f"/stores/{sid}/dashboard", headers=h)).json()
+    k = dash["kpis"]
+    assert k["income_today"] == 3750000 and k["sales_total"] == 3750000
+    assert k["orders_today"] == 1 and k["chats_answered_today"] == 1 and k["ai_replies_today"] >= 5
+    assert dash["series"][today]["sale_toman"] == 3750000 and dash["series"][today]["chats_answered"] == 1
+    # confirming again adds nothing
+    await client.patch(f"/ai-orders/{order['id']}", headers=h, json={"status": "confirmed", "notify_customer": False})
+    assert (await client.get(f"/stores/{sid}/dashboard", headers=h)).json()["kpis"]["income_today"] == 3750000
+
 
 async def test_business_owner_message_pauses_ai(client, monkeypatch):
     h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550004")

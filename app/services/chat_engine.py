@@ -2211,6 +2211,28 @@ def due_toman(order: AiOrder) -> int:
                if not i.get("paid", old))
 
 
+def _line_toman(i: dict[str, Any]) -> int:
+    return int(i.get("unit_price") or 0) * int(i.get("qty") or 1)
+
+
+def confirmed_toman(order: AiOrder) -> int:
+    """What the seller has confirmed as paid: all of a confirmed order, else the lines a past confirmation covered
+    (an order that grew after it was confirmed)."""
+    if order.status == "confirmed":
+        return int(order.total_toman or 0)
+    if order.status in ("rejected", "cancelled"):
+        return 0
+    return sum(_line_toman(i) for i in order.items or [] if i.get("confirmed") is True)
+
+
+def newly_confirmed_toman(order: AiOrder) -> int:
+    """What confirming the receipt now adds to the seller's income: the lines no earlier confirmation covered."""
+    lines = order.items or []
+    if not any(i.get("confirmed") is True for i in lines):
+        return int(order.total_toman or 0)
+    return sum(_line_toman(i) for i in lines if i.get("confirmed") is not True)
+
+
 def mark_paid(order: AiOrder) -> None:
     order.items = [{**i, "paid": True} for i in order.items or []]  # a new list, so the JSON change is saved
 
