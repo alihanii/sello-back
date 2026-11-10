@@ -686,3 +686,16 @@ class StoreSite(TimestampMixin, Base):
     domain_status: Mapped[str] = mapped_column(String(12), default="")
     domain_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class ChatLink(TimestampMixin, Base):
+    """The store's own chat page: a public link (`<frontend>/c/<slug>`) the seller puts in an Instagram or Telegram
+    bio. Customers chat there with the store's assistant; the chats land in the store's chats (platform "link") and
+    orders taken there are AiOrders like any other chat order."""
+
+    __tablename__ = "chat_links"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), unique=True, index=True)
+    slug: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    greeting: Mapped[str] = mapped_column(String(300), default="")
