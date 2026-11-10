@@ -38,6 +38,8 @@ SKILLS = {
 # Answered by the shop's code; every other skill goes to the sales model.
 CODE_SKILLS = {"browse", "status", "confirm", "cart_view", "checkout", "human", "complaint", "off_topic", "abuse"}
 
+ROUTER_TIMEOUT = 15  # seconds: a slow router is skipped and the sales model answers, the chat never hangs on it
+
 ROUTER_SYSTEM = ("You sort ONE customer message in an Iranian online shop's chat into the part of the shopping journey it "
                  "belongs to. Read RECENT CHAT and STEP for context.\nSKILLS:\n"
                  + "\n".join(f"- {k}: {v}" for k, v in SKILLS.items())
@@ -61,7 +63,7 @@ async def route(db: AsyncSession, conv: ChatConversation, store: Store, agent: C
               f"<customer>{text[:600]}</customer>")
     try:
         out = await ai.generate_json(task="chat_router", system=ROUTER_SYSTEM, prompt=prompt, store_id=store.id,
-                                     max_tokens=40)
+                                     max_tokens=40, timeout=ROUTER_TIMEOUT)
     except Exception:  # noqa: BLE001 - no router model or a bad answer: the sales model answers as before
         log.info("chat router unavailable", exc_info=True)
         return ""

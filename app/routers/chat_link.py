@@ -7,23 +7,27 @@
   from the panel and the page picks that up by polling. Orders are AiOrders, so they show in the orders list.
 """
 
+import asyncio
+import json
 import re
 import secrets
 from typing import Any
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from datetime import timedelta
 
 from sqlalchemy import func, select
 
-from app.core.db import utcnow
+from app.core.db import SessionLocal, utcnow
 
 from app.core.config import settings
 from app.deps import DB, CurrentUser, get_store_for
 from app.models import ChatConversation, ChatLink, ChatMessage, Store
 from app.routers.site import RESERVED, _limit, abs_media
 from app.services import chat_runtime as rt
+from app.services import live
 from app.services.chat_engine import get_agent
 from app.services.chat_menu import MAIN_BUTTONS, SEND_PHONE
 from app.services.media import ALLOWED, save_bytes
@@ -144,6 +148,50 @@ async def history(slug: str, db: DB, visitor: str = Query("", max_length=40), af
         ChatMessage.conversation_id == conv.id, ChatMessage.id > after,
         ChatMessage.role.in_(["customer", "ai", "seller"])).order_by(ChatMessage.id).limit(200))).scalars().all()
     return {"visitor": visitor, "name": conv.customer_name, "messages": [_msg(m) for m in rows]}
+
+
+STREAM_IDLE = 60 * 60  # an open page with nothing new for an hour is let go; it opens the stream again when used
+STREAM_PING = 25
+
+
+async def _after(db, conv_id: int, after: int) -> list[ChatMessage]:
+    return list((await db.execute(select(ChatMessage).where(
+        ChatMessage.conversation_id == conv_id, ChatMessage.id > after,
+        ChatMessage.role.in_(["customer", "ai", "seller"])).order_by(ChatMessage.id).limit(200))).scalars().all())
+
+
+@router.get("/public/chat/{slug}/stream")
+async def stream(slug: str, request: Request, db: DB, visitor: str = Query("", max_length=40), after: int = 0):
+    """Server-Sent Events: the chat's new messages (the assistant's and the seller's) as they are saved, so the page
+    never asks again and again. Each event is a JSON list of messages; "bye" after an hour with nothing new."""
+    _, store = await _public(db, slug)
+    conv = await _conv(db, store, visitor)
+    if not conv:
+        raise HTTPException(404, "این گفتگو پیدا نشد.")
+    conv_id = conv.id
+    await db.close()
+
+    async def events():
+        last, idle = after, 0.0
+        with live.watch(conv_id) as woke:
+            while not await request.is_disconnected():
+                woke.clear()  # before reading, so a message saved meanwhile wakes the next round
+                async with SessionLocal() as s:
+                    rows = await _after(s, conv_id, last)
+                if rows:
+                    last, idle = rows[-1].id, 0.0
+                    yield f"data: {json.dumps([_msg(m) for m in rows], ensure_ascii=False, default=str)}\n\n"
+                try:
+                    await asyncio.wait_for(woke.wait(), STREAM_PING)
+                except TimeoutError:
+                    idle += STREAM_PING
+                    if idle >= STREAM_IDLE:
+                        yield "event: bye\ndata: {}\n\n"
+                        return
+                    yield ": ping\n\n"
+
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 class SendIn(BaseModel):

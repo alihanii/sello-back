@@ -136,7 +136,7 @@ def provider_proxy(provider: AiProvider) -> str:
 async def _call(
     provider: AiProvider, model: str, system: str, prompt: str, images: list[tuple[bytes, str]], temperature: float,
     json_mode: bool = True, max_tokens: int | None = None, meta: dict[str, Any] | None = None,
-    low_res: bool = False, image_res: str = "",
+    low_res: bool = False, image_res: str = "", timeout: float = 120,
 ) -> tuple[str, int, int]:
     """Returns (text, input_tokens, output_tokens). `meta`, when given, receives `cached_tokens` (the part of the
     input the provider served from its prompt cache). `max_tokens` caps the answer (the chat assistant).
@@ -146,7 +146,7 @@ async def _call(
     key = _api_key(provider)
     kind, base = _wire(provider, model)
     meta = meta if meta is not None else {}
-    async with httpx.AsyncClient(timeout=120, proxy=provider_proxy(provider) or None) as client:
+    async with httpx.AsyncClient(timeout=timeout, proxy=provider_proxy(provider) or None) as client:
         if kind == "gemini":
             parts: list[dict[str, Any]] = [{"text": prompt}]
             parts += [{"inlineData": {"mimeType": m, "data": base64.b64encode(d).decode()}} for d, m in images]
@@ -423,11 +423,13 @@ async def ai_available(task: str = "caption_extract") -> bool:
 
 async def generate_json(
     *, task: str, system: str, prompt: str, images: list[tuple[bytes, str]] | None = None, store_id: int | None = None,
-    max_tokens: int | None = None, low_res_images: bool = False, image_res: str = "",
+    max_tokens: int | None = None, low_res_images: bool = False, image_res: str = "", timeout: float | None = None,
 ) -> dict[str, Any]:
     """`max_tokens` caps the answer, and on Gemini Flash also turns thinking off (billed as output).
+    `timeout`: seconds per call (a quick side task such as the chat router gives up early instead of holding the chat).
     `image_res` ("low" | "medium") reads the photos with fewer tokens; `low_res_images` is the same as "low"."""
-    extra = {k: v for k, v in (("max_tokens", max_tokens), ("low_res", low_res_images), ("image_res", image_res)) if v}
+    extra = {k: v for k, v in (("max_tokens", max_tokens), ("low_res", low_res_images), ("image_res", image_res),
+                                         ("timeout", timeout)) if v}
     candidates = await _route(task)
     if not candidates:
         raise AIError(await route_problem(task), code="ai_not_configured")

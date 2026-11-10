@@ -50,6 +50,10 @@ UNSUPPORTED_TEXT = "فعلاً فقط پیام متنی رو می‌تونم ب�
 PHOTO_TEXT = "عکس رسید 🙏 لطفاً اسم یا کد محصولی که می‌خوای رو بنویس تا راهنماییت کنم."
 RECEIPT_TEXT = "✅ اطلاعات پرداخت سفارش #{order} دریافت شد. بعد از بررسی، نتیجه رو همین‌جا خبر می‌دیم 🌸"
 CANCELLED_TEXT = "سفارش لغو شد. اگه چیز دیگه‌ای خواستی در خدمتم 🌸"
+# Slips the small chat models make in colloquial Persian.
+_TYPOS = (("دیه‌ای", "دیگه‌ای"), ("دیه ای", "دیگه‌ای"), ("دیگ‌ای", "دیگه‌ای"))
+CART_CLEARED_TEXT = "باشه، سفارشی ثبت نشده بود؛ سبدت رو خالی کردم 🌸 اگه چیز دیگه‌ای خواستی بگو."
+NOTHING_TO_CANCEL_TEXT = "سفارشی ثبت نکردی که لغو کنم 🌸 اگه چیزی خواستی بگو."
 ORDER_HANDOFF_TEXT = "عالیه 🌸 سفارشت رو به همکارم دادم؛ همین‌جا برای ثبت نهایی، پرداخت و ارسال بهت پیام می‌ده 🙏"
 AI_UNAVAILABLE_TEXT = "پیامت رسید 🙏 همکارم به‌زودی جواب می‌ده."
 ABUSE_TEXT = "لطفاً محترمانه صحبت کنیم 🙏 اگه مشکلی پیش اومده بگو تا پیگیری کنم."
@@ -74,6 +78,7 @@ _PAID = re.compile(r"(پیگیری|رهگیری|پرداخت|واریز|کارت
 _STOPWORDS = set("""از به با در که این آن را و یا برای تا هم یه یک چه چی چند چطور کدوم کدام دارید داری دارین هست است
 هستش چیه چطوره داره دارن دارین میخوام می‌خوام میخواستم می‌خواستم لطفا لطفاً سلام ممنون مرسی قیمت موجود موجوده چنده چقدره اینو اون این‌ها
 اره آره آری بله باشه خب خوب اوکی اکی حله پس اگه اگر خیلی ممنونم
+شما من تو ما او اونا اینا
 the a an is are""".split())
 
 
@@ -280,6 +285,12 @@ def product_card(p: Product, photos: int = 0, exact_stock: bool = True, full: bo
     if not full:
         items = [kv for kv in items if _VARIANT_KEY.search(str(kv[0]))][:2]
     attrs = "، ".join(f"{k}: {str(v)[:80]}" for k, v in items[:6])
+    # Sizes and colours that only the description lists, so every product line still shows them.
+    have = " ".join(str(k) for k, _ in items)
+    for kind, label, rx in (("size", "سایز", _SIZE_KEY), ("color", "رنگ", _COLOR_KEY)):
+        opts = variant_options(p).get(kind)
+        if opts and not rx.search(have):
+            attrs = (attrs + "، " if attrs else "") + f"{label}: {'، '.join(opts)[:80]}"
     # With "available only" the number never reaches the model, so it cannot say it.
     stock = ("ناموجود" if p.stock_qty <= 0 else f"موجودی {p.stock_qty}" if exact_stock else "موجود")
     desc = re.sub(r"\s+", " ", p.description or "")[:160] if full else ""
@@ -804,8 +815,13 @@ def fix_product_id(pid: int, products: list[Product], hint: str) -> int:
 
 async def _merge_order(db: AsyncSession, store_id: int, agent: ChatAgent, state: dict[str, Any],
                        update: dict[str, Any] | None, products: list[Product] | None = None,
-                       hint: str = "", action: str = "update") -> dict[str, Any]:
+                       hint: str = "", action: str = "update", said: str = "") -> dict[str, Any]:
+    """`said`: the customer's own recent words. With a cart already open, a product that is neither in it, nor
+    named by the customer, nor the one just talked about never comes in: the model sometimes re-lists the cart with
+    a wrong id ("my number was wrong" turned the black hoodie into the custom-print one)."""
     order = dict(state.get("order") or {})
+    old_ids = {o.get("product_id") for o in order.get("items") or [] if o.get("product_id")}
+    talked = set((state.get("recent_products") or [])[-2:])
     if not isinstance(update, dict):
         return order
     if isinstance(update.get("items"), list) and update["items"] == [] and action == "update" and order.get("items"):
@@ -826,6 +842,9 @@ async def _merge_order(db: AsyncSession, store_id: int, agent: ChatAgent, state:
             if str(pid or "").isdigit() and products:
                 pid = fix_product_id(int(pid), products, hint)
             p = await db.get(Product, int(pid)) if str(pid or "").isdigit() and int(pid) else None
+            if p and old_ids and said and p.id not in old_ids | talked \
+                    and not _strict_overlap(words(said), words(p.title)):
+                continue
             if p and p.store_id == store_id and p.status != "archived":
                 if (wrong := misfit(p, str(it.get("variant") or ""))):
                     opts = variant_options(p)
@@ -1426,8 +1445,9 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                 result.replies.append(Reply(PHOTO_TEXT, source="canned"))
                 return done()
         else:
+            seen = await as_print_design(db, conv, store, seen, text)
             text = (text + "\n" if text else "") + photo_line(seen)
-        if agent.orders_enabled and not image_fields and not (seen and seen["kind"] == "receipt"):
+        if not image_fields and not (seen and seen["kind"] == "receipt"):
             # Kept for the next print-product line (or one still without its design): "print this one".
             state["pending_design"] = photo
     found: list[int] = []
@@ -1492,6 +1512,8 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         complaint_handoff(conv, text, result, usage)
         return done()
     reply_text = clean_language(str(out.get("reply") or "").strip(), text, products, store)
+    for typo, right in _TYPOS:
+        reply_text = reply_text.replace(typo, right)
     if not re.search(r"(سلام|درود|salam|hi\b|hello)", text, re.IGNORECASE):
         # "Greet only if greeted": the model still opened every answer with «سلام».
         reply_text = re.sub(r"^(سلام|درود)\s*(و\s*وقت\s*بخیر|دوست\s*من|عزیزم)?\s*[!،,.🌸🙏😊]*\s*", "", reply_text).strip() \
@@ -1559,6 +1581,11 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         if awaiting:
             result.replies.append(Reply(reply_text or CANCELLED_TEXT, source="llm", intent="order", usage=usage))
             return done()
+        if not placed:
+            # Nothing was placed: the cart is emptied (or there was nothing), never "your order was cancelled".
+            result.replies.append(Reply(CART_CLEARED_TEXT if before.get("items") else NOTHING_TO_CANCEL_TEXT,
+                                        source="order", intent="order", usage=usage))
+            return done()
     else:
         # With AI ordering off this is only a note of what they chose, for the admin who takes the order.
         hint = " ".join([text, str(out.get("reply") or "")] + [m.text for m in history if m.role == "customer"][-3:])
@@ -1576,7 +1603,9 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                 out["order"] = {**given, "items": [{"product_id": last, "qty": int(have[0].get("qty") or 1) if have
                                                     else 1, "variant": pick}]}
                 action = "update" if action == "none" else action
-        state["order"] = await _merge_order(db, store.id, agent, state, out.get("order"), products, hint, action)
+        said = " ".join([text] + [m.text for m in history if m.role == "customer"][-3:])
+        state["order"] = await _merge_order(db, store.id, agent, state, out.get("order"), products, hint, action,
+                                            said)
         if not state["order"]:
             state.pop("order")
     order = state.get("order") or {}
@@ -1643,7 +1672,7 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         if placed and placed.extras:
             order["extras"] = {**placed.extras, **(order.get("extras") or {})}
         state["order"] = order
-    if agent.orders_enabled and order.get("items") and state.get("pending_design"):
+    if order.get("items") and state.get("pending_design"):
         for it in order["items"]:
             p = await db.get(Product, it.get("product_id") or 0) if it.get("product_id") else None
             if p and takes_design(p) and not it.get("design"):
@@ -1698,6 +1727,22 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                 and not _ASKS_KNOWN.search(reply.text)):
             # "Do you print your own design?": the answer first, then what the order needs next.
             lead = reply.text.strip() + "\n\n"
+        elif step.stage == "details" and changed:
+            # "مشکی XL پشت": what they just picked is said back, then what's still needed (not only "send your name").
+            # A line just added ("یه ماگ هم اضافه کن") is named, so they see it went in.
+            had_ids = {i.get("product_id") for i in before.get("items") or []}
+            had = {(i.get("product_id"), _flat(i.get("variant"))) for i in before.get("items") or []}
+            said_back = []
+            for i in order.get("items") or []:
+                v = str(i.get("variant") or "").strip()
+                if i.get("product_id") not in had_ids:
+                    p = await db.get(Product, i.get("product_id") or 0) if i.get("product_id") else None
+                    if p:
+                        said_back.append(f"«{p.title[:60]}»" + (f" ({v})" if v else "") + " اضافه شد")
+                elif v and (i.get("product_id"), _flat(v)) not in had:
+                    said_back.append(f"({v})")
+            if said_back:
+                lead = f"باشه 👌 {'؛ '.join(said_back)[:200]}\n"
         reply.text, reply.buttons, reply.intent = lead + step.text, step.buttons, "order"
     elif agent.orders_enabled and not order.get("items") and _CLAIMS_PLACED.search(reply.text):
         reply.text = "برای ثبت، اسم محصول و سایز/رنگش رو بگو تا خلاصهٔ سفارش رو برات بفرستم 🌸"
@@ -1784,6 +1829,36 @@ async def read_photo(db: AsyncSession, store: Store, agent: ChatAgent, url: str,
     pid = int(out["product_id"]) if str(out.get("product_id") or "").isdigit() else 0
     return {"kind": kind if kind in ("product", "design", "receipt", "other") else "other", "description": desc,
             "product_id": pid if any(p.id == pid for p in rows) else 0}
+
+
+_PRINT_ASK = re.compile(r"(چاپ|طرح\s*(دلخواه|خودم|خودمو|خودم\s*رو|شخصی|اختصاصی)|سفارشی)")
+
+
+async def as_print_design(db: AsyncSession, conv: ChatConversation, store: Store, seen: dict[str, Any],
+                          text: str) -> dict[str, Any]:
+    """"Do you print my own design?" then a picture (say, of Spider-Man): it is their design for the shop's print
+    product, not the ready-made Spider-Man hoodie it looks like."""
+    if seen["kind"] not in ("product", "design", "other"):
+        return seen
+    asked = [text] + list((await db.execute(select(ChatMessage.text).where(
+        ChatMessage.conversation_id == conv.id, ChatMessage.role == "customer")
+        .order_by(ChatMessage.id.desc()).limit(4))).scalars().all())
+    if not any(_PRINT_ASK.search(t or "") for t in asked):
+        return seen
+    prints = [p for p in await catalog_rows(db, store.id) if takes_design(p)]
+    if not prints:
+        return seen
+    target = next((p for p in prints if p.id == seen.get("product_id")), None) or max(
+        prints, key=lambda p: (_overlap(words(" ".join(asked)), words(f"{p.title} {p.category or ''}")),
+                               p.stock_qty > 0, p.status == "ready"))
+    return {**seen, "kind": "design", "product_id": target.id,
+            "note": f"the customer asked for a custom print: this picture is their design for «{target.title[:60]}», "
+                    "not a ready-made product that looks like it"}
+
+
+def public_media(url: str) -> str:
+    from app.core.config import settings
+    return f"{settings.public_base_url.rstrip('/')}{url}" if url.startswith("/media/") else url
 
 
 def photo_line(seen: dict[str, Any]) -> str:
@@ -1959,7 +2034,8 @@ async def items_complete(db: AsyncSession, store_id: int, items: list[dict[str, 
 _CLAIMS_SHIPPING = re.compile(r"(در\s*حال\s*(آماده|اماده|ارسال|پردازش)|آماده\s*‌?(سازی|ی\s*ارسال)|ارسال\s*(شد|کردیم|می\s*‌?شه|میشه)"
                               r"|فرستادیم|پست\s*(شد|کردیم))")
 _ASKS_KNOWN = re.compile(r"(سایز|رنگ|محل\s*چاپ|طرح)[^.!؟?\n]{0,40}?(بفرمایید|بگید|بگو|بفرستید|بفرست|مد\s*نظر|"
-                         r"می\s*‌?خوای|میخوای|می\s*‌?خواید|میخواید|انتخاب\s*کن)")
+                         r"می\s*‌?خوای|میخوای|می\s*‌?خواید|میخواید|می\s*‌?خواهید|میخواهید|می\s*‌?خواین|میخواین|"
+                         r"انتخاب\s*کن)|(کدوم|کدام|چه)\s*(سایز|رنگ)")
 _QUESTION = re.compile(r"[؟?]|چجوری|چطوری|چطوره|چنده|چقدره|چیه|چند\s*(سانت|سانتی)|ابعاد|جدول")
 _WANTS_IT = re.compile(r"(می\s*‌?خوام|میخوام|بردار|برمی\s*‌?دارم|ثبت|سفارش|بفرست\s*برام|بگیرم|می\s*‌?گیرم|میگیرم)")
 _CLAIMS_PLACED = re.compile(r"(ثبت\s*(شد|کردم|کردیم|گردید|می\s*‌?کنم|میکنم|می\s*‌?کنیم)|سفارش(ت|تون)?\s*(رو\s*)?(ثبت|گذاشتم|زدم)|در\s*نظر\s*گرفتم|"
@@ -2008,8 +2084,12 @@ async def order_handoff(db: AsyncSession, conv: ChatConversation, store: Store, 
     conv.status = "needs_human"
     result.replies.append(Reply(ORDER_HANDOFF_TEXT, source="handoff", intent="order", usage=usage or {}))
     chosen = ("\n" + order_summary(order, lines, total)) if lines else ""
+    designs = [str(it["design"]) for it in order.get("items") or [] if it.get("design")]
+    if state.get("pending_design"):
+        designs.append(str(state.pop("pending_design")))
+    pics = "".join(f"\n🎨 طرح مشتری: {public_media(d)}" for d in designs)
     result.notify_admin.append(f"🛍 {conv.customer_name or 'یک مشتری'} می‌خواهد سفارش بدهد (سفارش‌گیری AI خاموش است؛ "
-                               f"خودت ثبتش کن):{chosen}")
+                               f"خودت ثبتش کن):{chosen}{pics}")
 
 
 _STOCK_COUNT = re.compile(
@@ -2281,7 +2361,17 @@ def variant_options(p: Product) -> dict[str, list[str]]:
                 and all(len(x) <= 4 for x in parts[0].split()):
             parts = parts[0].split()  # "S M L XL"
         out[kind] = [x[:30] for x in parts][:15]
+    # Imports often put the choices only in the description: "رنگ‌ها: مشکی، سفید. سایزها: S، M، L".
+    for kind, rx in (("size", _DESC_SIZES), ("color", _DESC_COLORS)):
+        if kind not in out and (m := rx.search(p.description or "")):
+            parts = [x.strip(" .") for x in re.split(r"[،,/|؛;]|\s+و\s+", m.group(1)) if x.strip(" .")]
+            if len(parts) > 1:
+                out[kind] = [x[:30] for x in parts][:15]
     return out
+
+
+_DESC_SIZES = re.compile(r"(?:سایز|سايز|size)\S*\s*[:：]\s*([^.\n]+)", re.I)
+_DESC_COLORS = re.compile(r"(?:رنگ|color|colour)\S*\s*[:：]\s*([^.\n]+)", re.I)
 
 
 # ---------- editing the order at the summary, in code ----------
