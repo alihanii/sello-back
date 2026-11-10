@@ -13,7 +13,11 @@ from typing import Any
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from datetime import timedelta
+
+from sqlalchemy import func, select
+
+from app.core.db import utcnow
 
 from app.core.config import settings
 from app.deps import DB, CurrentUser, get_store_for
@@ -30,6 +34,10 @@ SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])$")
 VISITOR_RE = re.compile(r"[\w-]{16,40}")
 DEFAULT_GREETING = "سلام! خوش اومدی 🌱 هر سؤالی دربارهٔ محصولات داری بپرس؛ سفارشت رو هم همین‌جا ثبت می‌کنیم."
 PLATFORM = "link"
+# The link is public, so one chat can't spend the store's AI: at most this many assistant replies an hour; after that
+# the messages still reach the seller in the panel and the page says so.
+AI_REPLIES_PER_HOUR = 30
+CAP_NOTICE = "پیامت رسید ✅ همکارمان به‌زودی خودش جواب می‌دهد."
 
 
 def link_url(link: ChatLink) -> str:
@@ -163,8 +171,13 @@ async def _turn(db, request: Request, slug: str, visitor: str, name: str, text: 
     customer = rt.add_message(db, conv, role="customer", text=(text or "").strip()[:1000], image_url=image_url)
     conv.seller_unread = True
     await db.commit()
+    recent = await db.scalar(select(func.count()).select_from(ChatMessage).where(
+        ChatMessage.conversation_id == conv.id, ChatMessage.role == "ai",
+        ChatMessage.created_at >= utcnow() - timedelta(hours=1)))
+    if recent >= AI_REPLIES_PER_HOUR:
+        return {"visitor": visitor, "messages": [_msg(customer)], "notice": CAP_NOTICE}
     replies = await rt.answer(conv.id, send=False)
-    return {"visitor": visitor, "messages": [_msg(customer)] + [_msg(m) for m in replies]}
+    return {"visitor": visitor, "messages": [_msg(customer)] + [_msg(m) for m in replies], "notice": ""}
 
 
 @router.post("/public/chat/{slug}/messages")
