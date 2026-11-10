@@ -23,7 +23,7 @@ from app.services.integrations import (
     save_payment_config,
 )
 from app.services.plans import (
-    DURATIONS, LIMIT_KEYS, all_tiers, chat_used, create_subscription, credits_used, free_limits, limits_for, plan_status,
+    DURATIONS, FLAG_KEYS, LIMIT_KEYS, all_tiers, chat_used, create_subscription, credits_used, free_limits, limits_for, plan_status,
     save_free_limits, tier_config,
 )
 from app.schemas import ChannelOut, PlanOut, PlanTier, StoreOut, UserOut
@@ -287,8 +287,8 @@ async def get_tiers(admin: AdminUser, db: DB):
 
 
 def _clean_limits(limits: dict) -> dict:
-    out = {k: max(0, int(limits.get(k) or 0)) for k in LIMIT_KEYS}
-    out["crawl_frequency"] = "hourly" if limits.get("crawl_frequency") == "hourly" else "daily"
+    out: dict[str, Any] = {k: max(0, int(limits.get(k) or 0)) for k in LIMIT_KEYS}
+    out.update({k: bool(limits.get(k)) for k in FLAG_KEYS})
     return out
 
 
@@ -309,7 +309,10 @@ async def put_tier(tier: str, body: PlanTier, admin: AdminUser, db: DB):
     features = [f.strip() for f in body.features if f.strip()]
     for price in body.prices:
         p = current.get(price.duration_months) or Plan(tier=tier, duration_months=price.duration_months)
-        p.name, p.description, p.features, p.limits = body.name.strip(), body.description.strip(), features, _clean_limits(body.limits)
+        limits = _clean_limits(body.limits)
+        if price.max_stores is not None:  # e.g. the yearly plan allows a second store
+            limits["max_stores"] = max(0, price.max_stores)
+        p.name, p.description, p.features, p.limits = body.name.strip(), body.description.strip(), features, limits
         p.price_toman, p.compare_at_toman, p.is_active = price.price_toman, price.compare_at_toman, price.is_active
         p.sort_order, p.is_featured = body.sort_order, body.is_featured
         db.add(p)

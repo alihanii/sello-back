@@ -17,9 +17,11 @@ router = APIRouter(tags=["insights"])
 
 
 @router.get("/ai/status")
-async def ai_status(user: CurrentUser):
+async def ai_status(user: CurrentUser, db: DB):
     """Whether any AI key is configured, so the UI can explain why AI features are off."""
     image_problem = await route_problem("image_edit")
+    if not image_problem and not (await limits_for(db, user)).get("ai_images"):
+        image_problem = "ساخت عکس با AI در پلن این کاربر روشن نیست."
     # The technical reason (keys, quota, billing) is for the admin only; sellers just don't see the feature.
     return {"available": await ai_available("product_generate"),
             "image_edit": not image_problem, "image_edit_problem": image_problem if user.role == "admin" else ""}

@@ -193,6 +193,7 @@ class PlanPrice(BaseModel):
     compare_at_toman: int = 0
     is_active: bool = True
     plan_id: int | None = None
+    max_stores: int | None = None  # this period's store cap, when it differs from the plan's
 
 
 class PlanTier(BaseModel):

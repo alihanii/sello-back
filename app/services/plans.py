@@ -1,6 +1,6 @@
 """Plans: one or more plans (tiers), each sold for 1/3/12 months; their limits; and what a seller has used."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from dateutil.relativedelta import relativedelta
 from fastapi import HTTPException
@@ -14,33 +14,38 @@ PLAN_TIER = "sello"  # the default plan
 DURATIONS = (1, 3, 12)
 DISCOUNTS = {1: 0, 3: 10, 12: 25}  # % off the monthly price, for new tiers
 
-LIMIT_KEYS = ("max_stores", "max_channels", "max_products", "monthly_publishes", "monthly_ai_credits",
+LIMIT_KEYS = ("max_stores", "max_channels_per_platform", "max_products", "monthly_publishes", "monthly_ai_credits",
               "monthly_chat_messages")
+FLAG_KEYS = ("ai_images",)  # on/off features of a plan
 
 # Limits for users who never had a plan (trial). The admin edits them (app setting `plan:free`).
-FREE_LIMITS = {"max_stores": 1, "max_channels": 2, "max_products": 30, "monthly_ai_credits": 30,
-               "monthly_publishes": 50, "crawl_frequency": "daily",
-               "monthly_chat_messages": 100}
+FREE_LIMITS = {"max_stores": 1, "max_channels_per_platform": 2, "max_products": 30, "monthly_ai_credits": 30,
+               "monthly_publishes": 50, "monthly_chat_messages": 100, "ai_images": False}
 FREE_KEY = "plan:free"
 # Limits added after a plan was saved: a paid plan without the key gets this instead of the free value.
-PAID_DEFAULTS = {"monthly_chat_messages": 5000}
+PAID_DEFAULTS = {"monthly_chat_messages": 5000, "max_channels_per_platform": 2}
 # After a plan ends (or the account is blocked) the seller keeps their data, but no AI runs for them.
-NO_AI = {"monthly_ai_credits": 0, "monthly_chat_messages": 0}
+NO_AI = {"monthly_ai_credits": 0, "monthly_chat_messages": 0, "ai_images": False}
 
 # AI tasks that are part of the sales chat; they count against monthly_chat_messages, not AI credits.
 CHAT_TASKS = {"chat", "chat_vision", "chat_router"}
-# Credits per successful call; every other non-chat task costs 1. A generated picture costs ~20× a text call.
-CREDIT_WEIGHT = {"image_edit": 20}
+# One AI credit = one product made with AI (from photos / a note). Crawling, reading photos and filling platform
+# fields are free; a generated picture needs the plan's `ai_images` switch.
+CREDIT_TASKS = {"product_generate"}
+IMAGE_TASKS = {"image_edit", "image_prompt"}
 
 # The plan created on first start (prices in toman per month); the admin edits everything afterwards and can add
-# more plans. Worst case AI cost on Gemini 2.5 Flash-Lite: 2,000 chat replies × ~63 t + 200 credits × ~400 t ≈ 206k t.
+# more plans. Worst case AI cost on Gemini 2.5 Flash-Lite: 2,000 chat replies × ~63 t + 100 products × ~400 t
+# + unlimited crawling (~60 t a post) ≈ 170k t a month.
 DEFAULT_TIERS = [
     {"tier": PLAN_TIER, "name": "فروشیفای", "monthly": 790_000, "sort_order": 1, "is_featured": False,
      "description": "همهٔ امکانات؛ فقط مدت اشتراک فرق می‌کند.",
-     "limits": {"max_stores": 2, "max_channels": 6, "max_products": 1500, "monthly_publishes": 2000,
-                "monthly_ai_credits": 200, "crawl_frequency": "hourly", "monthly_chat_messages": 2000},
-     "features": ["۲ فروشگاه", "۶ کانال (تلگرام، بله، دیجی‌کالا، اینستاگرام)", "۱٬۵۰۰ محصول", "۲٬۰۰۰ انتشار در ماه",
-                  "کرال ساعتی", "۲۰۰ اعتبار AI در ماه (ساخت محصول، کرال، عکس)", "دستیار چت فروش: ۲٬۰۰۰ جواب AI در ماه"]},
+     "limits": {"max_stores": 1, "max_channels_per_platform": 2, "max_products": 1500, "monthly_publishes": 2000,
+                "monthly_ai_credits": 100, "monthly_chat_messages": 2000, "ai_images": False},
+     "store_by_months": {12: 2},  # the yearly plan can make a second store
+     "features": ["۱ فروشگاه (اشتراک یک‌ساله: ۲ فروشگاه)", "از هر پلتفرم ۲ کانال (تلگرام، بله، دیجی‌کالا، اینستاگرام)",
+                  "۱٬۵۰۰ محصول", "کرال نامحدود", "ساخت ۱۰۰ محصول با AI از عکس در ماه",
+                  "دستیار چت فروش: ۲٬۰۰۰ جواب AI در ماه"]},
 ]
 
 
@@ -51,13 +56,15 @@ def tier_plans(t: dict) -> list[Plan]:
         out.append(Plan(name=t["name"], tier=t["tier"], duration_months=months,
                         price_toman=int(round(full * (100 - DISCOUNTS[months]) / 100, -4)),
                         compare_at_toman=full if DISCOUNTS[months] else 0, description=t["description"],
-                        features=list(t["features"]), limits=dict(t["limits"]), is_featured=t["is_featured"],
+                        features=list(t["features"]), is_featured=t["is_featured"],
+                        limits={**t["limits"], **({"max_stores": t["store_by_months"][months]}
+                                                  if months in t.get("store_by_months", {}) else {})},
                         is_active=True, sort_order=t["sort_order"]))
     return out
 
 
 async def create_subscription(db: AsyncSession, user_id: int, plan: Plan, *, activated_by: str, note: str = "",
-                              starts_at: datetime | None = None, replace: bool = False) -> Subscription:
+                              starts_at: datetime | None = None, replace: bool = False, days: int | None = None) -> Subscription:
     """Renewals stack after the current period instead of overlapping it. `replace` ends the current
     subscriptions and starts the new plan now (an admin changing the plan)."""
     now = utcnow()
@@ -72,7 +79,8 @@ async def create_subscription(db: AsyncSession, user_id: int, plan: Plan, *, act
                                                                Subscription.ends_at > now).order_by(Subscription.ends_at.desc()))).scalars().first()
     start = starts_at or (current.ends_at.replace(tzinfo=timezone.utc) if current else now)
     s = Subscription(user_id=user_id, plan_id=plan.id, status="active", starts_at=start,
-                     ends_at=start + relativedelta(months=plan.duration_months), activated_by=activated_by, note=note)
+                     ends_at=start + (timedelta(days=days) if days else relativedelta(months=plan.duration_months)),
+                     activated_by=activated_by, note=note)
     db.add(s)
     return s
 
@@ -145,12 +153,12 @@ async def chat_used(db: AsyncSession, owner_id: int) -> int:
 
 
 async def credits_used(db: AsyncSession, owner_id: int) -> int:
+    """Products made with AI this month across the owner's stores (successful calls only)."""
     ids = await _store_ids(db, owner_id)
     if not ids:
         return 0
-    weight = case(*((AiUsageLog.task == t, w) for t, w in CREDIT_WEIGHT.items()), else_=1)
-    return int(await db.scalar(select(func.coalesce(func.sum(weight), 0)).where(
-        AiUsageLog.store_id.in_(ids), AiUsageLog.ok, AiUsageLog.task.notin_(CHAT_TASKS),
+    return int(await db.scalar(select(func.count()).select_from(AiUsageLog).where(
+        AiUsageLog.store_id.in_(ids), AiUsageLog.ok, AiUsageLog.task.in_(CREDIT_TASKS),
         AiUsageLog.created_at >= _month_start())) or 0)
 
 
@@ -167,9 +175,13 @@ async def credit_problem(db: AsyncSession, store_id: int, task: str) -> str:
         return "حساب کاربری غیرفعال است؛ کارهای هوش مصنوعی انجام نمی‌شود."
     if status == "expired":
         return "پلن شما تمام شده؛ برای استفاده از هوش مصنوعی پلن را تمدید کنید."
-    limit = int((await limits_for(db, owner)).get("monthly_ai_credits", 0))
-    if await credits_used(db, owner.id) + CREDIT_WEIGHT.get(task, 1) > limit:
-        return f"اعتبار AI این ماه ({limit}) تمام شده؛ برای ادامه پلن را ارتقا دهید."
+    limits = await limits_for(db, owner)
+    if task in IMAGE_TASKS and not limits.get("ai_images"):
+        return "ساخت عکس با AI در پلن شما نیست؛ محصول با عکس‌های خودتان ساخته می‌شود."
+    if task in CREDIT_TASKS:
+        limit = int(limits.get("monthly_ai_credits", 0))
+        if await credits_used(db, owner.id) >= limit:
+            return f"سقف ساخت محصول با AI این ماه ({limit}) پر شده؛ ماه بعد دوباره باز می‌شود یا پلن را ارتقا دهید."
     return ""
 
 
@@ -178,17 +190,20 @@ def _limit_error(what: str, limit: int) -> HTTPException:
                                "action": {"type": "upgrade", "label": "ارتقای پلن"}})
 
 
-async def check_limit(db: AsyncSession, user: User, kind: str) -> None:
+async def check_limit(db: AsyncSession, user: User, kind: str, *, store_id: int | None = None,
+                      platform: str = "") -> None:
     limits = await limits_for(db, user)
     if kind == "stores":
         n = await db.scalar(select(func.count()).select_from(Store).where(Store.owner_id == user.id, ~Store.archived))
         if n >= limits["max_stores"]:
             raise _limit_error("تعداد فروشگاه", limits["max_stores"])
     elif kind == "channels":
-        n = await db.scalar(select(func.count()).select_from(Channel).join(Store).where(
-            Store.owner_id == user.id, Channel.status != "disconnected"))
-        if n >= limits["max_channels"]:
-            raise _limit_error("تعداد کانال", limits["max_channels"])
+        # Per platform and store: e.g. two Telegram bots and two Bale bots in each store.
+        n = await db.scalar(select(func.count()).select_from(Channel).where(
+            Channel.store_id == store_id, Channel.platform == platform, Channel.status != "disconnected"))
+        cap = int(limits.get("max_channels_per_platform", 2))
+        if n >= cap:
+            raise _limit_error("کانال هر پلتفرم", cap)
     elif kind == "products":
         n = await db.scalar(select(func.count()).select_from(Product).join(Store).where(
             Store.owner_id == user.id, Product.status != "archived"))
@@ -207,13 +222,21 @@ async def tier_config(db: AsyncSession, tier: str) -> dict | None:
         Subscription.plan_id.in_([p.id for p in rows]), Subscription.status == "active", Subscription.ends_at > utcnow())) or 0
     return {
         "tier": tier, "name": base.name, "description": base.description, "features": base.features,
-        "limits": base.limits, "sort_order": base.sort_order, "is_featured": any(p.is_featured for p in rows),
+        "limits": {**base.limits, "max_stores": min(p.limits.get("max_stores", 1) for p in rows)},
+        "sort_order": base.sort_order, "is_featured": any(p.is_featured for p in rows),
         "is_active": any(p.is_active for p in rows), "subscribers": subscribers,
         "prices": [{"duration_months": m, "plan_id": by_months[m].id if m in by_months else None,
                     "price_toman": by_months[m].price_toman if m in by_months else 0,
                     "compare_at_toman": by_months[m].compare_at_toman if m in by_months else 0,
-                    "is_active": by_months[m].is_active if m in by_months else False} for m in DURATIONS],
+                    "is_active": by_months[m].is_active if m in by_months else False,
+                    "max_stores": _store_override(rows, by_months.get(m))} for m in DURATIONS],
     }
+
+
+def _store_override(rows: list[Plan], p: Plan | None) -> int | None:
+    base = min(r.limits.get("max_stores", 1) for r in rows)
+    v = p.limits.get("max_stores", base) if p else base
+    return v if v != base else None
 
 
 async def all_tiers(db: AsyncSession) -> list[dict]:

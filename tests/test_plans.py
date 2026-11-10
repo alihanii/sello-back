@@ -101,23 +101,57 @@ async def test_change_plan_block_and_expiry(client):
 
 async def test_ai_credits_cap(client):
     seller = await login(client, "09128880002")
-    sid = (await client.post("/stores", headers=seller, json={"name": "اعتبار"})).json()["id"]
+    r = await client.post("/stores", headers=seller, json={"name": "اعتبار"})
+    assert r.status_code == 200, r.text
+    sid = r.json()["id"]
     async with SessionLocal() as db:
-        await plans.save_free_limits(db, {"monthly_ai_credits": 22})
-        db.add_all([AiUsageLog(created_at=utcnow(), task="chat", store_id=sid, ok=True) for _ in range(50)])  # not credits
+        await plans.save_free_limits(db, {"monthly_ai_credits": 2, "ai_images": False})
+        # chat, crawling and reading photos are free; failed calls too
+        for task in ("chat", "caption_extract", "vision", "field_fill"):
+            db.add_all([AiUsageLog(created_at=utcnow(), task=task, store_id=sid, ok=True) for _ in range(5)])
         db.add(AiUsageLog(created_at=utcnow(), task="product_generate", store_id=sid, ok=True))
-        db.add(AiUsageLog(created_at=utcnow(), task="vision", store_id=sid, ok=False))  # failed calls are free
+        db.add(AiUsageLog(created_at=utcnow(), task="product_generate", store_id=sid, ok=False))
         await db.commit()
         uid = await _user_id("09128880002")
         assert await plans.credits_used(db, uid) == 1
         assert await plans.credit_problem(db, sid, "product_generate") == ""
-        assert await plans.credit_problem(db, sid, "image_edit") == ""  # 1 + 20 ≤ 22
-        db.add(AiUsageLog(created_at=utcnow(), task="image_edit", store_id=sid, ok=True))
+        assert await plans.credit_problem(db, sid, "caption_extract") == ""
+        assert "عکس" in await plans.credit_problem(db, sid, "image_edit")  # pictures are off in this plan
+        db.add(AiUsageLog(created_at=utcnow(), task="product_generate", store_id=sid, ok=True))
         await db.commit()
-        assert await plans.credits_used(db, uid) == 21
-        assert "اعتبار AI" in await plans.credit_problem(db, sid, "image_edit")
+        assert "سقف ساخت محصول" in await plans.credit_problem(db, sid, "product_generate")
+        assert await plans.credit_problem(db, sid, "caption_extract") == ""  # crawling has no cap
         await plans.save_free_limits(db, {})
         await db.commit()
+
+
+async def test_channels_per_platform_and_yearly_stores(client):
+    admin = await login(client, "09120000000")
+    tier = (await client.get("/admin/plan-tiers", headers=admin)).json()[0]
+    assert tier["limits"]["max_channels_per_platform"] == 2
+    # one store, the yearly plan two (the default; other tests may have changed it)
+    tier["limits"]["max_stores"] = 1
+    tier["prices"] = [{**p, "max_stores": 2 if p["duration_months"] == 12 else None} for p in tier["prices"]]
+    tier = (await client.put(f"/admin/plan-tiers/{tier['tier']}", headers=admin, json=tier)).json()
+    assert tier["limits"]["max_stores"] == 1 and [p["max_stores"] for p in tier["prices"]] == [None, None, 2]
+    yearly = next(p for p in (await client.get("/plans")).json() if p["duration_months"] == 12 and p["tier"] == "sello")
+    assert yearly["limits"]["max_stores"] == 2
+    # saving keeps the override
+    r = await client.put(f"/admin/plan-tiers/{tier['tier']}", headers=admin, json=tier)
+    assert [p["max_stores"] for p in r.json()["prices"]] == [None, None, 2]
+
+    from app.models import Channel
+    seller = await login(client, "09128880003")
+    sid = (await client.post("/stores", headers=seller, json={"name": "کانال"})).json()["id"]
+    async with SessionLocal() as db:
+        db.add_all([Channel(store_id=sid, platform="telegram", status="connected", config={}) for _ in range(2)])
+        await db.commit()
+        u = await db.get(User, await _user_id("09128880003"))
+        import pytest
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException):
+            await plans.check_limit(db, u, "channels", store_id=sid, platform="telegram")
+        await plans.check_limit(db, u, "channels", store_id=sid, platform="bale")  # other platforms still open
 
 
 async def test_chat_stops_when_plan_has_ended(client, monkeypatch):
