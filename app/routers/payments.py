@@ -11,7 +11,7 @@ from sqlalchemy import select
 from app.core.config import settings
 from app.core.db import utcnow
 from app.deps import DB, CurrentUser
-from app.models import Payment, Plan, Store
+from app.models import Payment, Plan, Store, Subscription
 from app.services import bank
 from app.services.integrations import payment_config
 from app.services.notify import notify
@@ -42,7 +42,7 @@ async def start(body: StartIn, user: CurrentUser, db: DB):
     pay = Payment(user_id=user.id, plan_id=plan.id, amount_toman=plan.price_toman, bank_type=cfg["bank"])
     db.add(pay)
     await db.commit()
-    return_url = f"{settings.frontend_base_url.rstrip('/')}/app/billing"
+    return_url = f"{settings.frontend_base_url.rstrip('/')}/app/payment"
     try:
         res = await asyncio.to_thread(bank.start, cfg, amount_toman=plan.price_toman, mobile=user.phone, return_url=return_url)
     except Exception as exc:  # noqa: BLE001 - any library or bank failure is shown to the buyer
@@ -88,4 +88,25 @@ async def _finish(db, query: dict, form: dict, method: str) -> str:
 async def callback(request: Request, db: DB):
     form = dict(await request.form()) if request.method == "POST" else {}
     outcome = await _finish(db, dict(request.query_params), {k: str(v) for k, v in form.items()}, request.method)
-    return RedirectResponse(f"{settings.frontend_base_url.rstrip('/')}/app/billing?payment={outcome}", status_code=303)
+    # The seller lands on the result page (paid or not), which links to the dashboard and back to billing.
+    status, _, rest = outcome.partition("&")
+    return RedirectResponse(f"{settings.frontend_base_url.rstrip('/')}/app/payment?status={status}" + (f"&{rest}" if rest else ""),
+                            status_code=303)
+
+
+@router.get("/payments/{payment_id}")
+async def payment_detail(payment_id: int, user: CurrentUser, db: DB):
+    """One of the seller's own payments, for the result page after the bank."""
+    pay = await db.get(Payment, payment_id)
+    if not pay or (pay.user_id != user.id and user.role != "admin"):
+        raise HTTPException(404, "پرداخت پیدا نشد.")
+    plan = await db.get(Plan, pay.plan_id)
+    sub = await db.get(Subscription, pay.subscription_id) if pay.subscription_id else None
+    return {
+        "id": pay.id, "status": pay.status, "amount_toman": pay.amount_toman, "bank": pay.bank_type,
+        "bank_label": bank.BANKS.get(pay.bank_type, {}).get("label", pay.bank_type),
+        "tracking_code": pay.tracking_code, "reference_number": pay.reference_number,
+        "message": pay.message if pay.status == "failed" else "", "created_at": pay.created_at, "paid_at": pay.paid_at,
+        "plan": {"id": plan.id, "name": plan.name, "duration_months": plan.duration_months} if plan else None,
+        "subscription": {"starts_at": sub.starts_at, "ends_at": sub.ends_at} if sub else None,
+    }
