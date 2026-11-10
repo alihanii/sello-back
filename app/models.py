@@ -341,7 +341,7 @@ class AiProvider(TimestampMixin, Base):
     __tablename__ = "ai_providers"
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(120))
-    # gemini (Google or MetisAI gateway) | openai (OpenAI or any compatible gateway) | anthropic
+    # gemini (Google) | metis / avalai (Iranian gateways, one key for every model) | openai (OpenAI or any compatible gateway) | anthropic
     kind: Mapped[str] = mapped_column(String(20))
     base_url: Mapped[str] = mapped_column(String(300), default="")
     api_key_encrypted: Mapped[str] = mapped_column(Text)
@@ -371,7 +371,7 @@ AI_TASKS: dict[str, str] = {
 # Tasks that need a model which returns an image; every other task needs a text (JSON) model.
 IMAGE_TASKS = {"image_edit"}
 # Key types whose models can return a picture.
-IMAGE_KINDS = ("gemini", "metis", "openrouter")
+IMAGE_KINDS = ("gemini", "metis", "avalai", "openrouter")
 
 
 class AiTaskRoute(TimestampMixin, Base):

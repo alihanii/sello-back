@@ -457,6 +457,9 @@ async def providers(admin: AdminUser, db: DB):
                       {"kind": "metis", "label": "متیس", "base_url": DEFAULT_BASE_URLS["metis"],
                        "hint": "کلید متیس؛ از داخل ایران بدون پروکسی کار می‌کند. «دریافت مدل‌ها» همهٔ مدل‌های متیس (Gemini، GPT، Claude و DeepSeek) را می‌آورد.",
                        "model": "gemini-3.6-flash"},
+                      {"kind": "avalai", "label": "اول‌ای‌آی (AvalAI)", "base_url": DEFAULT_BASE_URLS["avalai"],
+                       "hint": "کلید را از chat.avalai.ir/platform بگیر؛ از داخل ایران بدون پروکسی کار می‌کند. «دریافت مدل‌ها» همهٔ مدل‌های اول‌ای‌آی (Gemini، GPT، Claude، DeepSeek و …) را می‌آورد.",
+                       "model": "gemini-3.6-flash"},
                       {"kind": "openai", "label": "OpenAI یا سرویس سازگار", "base_url": DEFAULT_BASE_URLS["openai"],
                        "hint": "هر سرویس سازگار با OpenAI (مثلاً واسط‌های ایرانی)", "model": "gpt-4.1-mini"},
                       {"kind": "openrouter", "label": "OpenRouter", "base_url": DEFAULT_BASE_URLS["openrouter"],
@@ -588,9 +591,9 @@ async def set_route(task: str, body: RouteIn, admin: AdminUser, db: DB):
         if problem := check_model(task, effective):
             raise HTTPException(422, f"{label}: {problem}")
         if task in IMAGE_TASKS and p and p.kind not in IMAGE_KINDS:
-            raise HTTPException(422, f"{label}: ساخت عکس فقط با کلید Gemini (مستقیم یا متیس) یا OpenRouter کار می‌کند.")
-        if task in IMAGE_TASKS and p and p.kind == "metis" and metis_family(effective) != "gemini":
-            raise HTTPException(422, f"{label}: ساخت عکس با متیس فقط با مدل‌های تصویری Gemini کار می‌کند (مثل gemini-3.1-flash-image).")
+            raise HTTPException(422, f"{label}: ساخت عکس فقط با کلید Gemini (مستقیم، متیس یا اول‌ای‌آی) یا OpenRouter کار می‌کند.")
+        if task in IMAGE_TASKS and p and p.kind in ("metis", "avalai") and metis_family(effective) != "gemini":
+            raise HTTPException(422, f"{label}: ساخت عکس با {'متیس' if p.kind == 'metis' else 'اول‌ای‌آی'} فقط با مدل‌های تصویری Gemini کار می‌کند (مثل gemini-3.1-flash-image).")
     r = (await db.execute(select(AiTaskRoute).where(AiTaskRoute.task == task))).scalar_one_or_none()
     if not r:
         r = AiTaskRoute(task=task)

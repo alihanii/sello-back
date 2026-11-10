@@ -7,7 +7,7 @@ from app.services import ai
 
 
 def _provider(**kw):
-    return AiProvider(id=1, name="g", kind=kw.get("kind", "gemini"), base_url="", default_model="gemini-2.5-flash",
+    return AiProvider(id=1, name="g", kind=kw.get("kind", "gemini"), base_url=kw.get("base_url", ""), default_model="gemini-2.5-flash",
                       api_key_encrypted=encrypt_credentials({"api_key": "AIza-test", "proxy": kw.get("proxy", "")}),
                       input_price_per_m=0, output_price_per_m=0)
 
@@ -97,6 +97,37 @@ async def test_metis_lists_models_of_every_family(monkeypatch):
     _patch(monkeypatch, handler, {})
     ids = await ai.list_models(_provider(kind="metis"))
     assert ids == ["gemini-3.6-flash", "gemini-3.1-flash-image", "claude-sonnet-5-5", "deepseek-v4-flash", "gpt-5-mini"]
+
+
+async def test_avalai_sends_gemini_natively_and_the_rest_to_v1(monkeypatch):
+    seen = []
+
+    def handler(req):
+        seen.append((str(req.url), req.headers.get("authorization"), req.headers.get("x-goog-api-key")))
+        if "/v1beta/" in str(req.url):
+            return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": "{}"}]}}]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}], "usage": {}})
+
+    _patch(monkeypatch, handler, {})
+    await ai._call(_provider(kind="avalai"), "gemini-3.6-flash", "s", "p", [], 0)
+    await ai._call(_provider(kind="avalai"), "gpt-5-mini", "s", "p", [], 0)
+    await ai._call(_provider(kind="avalai", base_url="https://api.avalai.ir/v1/"), "claude-sonnet-5-5", "s", "p", [], 0)
+    assert seen[0][0].startswith("https://api.avalai.ir/v1beta/models/gemini-3.6-flash") and seen[0][2] == "AIza-test"
+    assert seen[1][:2] == ("https://api.avalai.ir/v1/chat/completions", "Bearer AIza-test")
+    assert seen[2][0] == "https://api.avalai.ir/v1/chat/completions"
+
+
+async def test_avalai_lists_every_model_from_one_list(monkeypatch):
+    def handler(req):
+        if str(req.url) == "https://api.avalai.ir/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "gpt-5-mini"}, {"id": "gemini-3.6-flash"}, {"id": "tts-1"},
+                                                      {"id": "gemini-2.5-flash-preview-tts"}, {"id": "claude-sonnet-5-5"},
+                                                      {"id": "text-embedding-3-large"}]})
+        return httpx.Response(404)
+
+    _patch(monkeypatch, handler, {})
+    ids = await ai.list_models(_provider(kind="avalai"))
+    assert ids == ["gpt-5-mini", "gemini-3.6-flash", "claude-sonnet-5-5"]
 
 
 async def test_busy_503_is_retried_before_failing(monkeypatch):
