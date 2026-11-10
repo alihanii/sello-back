@@ -364,6 +364,19 @@ async def _route(task: str) -> list[tuple[AiProvider, str, float, bool]]:
                 and (task not in IMAGE_TASKS or c[0].kind in IMAGE_KINDS)]
 
 
+async def _check_credits(task: str, store_id: int | None) -> None:
+    """Stops non-chat AI work when the store owner's plan has ended, the account is blocked or this month's credits
+    are used up. The sales chat has its own monthly cap in the chat engine."""
+    if store_id is None:
+        return
+    from app.services.plans import credit_problem
+
+    async with SessionLocal() as db:
+        problem = await credit_problem(db, store_id, task)
+    if problem:
+        raise AIError(problem, code="ai_quota")
+
+
 async def has_route(task: str) -> bool:
     async with SessionLocal() as db:
         return (await db.execute(select(AiTaskRoute.id).where(AiTaskRoute.task == task))).first() is not None
@@ -418,6 +431,7 @@ async def generate_json(
     candidates = await _route(task)
     if not candidates:
         raise AIError(await route_problem(task), code="ai_not_configured")
+    await _check_credits(task, store_id)
     last: AIError | None = None
     for provider, model, temp, is_fallback in candidates:
         started = time.monotonic()
@@ -451,6 +465,7 @@ async def generate_text(
     candidates = await _route(task)
     if not candidates:
         raise AIError(await route_problem(task), code="ai_not_configured")
+    await _check_credits(task, store_id)
     last: AIError | None = None
     for provider, model, temp, is_fallback in candidates:
         started = time.monotonic()
@@ -505,6 +520,7 @@ async def generate_chat(
     candidates = await _route(task)
     if not candidates:
         raise AIError(await route_problem(task), code="ai_not_configured")
+    await _check_credits(task, store_id)
     last: AIError | None = None
     for provider, model, temp, is_fallback in candidates:
         started = time.monotonic()
@@ -552,6 +568,7 @@ async def generate_image(
     candidates = await _route(task)
     if not candidates:
         raise AIError(await route_problem(task), code="ai_not_configured")
+    await _check_credits(task, store_id)
     last: AIError | None = None
     for provider, model, temp, is_fallback in candidates:
         started = time.monotonic()

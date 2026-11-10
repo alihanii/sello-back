@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from app.deps import DB, CurrentUser
 from app.models import FeatureInterest, Plan, PlanRequest
 from app.schemas import PlanOut
-from app.services.plans import active_subscription, limits_for
+from app.services.plans import active_subscription, chat_used, credits_used, limits_for, plan_status
 
 router = APIRouter(tags=["billing"])
 
@@ -27,6 +27,8 @@ async def my_subscription(user: CurrentUser, db: DB):
         "subscription": {"plan": PlanOut.model_validate(plan), "starts_at": sub.starts_at, "ends_at": sub.ends_at}
         if sub else None,
         "limits": await limits_for(db, user),
+        "status": await plan_status(db, user),
+        "usage": {"chat_messages": await chat_used(db, user.id), "ai_credits": await credits_used(db, user.id)},
         "pending_request": {"id": pending.id, "plan_id": pending.plan_id, "created_at": pending.created_at} if pending else None,
     }
 

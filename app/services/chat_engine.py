@@ -705,11 +705,11 @@ async def catalog_rows(db: AsyncSession, store_id: int) -> list[Product]:
 
 
 async def month_ai_messages(db: AsyncSession, store_id: int) -> int:
-    now = utcnow()
-    start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
-    return await db.scalar(select(func.count()).select_from(ChatMessage).where(
-        ChatMessage.store_id == store_id, ChatMessage.role == "ai", ChatMessage.model != "", ~ChatMessage.is_test,
-        ChatMessage.created_at >= start)) or 0
+    """AI replies this month across all stores of this store's owner: the plan's cap is per seller."""
+    from app.services.plans import chat_used
+
+    store = await db.get(Store, store_id)
+    return await chat_used(db, store.owner_id) if store else 0
 
 
 async def chat_limit(db: AsyncSession, store: Store) -> int:
@@ -1378,14 +1378,18 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         return done()
 
     # 4. Budget: plan's monthly AI messages and a per-conversation burst limit.
+    # A limit of 0 means no AI at all: the plan has ended or the account is blocked.
     limit = await chat_limit(db, store)
-    if not conv.is_test and limit and await month_ai_messages(db, store.id) >= limit:
+    if not conv.is_test and (limit <= 0 or await month_ai_messages(db, store.id) >= limit):
         if not state.get("limit_notified"):
             state["limit_notified"] = True
             result.replies.append(Reply(LIMIT_TEXT, source="limit"))
-            result.notify_admin.append("⚠️ سقف ماهانهٔ پیام‌های دستیار چت پر شده؛ پیام‌های جدید را خودت جواب بده یا پلن را ارتقا بده.")
+            result.notify_admin.append(
+                "⚠️ پلنت تمام شده و دستیار چت خاموش است؛ پیام‌های جدید را خودت جواب بده یا پلن را تمدید کن." if limit <= 0
+                else "⚠️ سقف ماهانهٔ پیام‌های دستیار چت پر شده؛ پیام‌های جدید را خودت جواب بده یا پلن را ارتقا بده.")
         conv.status = "needs_human"
         return done()
+    state.pop("limit_notified", None)  # tell the seller again the next time the cap is hit
     recent = await db.scalar(select(func.count()).select_from(ChatMessage).where(
         ChatMessage.conversation_id == conv.id, ChatMessage.role == "ai", ChatMessage.model != "",
         ChatMessage.created_at >= utcnow() - RATE_WINDOW)) or 0
