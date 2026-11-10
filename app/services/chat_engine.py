@@ -1729,11 +1729,20 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
             lead = reply.text.strip() + "\n\n"
         elif step.stage == "details" and changed:
             # "مشکی XL پشت": what they just picked is said back, then what's still needed (not only "send your name").
+            # A line just added ("یه ماگ هم اضافه کن") is named, so they see it went in.
+            had_ids = {i.get("product_id") for i in before.get("items") or []}
             had = {(i.get("product_id"), _flat(i.get("variant"))) for i in before.get("items") or []}
-            picked = [str(i.get("variant") or "").strip() for i in order.get("items") or []
-                      if str(i.get("variant") or "").strip() and (i.get("product_id"), _flat(i.get("variant"))) not in had]
-            if picked:
-                lead = f"باشه 👌 ({'؛ '.join(picked)[:120]})\n"
+            said_back = []
+            for i in order.get("items") or []:
+                v = str(i.get("variant") or "").strip()
+                if i.get("product_id") not in had_ids:
+                    p = await db.get(Product, i.get("product_id") or 0) if i.get("product_id") else None
+                    if p:
+                        said_back.append(f"«{p.title[:60]}»" + (f" ({v})" if v else "") + " اضافه شد")
+                elif v and (i.get("product_id"), _flat(v)) not in had:
+                    said_back.append(f"({v})")
+            if said_back:
+                lead = f"باشه 👌 {'؛ '.join(said_back)[:200]}\n"
         reply.text, reply.buttons, reply.intent = lead + step.text, step.buttons, "order"
     elif agent.orders_enabled and not order.get("items") and _CLAIMS_PLACED.search(reply.text):
         reply.text = "برای ثبت، اسم محصول و سایز/رنگش رو بگو تا خلاصهٔ سفارش رو برات بفرستم 🌸"

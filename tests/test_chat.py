@@ -2187,13 +2187,15 @@ async def test_live_model_slips_with_a_real_chat(client, monkeypatch):
                                                                   {"product_id": mug["id"], "qty": 1}]}}]
     m = await say("یه ماگ هم اضافه کن")
     assert "ماگ سرامیکی" in m["text"] and "سایز یا رنگ" not in m["text"]
+    assert "«ماگ سرامیکی» اضافه شد" in m["text"] or "خلاصه" in m["text"]
 
     # "Cancel it" before anything was placed: the cart is emptied, not "your order was cancelled".
     await client.post(f"/stores/{sid}/chat/test", headers=h, json={"reset": True})
     await say("سلام")
-    llm.answers = [{"reply": "", "intent": "order", "order_action": "update",
+    llm.answers = [{"reply": "چه رنگی می‌خواین؟", "intent": "order", "order_action": "update",
                     "order": {"items": [{"product_id": mug["id"], "qty": 1}]}}]
-    await say("یه ماگ میخوام")
+    m = await say("یه ماگ میخوام")
+    assert m["text"].startswith("باشه 👌 «ماگ سرامیکی» اضافه شد"), m["text"]
     llm.answers = [{"reply": "سفارشتون کنسل شد.", "intent": "order", "order_action": "cancel"}]
     m = await say("کنسلش کن")
     assert m["text"] == chat_engine.CART_CLEARED_TEXT
