@@ -89,12 +89,14 @@ jobs:
 
       - name: Copy files and restart
         run: |
-          scp deploy/docker-compose.yml deploy/nginx-sello.conf deploy/env.example sello-back.tar.gz "server:$DEPLOY_PATH/"
+          scp deploy/docker-compose.yml deploy/nginx-sello.conf deploy/nginx-store.conf deploy/env.example sello-back.tar.gz "server:$DEPLOY_PATH/"
           ssh server "set -e; cd '$DEPLOY_PATH'
             test -f .env || { echo '::error::$DEPLOY_PATH/.env is missing: copy env.example to .env and fill it in'; exit 1; }
             gunzip -c sello-back.tar.gz | docker load && rm sello-back.tar.gz
-            if docker image inspect sello-front:latest >/dev/null 2>&1; then docker compose up -d --remove-orphans
-            else docker compose up -d db backend; echo 'sello-front not deployed yet: run its deploy workflow'; fi
+            svcs='db backend'
+            docker image inspect sello-front:latest >/dev/null 2>&1 && svcs=\"\$svcs frontend\" || echo 'sello-front not deployed yet: run its deploy workflow'
+            docker image inspect sello-store:latest >/dev/null 2>&1 && svcs=\"\$svcs store\" || echo 'sello-public-store not deployed yet: run its deploy workflow'
+            docker compose up -d --remove-orphans \$svcs
             docker image prune -f >/dev/null || true  # the other repo's deploy may be pruning at the same time
             for i in \$(seq 1 30); do docker compose exec -T backend python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/api/health')\" 2>/dev/null && { echo backend healthy; exit 0; }; sleep 2; done
             docker compose logs --tail 80 backend; exit 1"

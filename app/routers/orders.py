@@ -30,7 +30,9 @@ router = APIRouter(tags=["orders"])
 
 STATUSES = ("awaiting_payment", "payment_submitted", "confirmed", "rejected", "cancelled")
 PLATFORMS = ("instagram", "telegram", "bale", "whatsapp", "rubika", "eitaa", "divar", "phone", "in_person", "site", "other")
-SOURCE_EVENT = {"invoice": "sale_invoice_toman", "chat": "sale_chat_toman"}
+SOURCE_EVENT = {"invoice": "sale_invoice_toman", "chat": "sale_chat_toman", "site": "sale_site_toman"}
+# Sources stored as Invoices: the seller's invoice links, chat orders logged by hand, and orders from the store's website.
+INVOICE_SOURCES = ("invoice", "chat", "site")
 
 # ---------- settings ----------
 
@@ -232,6 +234,17 @@ async def _get_invoice(db, user, invoice_id: int) -> Invoice:
     return inv
 
 
+async def next_number(db, store: Store, conf: dict[str, Any]) -> int:
+    """The store's next invoice/order number (shown as «فاکتور ۱۰۲۴»), reserved on the store's settings."""
+    number = int(conf.get("next_number") or 1001)
+    last = await db.scalar(select(func.max(Invoice.number)).where(Invoice.store_id == store.id))
+    number = max(number, (last or 0) + 1)
+    s = dict(store.settings or {})
+    s["invoice"] = {**(s.get("invoice") or {}), "next_number": number + 1}
+    store.settings = s
+    return number
+
+
 @router.post("/stores/{store_id}/invoices", status_code=201)
 async def create_invoice(store_id: int, body: InvoiceIn, user: CurrentUser, db: DB):
     store = await get_store_for(db, user, store_id)
@@ -242,12 +255,7 @@ async def create_invoice(store_id: int, body: InvoiceIn, user: CurrentUser, db: 
     if body.status not in ("awaiting_payment", "confirmed") or (body.source == "invoice" and body.status != "awaiting_payment"):
         raise HTTPException(422, "وضعیت نامعتبر است.")
     conf = await invoice_settings(db, store)
-    number = int(conf.get("next_number") or 1001)
-    last = await db.scalar(select(func.max(Invoice.number)).where(Invoice.store_id == store_id))
-    number = max(number, (last or 0) + 1)
-    s = dict(store.settings or {})
-    s["invoice"] = {**(s.get("invoice") or {}), "next_number": number + 1}
-    store.settings = s
+    number = await next_number(db, store, conf)
     hours = int(conf.get("expire_hours") or 0)
     inv = Invoice(
         store_id=store_id, number=number, source=body.source, code=secrets.token_urlsafe(9), platform=body.platform,
@@ -338,7 +346,8 @@ async def update_invoice(invoice_id: int, body: InvoicePatch, user: CurrentUser,
 
 
 async def _public(db, code: str) -> tuple[Invoice, Store]:
-    inv = (await db.execute(select(Invoice).where(Invoice.code == code, Invoice.source == "invoice"))).scalar_one_or_none()
+    inv = (await db.execute(select(Invoice).where(
+        Invoice.code == code, Invoice.source.in_(["invoice", "site"])))).scalar_one_or_none()
     store = await db.get(Store, inv.store_id) if inv else None
     if not inv or not store or store.archived:
         raise HTTPException(404, "فاکتور پیدا نشد.")
@@ -350,7 +359,7 @@ def _public_out(inv: Invoice, conf: dict[str, Any]) -> dict[str, Any]:
     closed = inv.status in ("payment_submitted", "confirmed", "cancelled") or _expired(inv)
     pay = {k: "" if closed else conf.get(k) or "" for k in ("card_number", "sheba", "holder", "bank_name", "pay_link")}
     return {
-        "number": inv.number, "status": inv.status, "expired": _expired(inv), "closed": closed, "expires_at": inv.expires_at,
+        "number": inv.number, "source": inv.source, "status": inv.status, "expired": _expired(inv), "closed": closed, "expires_at": inv.expires_at,
         "created_at": inv.created_at, "items": [{k: i.get(k) for k in ("title", "variant", "qty", "unit_price", "image_url")}
                                                 for i in inv.items or []],
         "subtotal_toman": inv.subtotal_toman, "discount_toman": inv.discount_toman,
@@ -409,7 +418,8 @@ async def public_receipt(code: str, db: DB, file: UploadFile | None = File(None)
     inv.payer_note = note.strip()[:1000]
     inv.status = "payment_submitted"
     inv.submitted_at = utcnow()
-    await notify(db, inv.store_id, "approval", f"فیش فاکتور {inv.number} رسید",
+    what = "سفارش سایت" if inv.source == "site" else "فاکتور"
+    await notify(db, inv.store_id, "approval", f"فیش {what} {inv.number} رسید",
                  f"{inv.customer_name or 'مشتری'} · {inv.total_toman:,} تومان. بررسی و تأیید کن.",
                  link=f"/app/s/{inv.store_id}/orders?o=inv-{inv.id}", image_url=inv.receipt_url)
     await db.commit()
@@ -444,8 +454,8 @@ def _aware(d: datetime) -> datetime:
 @router.get("/stores/{store_id}/orders")
 async def unified_orders(store_id: int, user: CurrentUser, db: DB, source: str = "", status: str = "", q: str = "",
                          day: date | None = None, limit: int = 30, offset: int = 0):
-    """Every order of the store, newest first: the assistant's (ai), the seller's chat orders (chat) and invoices the
-    customer has paid or sent a receipt for (invoice)."""
+    """Every order of the store, newest first: the assistant's (ai), the seller's chat orders (chat), invoices the
+    customer has paid or sent a receipt for (invoice) and orders placed on the store's website (site)."""
     await get_store_for(db, user, store_id)
     limit = min(max(limit, 1), 100)
     want = limit + offset
@@ -465,7 +475,7 @@ async def unified_orders(store_id: int, user: CurrentUser, db: DB, source: str =
                               AiOrder.tracking_code.ilike(f"%{q}%"), *([AiOrder.id == int(num)] if num.isdigit() else [])))
         totals["ai"] = int(await db.scalar(select(func.count()).select_from(st.subquery())) or 0)
         items += [_ai_item(o) for o in (await db.execute(st.order_by(AiOrder.created_at.desc()).limit(want))).scalars()]
-    if source in ("", "invoice", "chat"):
+    if source in ("", *INVOICE_SOURCES):
         st = select(Invoice).where(Invoice.store_id == store_id, Invoice.submitted_at.is_not(None))
         if source:
             st = st.where(Invoice.source == source)
@@ -500,7 +510,7 @@ async def unified_orders(store_id: int, user: CurrentUser, db: DB, source: str =
 
 # ---------- money: income by source, per day ----------
 
-SOURCES = ("ai", "chat", "invoice")
+SOURCES = ("ai", "chat", "invoice", "site")
 
 
 async def finance_series(db, store_id: int, start: date, end: date) -> dict[str, dict[str, int]]:
@@ -513,9 +523,10 @@ async def finance_series(db, store_id: int, start: date, end: date) -> dict[str,
                    ActivityEvent.type.in_(["sale_toman", *SOURCE_EVENT.values()]))
             .group_by(ActivityEvent.day, ActivityEvent.type))).all():
         row = days.setdefault(d.isoformat(), dict(blank))
-        row[{"sale_toman": "all", "sale_invoice_toman": "invoice", "sale_chat_toman": "chat"}[typ] + "_toman"] = int(n)
+        row[{"sale_toman": "all", "sale_invoice_toman": "invoice", "sale_chat_toman": "chat",
+             "sale_site_toman": "site"}[typ] + "_toman"] = int(n)
     for row in days.values():  # the assistant's share is the rest of the day's income
-        row["ai_toman"] = max(0, row.pop("all_toman", 0) - row["invoice_toman"] - row["chat_toman"])
+        row["ai_toman"] = max(0, row.pop("all_toman", 0) - row["invoice_toman"] - row["chat_toman"] - row["site_toman"])
     lo = datetime.combine(start, time.min, tzinfo=timezone.utc)
     hi = datetime.combine(end + timedelta(days=1), time.min, tzinfo=timezone.utc)
     oday = func.date(AiOrder.created_at)

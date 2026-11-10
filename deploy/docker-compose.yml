@@ -1,7 +1,8 @@
 # Production stack. Lives on the server in DEPLOY_PATH (default /opt/sello) next to .env;
 # the deploy workflows copy it there. Images are built in GitHub Actions and loaded with `docker load`,
 # so the server never needs to build or reach a registry for sello-back / sello-front.
-# Both apps listen on 127.0.0.1 only; the server's nginx (deploy/nginx-sello.conf) puts them on the web.
+# The apps listen on 127.0.0.1 only; the server's nginx (deploy/nginx-sello.conf, deploy/nginx-store.conf) puts them
+# on the web.
 name: sello
 
 services:
@@ -41,6 +42,17 @@ services:
     pull_policy: never
     restart: unless-stopped
     ports: ["127.0.0.1:${FRONTEND_PORT:-3100}:3000"]
+    depends_on: [backend]
+
+  # The stores' own websites (sello-public-store): server-rendered, reached by host (*.SELLO_SITE_ROOT_DOMAIN or the
+  # seller's own domain). It reads the API over the internal network, so pages render without a trip through nginx.
+  store:
+    image: sello-store:latest
+    pull_policy: never
+    restart: unless-stopped
+    environment:
+      STORE_API_URL: http://backend:8000
+    ports: ["127.0.0.1:${STORE_PORT:-3200}:3000"]
     depends_on: [backend]
 
 volumes:

@@ -64,6 +64,12 @@ class Settings(BaseSettings):
     xray_dir: str = "./xray"  # generated config and log
     proxy_check_seconds: float = 180
 
+    # Store websites (storefront app): each store gets <subdomain>.<site_root_domain>; a wildcard DNS record
+    # (*.root) must point to the server. site_server_ip is shown to sellers who connect their own domain.
+    site_root_domain: str = ""  # e.g. sello.ir; empty = sites only on their own domains (or *.localhost in dev)
+    site_scheme: str = "https"
+    site_server_ip: str = ""
+
     worker_enabled: bool = True
     worker_concurrency: int = 4
     worker_poll_seconds: float = 1.0

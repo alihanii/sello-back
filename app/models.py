@@ -664,3 +664,25 @@ class Invoice(TimestampMixin, Base):
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     stock_taken: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+# ---------- the store's own website (storefront) ----------
+
+
+class StoreSite(TimestampMixin, Base):
+    """The seller's public website, served by the separate storefront app (sello-public-store).
+
+    It is reached at `<subdomain>.<SELLO_SITE_ROOT_DOMAIN>` or at the seller's own domain. Everything the seller sets on
+    the «سایت من» tab (banners, palette, about, contact, footer badges, chat widget, SEO) lives in `config`; orders
+    placed on it are Invoices with source "site", so they land in the unified orders list."""
+
+    __tablename__ = "store_sites"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), unique=True, index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    subdomain: Mapped[str | None] = mapped_column(String(40), unique=True, index=True, nullable=True)
+    custom_domain: Mapped[str | None] = mapped_column(String(190), unique=True, index=True, nullable=True)
+    # pending (DNS not pointed yet) | active (points to us) | error
+    domain_status: Mapped[str] = mapped_column(String(12), default="")
+    domain_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
