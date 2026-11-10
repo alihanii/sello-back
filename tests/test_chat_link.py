@@ -55,3 +55,17 @@ async def test_chat_link_page_lands_in_store_chats(client, monkeypatch):
     await client.put(f"/stores/{sid}/chat-link", headers=h, json={"enabled": False})
     assert (await client.get("/public/chat/boutique-chat")).status_code == 403
     assert (await client.post("/public/chat/boutique-chat/messages", json={"name": "a", "text": "hi"})).status_code == 403
+
+
+async def test_chat_link_caps_ai_replies_per_hour(client, monkeypatch):
+    from app.routers import chat_link
+
+    h, sid, _llm, *_ = await _setup(client, monkeypatch, "09125550903")
+    await client.get(f"/stores/{sid}/chat-link", headers=h)
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={"enabled": True})
+    monkeypatch.setattr(chat_link, "AI_REPLIES_PER_HOUR", 1)
+    r = (await client.post(f"/public/chat/shop{sid}/messages", json={"name": "رضا", "text": "سلام"})).json()
+    assert [m["role"] for m in r["messages"]] == ["customer", "ai"] and not r["notice"]
+    r = (await client.post(f"/public/chat/shop{sid}/messages",
+                           json={"name": "رضا", "visitor": r["visitor"], "text": "قیمت مانتو؟"})).json()
+    assert [m["role"] for m in r["messages"]] == ["customer"] and r["notice"]
