@@ -27,11 +27,12 @@ from sqlalchemy.orm import selectinload
 from app.core.config import settings
 from app.core.db import utcnow
 from app.deps import DB, CurrentUser, get_store_for
-from app.models import ChatConversation, ChatMessage, Invoice, Product, Store, StoreSite
+from app.models import ChatConversation, ChatMessage, Invoice, Product, Store, StoreSite, User
 from app.routers.orders import _latin_digits, _totals, invoice_settings, next_number
 from app.services import chat_runtime as rt
 from app.services.categories import store_categories
 from app.services.chat_engine import _COLOR_KEY, _SIZE_KEY, get_agent, variant_options
+from app.services.features import SITE_BUILDER, has_feature
 from app.services.notify import notify
 
 router = APIRouter(tags=["site"])
@@ -217,6 +218,19 @@ class SiteIn(BaseModel):
     home: dict[str, bool] | None = None
 
 
+async def _seller_store(db, user, store_id: int) -> Store:
+    """The seller's store, if the admin has opened the website builder to them."""
+    store = await get_store_for(db, user, store_id)
+    if not await has_feature(db, user, SITE_BUILDER):
+        raise HTTPException(403, "وبسایت ساز هنوز برای حساب تو فعال نشده است.")
+    return store
+
+
+async def _owner_allowed(db, store: Store) -> bool:
+    owner = await db.get(User, store.owner_id)
+    return bool(owner) and await has_feature(db, owner, SITE_BUILDER)
+
+
 async def _site(db, store: Store, create: bool = True) -> StoreSite | None:
     site = (await db.execute(select(StoreSite).where(StoreSite.store_id == store.id))).scalar_one_or_none()
     if not site and create:
@@ -245,7 +259,7 @@ def _clean_text(d: dict[str, Any] | None, keys: tuple[str, ...], limit: int = 50
 
 @router.get("/stores/{store_id}/site")
 async def get_site(store_id: int, user: CurrentUser, db: DB):
-    store = await get_store_for(db, user, store_id)
+    store = await _seller_store(db, user, store_id)
     site = await _site(db, store)
     await db.commit()
     return await _seller_out(db, store, site)
@@ -253,7 +267,7 @@ async def get_site(store_id: int, user: CurrentUser, db: DB):
 
 @router.put("/stores/{store_id}/site")
 async def put_site(store_id: int, body: SiteIn, user: CurrentUser, db: DB):
-    store = await get_store_for(db, user, store_id)
+    store = await _seller_store(db, user, store_id)
     site = await _site(db, store)
     cfg = dict(site.config or {})
 
@@ -358,7 +372,7 @@ def _resolve_ips(host: str) -> set[str]:
 @router.post("/stores/{store_id}/site/check-domain")
 async def check_domain(store_id: int, user: CurrentUser, db: DB):
     """Whether the seller's own domain points to our server yet (its A record)."""
-    store = await get_store_for(db, user, store_id)
+    store = await _seller_store(db, user, store_id)
     site = await _site(db, store)
     if not site.custom_domain:
         raise HTTPException(422, "اول دامنه را وارد کن.")
@@ -397,7 +411,7 @@ async def site_for_host(db, host: str) -> StoreSite | None:
 async def _public_site(db, key: str) -> tuple[StoreSite, Store]:
     site = (await db.execute(select(StoreSite).where(StoreSite.subdomain == key.lower()))).scalar_one_or_none()
     store = await db.get(Store, site.store_id) if site else None
-    if not site or not site.enabled or not store or store.archived:
+    if not site or not site.enabled or not store or store.archived or not await _owner_allowed(db, store):
         raise HTTPException(404, "این سایت پیدا نشد.")
     return site, store
 
@@ -433,7 +447,7 @@ async def resolve(db: DB, host: str = Query(..., max_length=255)):
     """The storefront calls this with the request's Host header to know which store's site to render."""
     site = await site_for_host(db, host)
     store = await db.get(Store, site.store_id) if site else None
-    if not site or not site.enabled or not store or store.archived:
+    if not site or not site.enabled or not store or store.archived or not await _owner_allowed(db, store):
         raise HTTPException(404, "این سایت پیدا نشد.")
     return await _site_payload(db, site, store)
 
@@ -442,7 +456,8 @@ async def resolve(db: DB, host: str = Query(..., max_length=255)):
 async def tls_check(db: DB, domain: str = Query("", max_length=255)):
     """For the web server's on-demand TLS: a certificate is issued only for hosts that are a live store site."""
     site = await site_for_host(db, domain)
-    if not site or not site.enabled:
+    store = await db.get(Store, site.store_id) if site else None
+    if not site or not site.enabled or not store or not await _owner_allowed(db, store):
         raise HTTPException(404, "unknown")
     return {"ok": True}
 

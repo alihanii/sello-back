@@ -16,6 +16,8 @@ from app.models import (
     Operation, Payment, Plan, PlanRequest, Product, Store, Subscription, User,
 )
 from app.services.bank import BANKS
+from app.services.text import to_en_digits
+from app.services.features import FEATURES, MODES, allowed, feature_access, save_feature_access
 from app.services.integrations import (
     INSTAGRAM_SCOPES, instagram_app, instagram_crawler, payment_config, save_instagram_app, save_instagram_crawler,
     save_payment_config,
@@ -97,8 +99,12 @@ async def user_detail(user_id: int, admin: AdminUser, db: DB):
         sub_rows.append({"id": s.id, "plan": p.name if p else "?", "duration_months": p.duration_months if p else None,
                          "status": s.status, "starts_at": s.starts_at, "ends_at": s.ends_at, "activated_by": s.activated_by,
                          "note": s.note})
+    features = {}
+    for key, label in FEATURES.items():
+        acc = await feature_access(db, key)
+        features[key] = {"label": label, "mode": acc["mode"], "selected": u.id in acc["user_ids"], "allowed": allowed(acc, u)}
     return {"user": {**UserOut.model_validate(u).model_dump(), "is_active": u.is_active}, "stores": store_rows,
-            "subscriptions": sub_rows}
+            "subscriptions": sub_rows, "features": features}
 
 
 class ActivateIn(BaseModel):
@@ -149,6 +155,72 @@ async def set_active(user_id: int, body: ActiveIn, admin: AdminUser, db: DB):
     audit(db, admin, "set_active", "user", user_id, {"is_active": body.is_active})
     await db.commit()
     return {"ok": True}
+
+
+# ---------- features opened to a segment of sellers ----------
+
+
+def _feature_key(key: str) -> str:
+    if key not in FEATURES:
+        raise HTTPException(404, "این قابلیت وجود ندارد.")
+    return key
+
+
+async def _feature_out(db, key: str) -> dict:
+    acc = await feature_access(db, key)
+    users = (await db.execute(select(User).where(User.id.in_(acc["user_ids"])).order_by(User.id.desc()))).scalars().all() \
+        if acc["user_ids"] else []
+    sellers = await db.scalar(select(func.count()).select_from(User).where(User.role != "admin", User.is_active))
+    return {"key": key, "label": FEATURES[key], "mode": acc["mode"],
+            "users": [{"id": x.id, "phone": x.phone, "name": x.name} for x in users],
+            "sellers": sellers or 0,
+            "with_access": (sellers or 0) if acc["mode"] == "all" else len(users) if acc["mode"] == "selected" else 0}
+
+
+@router.get("/features")
+async def features(admin: AdminUser, db: DB):
+    return [await _feature_out(db, k) for k in FEATURES]
+
+
+class FeatureIn(BaseModel):
+    mode: str
+    user_ids: list[int] | None = None  # None keeps the current list
+    phones: list[str] = []  # add users by phone too
+
+
+@router.put("/features/{key}")
+async def put_feature(key: str, body: FeatureIn, admin: AdminUser, db: DB):
+    key = _feature_key(key)
+    if body.mode not in MODES:
+        raise HTTPException(422, "حالت نامعتبر است.")
+    ids = list(body.user_ids) if body.user_ids is not None else (await feature_access(db, key))["user_ids"]
+    for phone in body.phones:
+        phone = to_en_digits(phone).strip()
+        u = (await db.execute(select(User).where(User.phone == phone))).scalar_one_or_none()
+        if not u:
+            raise HTTPException(404, f"کاربری با شمارهٔ {phone} پیدا نشد.")
+        ids.append(u.id)
+    v = await save_feature_access(db, key, body.mode, ids)
+    audit(db, admin, "update_feature", "feature", None, {"key": key, **v})
+    await db.commit()
+    return await _feature_out(db, key)
+
+
+class UserFeatureIn(BaseModel):
+    enabled: bool
+
+
+@router.post("/users/{user_id}/features/{key}")
+async def set_user_feature(user_id: int, key: str, body: UserFeatureIn, admin: AdminUser, db: DB):
+    key = _feature_key(key)
+    if not await db.get(User, user_id):
+        raise HTTPException(404, "کاربر پیدا نشد.")
+    acc = await feature_access(db, key)
+    ids = set(acc["user_ids"]) | {user_id} if body.enabled else set(acc["user_ids"]) - {user_id}
+    v = await save_feature_access(db, key, acc["mode"], list(ids))
+    audit(db, admin, "update_feature", "user", user_id, {"key": key, "enabled": body.enabled})
+    await db.commit()
+    return {"ok": True, "mode": v["mode"], "selected": body.enabled}
 
 
 # ---------- stores & channels ----------

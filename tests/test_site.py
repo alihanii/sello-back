@@ -3,9 +3,25 @@ import io
 from tests.conftest import login
 from tests.test_invoices import PNG
 
+_admin: dict = {}
+
+
+async def admin(client) -> dict:
+    if not _admin:  # the admin phone hits the OTP rate limit if every test logs in again
+        _admin.update(await login(client, "09120000000"))
+    return _admin
+
+
+async def open_builder(client, phone: str) -> None:
+    """The website builder is closed by default; the admin opens it to this seller."""
+    a = await admin(client)
+    r = await client.put("/admin/features/site_builder", headers=a, json={"mode": "selected", "phones": [phone]})
+    assert r.status_code == 200, r.text
+
 
 async def test_site_settings_catalog_checkout_and_sitemap(client):
     h = await login(client, "09128820001")
+    await open_builder(client, "09128820001")
     sid = (await client.post("/stores", json={"name": "سایت‌دار"}, headers=h)).json()["id"]
     hoodie = (await client.post(f"/stores/{sid}/products", headers=h, json={
         "title": "هودی چاپی مشکی", "price": 450000, "compare_at_price": 520000, "stock_qty": 3, "category": "هودی",
@@ -41,6 +57,7 @@ async def test_site_settings_catalog_checkout_and_sitemap(client):
 
     # Someone else can't take the subdomain or the domain.
     h2 = await login(client, "09128820002")
+    await open_builder(client, "09128820002")
     sid2 = (await client.post("/stores", json={"name": "دیگری"}, headers=h2)).json()["id"]
     assert (await client.put(f"/stores/{sid2}/site", headers=h2, json={"subdomain": "hoodiland"})).status_code == 409
     r = await client.put(f"/stores/{sid}/site", headers=h, json={"custom_domain": "https://www.Hoodiland.ir/"})
@@ -128,6 +145,7 @@ async def test_site_settings_catalog_checkout_and_sitemap(client):
 
 async def test_site_chat_widget_lands_in_store_chats(client):
     h = await login(client, "09128820003")
+    await open_builder(client, "09128820003")
     sid = (await client.post("/stores", json={"name": "چتی"}, headers=h)).json()["id"]
     await client.put(f"/stores/{sid}/site", headers=h, json={"enabled": True, "subdomain": "chatty"})
     site = (await client.get("/public/sites/chatty")).json()
@@ -153,3 +171,38 @@ async def test_site_chat_widget_lands_in_store_chats(client):
 
     await client.put(f"/stores/{sid}/site", headers=h, json={"chat": {"enabled": False}})
     assert (await client.post("/public/sites/chatty/chat", json={"text": "hi"})).status_code == 403
+
+
+async def test_site_builder_is_opened_to_a_segment(client):
+    h = await login(client, "09128820004")
+    sid = (await client.post("/stores", json={"name": "سگمنت"}, headers=h)).json()["id"]
+    a = await admin(client)
+    me = (await client.get("/auth/me", headers=h)).json()
+    assert me["features"] == {"site_builder": False}
+    assert (await client.get(f"/stores/{sid}/site", headers=h)).status_code == 403
+    assert (await client.get("/auth/me", headers=a)).json()["features"]["site_builder"]  # admins always have it
+
+    uid = me["id"]
+    r = await client.post(f"/admin/users/{uid}/features/site_builder", headers=a, json={"enabled": True})
+    assert r.status_code == 200, r.text
+    assert (await client.get("/auth/me", headers=h)).json()["features"]["site_builder"]
+    await client.put(f"/stores/{sid}/site", headers=h, json={"enabled": True, "subdomain": "segmented"})
+    assert (await client.get("/public/sites/segmented")).status_code == 200
+    detail = (await client.get(f"/admin/users/{uid}", headers=a)).json()
+    assert detail["features"]["site_builder"]["selected"] and detail["features"]["site_builder"]["allowed"]
+
+    # Closing it to everyone takes the site off the web too.
+    f = (await client.put("/admin/features/site_builder", headers=a, json={"mode": "none"})).json()
+    assert f["mode"] == "none" and f["with_access"] == 0 and any(u["id"] == uid for u in f["users"])
+    assert (await client.get(f"/stores/{sid}/site", headers=h)).status_code == 403
+    assert (await client.get("/public/sites/segmented")).status_code == 404
+    assert (await client.get("/public/sites/resolve", params={"host": "segmented.localhost"})).status_code == 404
+
+    f = (await client.put("/admin/features/site_builder", headers=a, json={"mode": "all"})).json()
+    assert f["with_access"] == f["sellers"] > 0
+    r = await client.post(f"/admin/users/{uid}/features/site_builder", headers=a, json={"enabled": False})
+    assert (await client.get(f"/stores/{sid}/site", headers=h)).status_code == 200  # "all" covers everyone
+    assert (await client.put("/admin/features/site_builder", headers=a, json={"mode": "x"})).status_code == 422
+    assert (await client.put("/admin/features/nope", headers=a, json={"mode": "all"})).status_code == 404
+    assert (await client.put("/admin/features/site_builder", headers=h, json={"mode": "all"})).status_code == 403
+    await client.put("/admin/features/site_builder", headers=a, json={"mode": "selected"})
