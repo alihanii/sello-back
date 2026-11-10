@@ -3,7 +3,8 @@ ai_task_routes); every call is written to ai_usage_logs for the monitoring page.
 
 Wire formats: `gemini` (a key straight from Google AI Studio), `metis` (one MetisAI key for every model it
 sells: Gemini models go out in the Gemini format, Claude through /anthropic, DeepSeek through /deepseek/v1, the rest through /openai/v1), `openai` (OpenAI and compatible gateways), `openrouter` (OpenAI format, plus image output),
-`anthropic`. Each key may carry its own
+`avalai` (one AvalAI key for every model it sells: Gemini models in the Gemini format, so image output works, the rest
+through its OpenAI-compatible /v1), `anthropic`. Each key may carry its own
 proxy, stored with the key in the encrypted blob, because Google and OpenAI refuse requests from Iran."""
 
 import asyncio
@@ -23,6 +24,7 @@ from app.models import IMAGE_KINDS, IMAGE_TASKS, AiProvider, AiTaskRoute, AiUsag
 DEFAULT_BASE_URLS = {
     "gemini": "https://generativelanguage.googleapis.com",
     "metis": "https://api.metisai.ir",
+    "avalai": "https://api.avalai.ir",
     "openai": "https://api.openai.com/v1",
     "openrouter": "https://openrouter.ai/api/v1",
     "anthropic": "https://api.anthropic.com",
@@ -105,8 +107,17 @@ def metis_family(model: str) -> str:
     return "openai"
 
 
+_AVALAI_SUFFIXES = ("/v1beta", "/v1")
+
+
 def _wire(provider: AiProvider, model: str) -> tuple[str, str]:
-    """(wire format, base URL) for one call. Metis picks the format from the model family."""
+    """(wire format, base URL) for one call. Metis and AvalAI pick the format from the model family."""
+    if provider.kind == "avalai":
+        root = _base(provider)
+        for suffix in _AVALAI_SUFFIXES:
+            root = root.removesuffix(suffix)
+        # Gemini natively (thinking level, image output); everything else in the OpenAI format on /v1.
+        return ("gemini", root) if metis_family(model) == "gemini" else ("openai", f"{root}/v1")
     if provider.kind != "metis":
         return provider.kind, _base(provider)
     root = _base(provider)
@@ -638,13 +649,16 @@ async def list_models(provider: AiProvider) -> list[str]:
                 resp = await client.get(f"{base}/models", headers={"Authorization": f"Bearer {key}"})
                 _raise_for(resp)
                 ids = sorted((m["id"] for m in resp.json().get("data", [])), reverse=True)
-                return [i for i in ids if not _not_chat(i)] if provider.kind == "metis" else ids
+                return [i for i in ids if not _not_chat(i)] if provider.kind in ("metis", "avalai") else ids
             if kind == "anthropic":
                 resp = await client.get(f"{base}/v1/models", headers={"x-api-key": key, "anthropic-version": "2023-06-01"})
                 _raise_for(resp)
                 return [m["id"] for m in resp.json().get("data", [])]
             return []
 
+        if provider.kind == "avalai":
+            # One OpenAI-style list holds every model AvalAI sells (GPT, Gemini, Claude, DeepSeek, Grok …).
+            return [m for m in await fetch("openai", _wire(provider, "gpt")[1]) if model_kind(m)[0] != "unsupported"]
         if provider.kind != "metis":
             return await fetch(provider.kind, _base(provider))
         samples = ("gemini", "claude", "deepseek", "gpt")
