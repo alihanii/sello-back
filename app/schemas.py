@@ -193,11 +193,18 @@ class PlanPrice(BaseModel):
     compare_at_toman: int = 0
     is_active: bool = True
     plan_id: int | None = None
+    max_stores: int | None = None  # this period's store cap, when it differs from the plan's
 
 
-class PlanConfig(BaseModel):
+class PlanTier(BaseModel):
+    """One plan as the admin edits it: one feature set and limits, and a price per billing period."""
+    tier: str = ""
     name: str
     description: str = ""
     features: list[str] = []
     limits: dict[str, Any] = {}
+    sort_order: int = 0
+    is_featured: bool = False
+    is_active: bool = True
+    subscribers: int = 0
     prices: list[PlanPrice]

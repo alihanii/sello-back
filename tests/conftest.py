@@ -14,6 +14,11 @@ import httpx  # noqa: E402
 from app.services import ai as _ai  # noqa: E402
 
 _ai.BUSY_RETRY_DELAYS = (0.0, 0.0)
+from app.services import plans as _plans  # noqa: E402
+
+# Tests make many AI calls as trial sellers; the monthly credit cap has its own test (test_plans.py).
+_plans.FREE_LIMITS["monthly_ai_credits"] = 10**6
+_plans.FREE_LIMITS["ai_images"] = True
 import pytest  # noqa: E402
 
 from app.main import app  # noqa: E402

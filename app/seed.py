@@ -1,29 +1,30 @@
-"""Creates the single Sello plan (1/3/12-month prices) on a fresh install; the admin edits it."""
+"""Sets up the default plan (1/3/12-month prices) once; the admin edits it, and can add plans, afterwards.
 
-from sqlalchemy import func, select
+On a database that already has the default plan, its prices, limits and features are moved to the current
+defaults once (subscriptions already bought keep their dates)."""
+
+from sqlalchemy import select
 
 from app.core.db import SessionLocal
-from app.models import Plan
-from app.services.plans import PLAN_TIER
+from app.models import AppSetting, Plan
+from app.services.plans import DEFAULT_TIERS, tier_plans
 
-FEATURES = ["۳ فروشگاه", "۸ کانال (تلگرام، بله، دیجی‌کالا، اینستاگرام)", "۲٬۰۰۰ محصول", "۳٬۰۰۰ انتشار در ماه",
-            "کرال ساعتی", "۵۰۰ اعتبار AI در ماه", "ساخت محصول با AI",
-            "دستیار چت فروش: ۵٬۰۰۰ پیام AI در ماه"]
-LIMITS = {"max_stores": 3, "max_channels": 8, "max_products": 2000, "monthly_publishes": 3000,
-          "monthly_ai_credits": 500, "crawl_frequency": "hourly",
-          "monthly_chat_messages": 5000}
-MONTHLY = 990_000
-DURATIONS = [(1, 0), (3, 10), (12, 25)]  # months, discount %
+SEEDED_KEY = "plans:v2_seeded"
 
 
 async def seed() -> None:
     async with SessionLocal() as db:
-        if await db.scalar(select(func.count()).select_from(Plan)):
+        if await db.get(AppSetting, SEEDED_KEY):
             return
-        for months, discount in DURATIONS:
-            full = MONTHLY * months
-            db.add(Plan(name="Sello", tier=PLAN_TIER, duration_months=months,
-                        price_toman=int(round(full * (100 - discount) / 100, -4)), compare_at_toman=full if discount else 0,
-                        description="همهٔ امکانات Sello؛ فقط مدت اشتراک فرق می‌کند.", features=FEATURES, limits=LIMITS,
-                        is_featured=months == 12))
+        for t in DEFAULT_TIERS:
+            current = {p.duration_months: p for p in (await db.execute(select(Plan).where(Plan.tier == t["tier"]))).scalars()}
+            for new in tier_plans(t):
+                old = current.get(new.duration_months)
+                if not old:
+                    db.add(new)
+                    continue
+                for k in ("name", "price_toman", "compare_at_toman", "description", "features", "limits", "is_featured",
+                          "sort_order"):
+                    setattr(old, k, getattr(new, k))
+        db.add(AppSetting(key=SEEDED_KEY, value={"tiers": [t["tier"] for t in DEFAULT_TIERS]}))
         await db.commit()

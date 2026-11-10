@@ -90,7 +90,7 @@ async def _channel(db, user, store_id: int, body: ConnectIn) -> Channel:
         if not ch or ch.store_id != store_id:
             raise HTTPException(404, "کانال پیدا نشد.")
         return ch
-    await check_limit(db, user, "channels")
+    await check_limit(db, user, "channels", store_id=store_id, platform=body.platform)
     ch = Channel(store_id=store_id, platform=body.platform, status="disconnected", config={})
     db.add(ch)
     await db.flush()

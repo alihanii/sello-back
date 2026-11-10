@@ -111,10 +111,10 @@ async def test_admin_plans_and_ai_keys(client, monkeypatch):
     plans = (await client.get("/plans")).json()
     assert {p["duration_months"] for p in plans} == {1, 3, 12}
     assert len({p["tier"] for p in plans}) == 1  # one plan, three billing periods
-    cfg = (await client.get("/admin/plan-config", headers=admin)).json()
+    cfg = (await client.get("/admin/plan-tiers", headers=admin)).json()[0]
     cfg["prices"][1]["price_toman"] = 2_500_000
     cfg["limits"]["max_stores"] = 3
-    assert (await client.put("/admin/plan-config", headers=admin, json=cfg)).status_code == 200
+    assert (await client.put(f"/admin/plan-tiers/{cfg['tier']}", headers=admin, json=cfg)).status_code == 200
     pro3 = next(p for p in (await client.get("/plans")).json() if p["duration_months"] == 3)
     assert pro3["price_toman"] == 2_500_000
     assert (await client.post("/plan-requests", headers=seller, json={"plan_id": pro3["id"]})).status_code == 200

@@ -22,8 +22,11 @@ from app.services.integrations import (
     INSTAGRAM_SCOPES, instagram_app, instagram_crawler, payment_config, save_instagram_app, save_instagram_crawler,
     save_payment_config,
 )
-from app.services.plans import PLAN_TIER, create_subscription, plan_config
-from app.schemas import ChannelOut, PlanConfig, PlanOut, StoreOut, UserOut
+from app.services.plans import (
+    DURATIONS, FLAG_KEYS, LIMIT_KEYS, all_tiers, chat_used, create_subscription, credits_used, free_limits, limits_for, plan_status,
+    save_free_limits, tier_config,
+)
+from app.schemas import ChannelOut, PlanOut, PlanTier, StoreOut, UserOut
 from app.services.ai import DEFAULT_BASE_URLS, AIError, check_model, list_models, metis_family, model_kind, provider_proxy, test_provider
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -73,8 +76,10 @@ async def users(admin: AdminUser, db: DB, q: str = ""):
     for u in rows:
         s = subs.get(u.id)
         plan = await db.get(Plan, s.plan_id) if s else None
+        status = "admin" if u.role == "admin" else "blocked" if not u.is_active else "active" if s else None
         out.append({**UserOut.model_validate(u).model_dump(), "is_active": u.is_active, "stores": stores.get(u.id, 0),
-                    "plan": plan.name if plan else None, "plan_ends_at": s.ends_at if s else None})
+                    "plan": plan.name if plan else None, "plan_tier": plan.tier if plan else None,
+                    "plan_ends_at": s.ends_at if s else None, "plan_status": status or await plan_status(db, u)})
     return out
 
 
@@ -96,29 +101,40 @@ async def user_detail(user_id: int, admin: AdminUser, db: DB):
     sub_rows = []
     for s in subs:
         p = await db.get(Plan, s.plan_id)
-        sub_rows.append({"id": s.id, "plan": p.name if p else "?", "duration_months": p.duration_months if p else None,
+        sub_rows.append({"id": s.id, "plan": p.name if p else "?", "plan_id": s.plan_id, "tier": p.tier if p else "",
+                         "duration_months": p.duration_months if p else None,
                          "status": s.status, "starts_at": s.starts_at, "ends_at": s.ends_at, "activated_by": s.activated_by,
                          "note": s.note})
     features = {}
     for key, label in FEATURES.items():
         acc = await feature_access(db, key)
         features[key] = {"label": label, "mode": acc["mode"], "selected": u.id in acc["user_ids"], "allowed": allowed(acc, u)}
+    limits = await limits_for(db, u)
+    usage = {"chat_messages": await chat_used(db, u.id), "ai_credits": await credits_used(db, u.id),
+             "stores": sum(1 for s in stores if not s.archived), "products": sum(r["products"] for r in store_rows),
+             "channels": sum(len(r["channels"]) for r in store_rows)}
     return {"user": {**UserOut.model_validate(u).model_dump(), "is_active": u.is_active}, "stores": store_rows,
-            "subscriptions": sub_rows, "features": features}
+            "subscriptions": sub_rows, "features": features, "plan_status": await plan_status(db, u),
+            "limits": limits, "usage": usage}
 
 
 class ActivateIn(BaseModel):
     plan_id: int
     starts_at: datetime | None = None
     note: str = ""
+    # "after": starts when the current plan ends (renewal); "now": ends the current plan and starts this one today.
+    mode: str = "after"
 
 
-async def _activate(db, admin: User, user_id: int, plan_id: int, starts_at: datetime | None, note: str) -> Subscription:
+async def _activate(db, admin: User, user_id: int, plan_id: int, starts_at: datetime | None, note: str,
+                    replace: bool = False) -> Subscription:
     plan = await db.get(Plan, plan_id)
     if not plan:
         raise HTTPException(404, "پلن پیدا نشد.")
-    sub = await create_subscription(db, user_id, plan, activated_by=f"admin:{admin.id}", note=note, starts_at=starts_at)
-    audit(db, admin, "activate_plan", "user", user_id, {"plan_id": plan.id, "starts_at": sub.starts_at.isoformat()})
+    sub = await create_subscription(db, user_id, plan, activated_by=f"admin:{admin.id}", note=note, starts_at=starts_at,
+                                    replace=replace)
+    audit(db, admin, "change_plan" if replace else "activate_plan", "user", user_id,
+          {"plan_id": plan.id, "starts_at": sub.starts_at.isoformat()})
     return sub
 
 
@@ -126,7 +142,9 @@ async def _activate(db, admin: User, user_id: int, plan_id: int, starts_at: date
 async def activate(user_id: int, body: ActivateIn, admin: AdminUser, db: DB):
     if not await db.get(User, user_id):
         raise HTTPException(404, "کاربر پیدا نشد.")
-    sub = await _activate(db, admin, user_id, body.plan_id, body.starts_at, body.note)
+    if body.mode not in ("after", "now"):
+        raise HTTPException(422, "حالت نامعتبر است.")
+    sub = await _activate(db, admin, user_id, body.plan_id, body.starts_at, body.note, replace=body.mode == "now")
     await db.commit()
     return {"ok": True, "ends_at": sub.ends_at}
 
@@ -263,29 +281,95 @@ async def list_plans(admin: AdminUser, db: DB):
     return (await db.execute(select(Plan).order_by(Plan.sort_order, Plan.duration_months))).scalars().all()
 
 
-# Sello sells one plan; only the billing period (1/3/12 months) and its price differ.
-@router.get("/plan-config", response_model=PlanConfig)
-async def get_plan_config(admin: AdminUser, db: DB):
-    return await plan_config(db)
+@router.get("/plan-tiers", response_model=list[PlanTier])
+async def get_tiers(admin: AdminUser, db: DB):
+    return await all_tiers(db)
 
 
-@router.put("/plan-config", response_model=PlanConfig)
-async def put_plan_config(body: PlanConfig, admin: AdminUser, db: DB):
-    if sorted(p.duration_months for p in body.prices) != [1, 3, 12]:
+def _clean_limits(limits: dict) -> dict:
+    out: dict[str, Any] = {k: max(0, int(limits.get(k) or 0)) for k in LIMIT_KEYS}
+    out.update({k: bool(limits.get(k)) for k in FLAG_KEYS})
+    return out
+
+
+@router.put("/plan-tiers/{tier}", response_model=PlanTier)
+async def put_tier(tier: str, body: PlanTier, admin: AdminUser, db: DB):
+    """Creates or edits one plan: its name, features and limits, and a price per billing period."""
+    tier = tier.strip()[:40]
+    if not tier or not body.name.strip():
+        raise HTTPException(422, "نام پلن لازم است.")
+    if sorted(p.duration_months for p in body.prices) != list(DURATIONS):
         raise HTTPException(422, "قیمت هر سه مدت ۱، ۳ و ۱۲ ماهه لازم است.")
-    current = {p.duration_months: p for p in (await db.execute(select(Plan).where(Plan.tier == PLAN_TIER))).scalars()}
+    if any(p.price_toman < 0 or p.compare_at_toman < 0 for p in body.prices):
+        raise HTTPException(422, "قیمت نمی‌تواند منفی باشد.")
+    if body.is_featured:  # one highlighted plan on the pricing page
+        for p in (await db.execute(select(Plan).where(Plan.tier != tier, Plan.is_featured.is_(True)))).scalars():
+            p.is_featured = False
+    current = {p.duration_months: p for p in (await db.execute(select(Plan).where(Plan.tier == tier))).scalars()}
+    features = [f.strip() for f in body.features if f.strip()]
     for price in body.prices:
-        p = current.get(price.duration_months) or Plan(tier=PLAN_TIER, duration_months=price.duration_months)
-        p.name, p.description, p.features, p.limits = body.name, body.description, body.features, body.limits
+        p = current.get(price.duration_months) or Plan(tier=tier, duration_months=price.duration_months)
+        limits = _clean_limits(body.limits)
+        if price.max_stores is not None:  # e.g. the yearly plan allows a second store
+            limits["max_stores"] = max(0, price.max_stores)
+        p.name, p.description, p.features, p.limits = body.name.strip(), body.description.strip(), features, limits
         p.price_toman, p.compare_at_toman, p.is_active = price.price_toman, price.compare_at_toman, price.is_active
-        p.sort_order, p.is_featured = 0, price.duration_months == 12
+        p.sort_order, p.is_featured = body.sort_order, body.is_featured
         db.add(p)
-    # Older multi-tier plans stay for existing subscriptions but are no longer sold.
-    for p in (await db.execute(select(Plan).where(Plan.tier != PLAN_TIER, Plan.is_active.is_(True)))).scalars():
-        p.is_active = False
-    audit(db, admin, "update_plan", "plan", None, body.model_dump())
+    audit(db, admin, "update_plan", "plan", None, {"tier": tier, **body.model_dump(exclude={"subscribers"})})
     await db.commit()
-    return await plan_config(db)
+    return await tier_config(db, tier)
+
+
+class TierActiveIn(BaseModel):
+    is_active: bool
+
+
+@router.post("/plan-tiers/{tier}/active", response_model=PlanTier)
+async def set_tier_active(tier: str, body: TierActiveIn, admin: AdminUser, db: DB):
+    """Stops or resumes selling a plan (all its periods). People already on it keep it until it ends."""
+    rows = (await db.execute(select(Plan).where(Plan.tier == tier))).scalars().all()
+    if not rows:
+        raise HTTPException(404, "پلن پیدا نشد.")
+    for p in rows:
+        p.is_active = body.is_active
+    audit(db, admin, "set_plan_active", "plan", None, {"tier": tier, "is_active": body.is_active})
+    await db.commit()
+    return await tier_config(db, tier)
+
+
+@router.delete("/plan-tiers/{tier}")
+async def delete_tier(tier: str, admin: AdminUser, db: DB):
+    rows = (await db.execute(select(Plan).where(Plan.tier == tier))).scalars().all()
+    if not rows:
+        raise HTTPException(404, "پلن پیدا نشد.")
+    ids = [p.id for p in rows]
+    used = any([await db.scalar(select(m.id).where(m.plan_id.in_(ids)).limit(1)) for m in (Subscription, PlanRequest, Payment)])
+    if used:
+        raise HTTPException(409, "این پلن خریدار یا سابقه دارد و حذف نمی‌شود؛ به‌جایش فروشش را خاموش کنید.")
+    for p in rows:
+        await db.delete(p)
+    audit(db, admin, "delete_plan", "plan", None, {"tier": tier})
+    await db.commit()
+    return {"ok": True}
+
+
+class FreeLimitsIn(BaseModel):
+    limits: dict[str, Any]
+
+
+@router.get("/free-limits")
+async def get_free_limits(admin: AdminUser, db: DB):
+    return {"limits": await free_limits(db)}
+
+
+@router.put("/free-limits")
+async def put_free_limits(body: FreeLimitsIn, admin: AdminUser, db: DB):
+    """Limits for sellers who never bought a plan (trial). After a plan ends no AI runs, whatever these say."""
+    limits = await save_free_limits(db, _clean_limits(body.limits))
+    audit(db, admin, "update_free_limits", "plan", None, limits)
+    await db.commit()
+    return {"limits": limits}
 
 
 class InstagramAppIn(BaseModel):
