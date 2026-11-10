@@ -2120,3 +2120,40 @@ async def test_common_questions_answer_from_faq_settings_or_tell_the_seller(clie
     keys = [s["key"] for s in (await client.get(f"/stores/{sid}/chat/faq/suggested", headers=h)).json()["items"]]
     assert "shipping_cost" not in keys and "returns" in keys
     assert chat_common.match("سلام هودی مشکی دارید؟") is None
+
+
+async def test_sizes_and_colours_from_the_description(client):
+    from app.models import Product
+    p = Product(title="هودی چاپ دلخواه (طرح شما)", price=2000000, attributes={}, stock_qty=50,
+                description="هودی با طرح دلخواه شما. رنگ‌ها: مشکی، سفید، طوسی. سایزها: S، M، L، XL، 2XL.")
+    opts = chat_engine.variant_options(p)
+    assert opts["size"] == ["S", "M", "L", "XL", "2XL"] and opts["color"] == ["مشکی", "سفید", "طوسی"]
+    card = chat_engine.product_card(p, full=False)
+    assert "سایز: S، M، L، XL، 2XL" in card and "رنگ: مشکی" in card
+    # Attributes still win.
+    p.attributes = {"سایز": "۳۸ تا ۴۴"}
+    assert chat_engine.variant_options(p)["size"] == ["۳۸ تا ۴۴"]
+
+
+async def test_design_after_asking_for_a_custom_print_goes_on_the_print_product(client, monkeypatch):
+    from app.core.db import SessionLocal
+    from app.models import Product
+    h, sid, *_ = await _setup(client, monkeypatch, "09125550990")
+    spider = (await client.post(f"/stores/{sid}/products", headers=h, json={
+        "title": "ست هودی اسپایدرمن", "price": 900000, "stock_qty": 2})).json()
+    printed = (await client.post(f"/stores/{sid}/products", headers=h, json={
+        "title": "هودی چاپ دلخواه (طرح شما)", "price": 2000000, "stock_qty": 50, "category": "هودی"})).json()
+    conv_id = await _real_conv(sid)
+    async with SessionLocal() as db:
+        conv = await db.get(chat_engine.ChatConversation, conv_id)
+        store = await db.get(chat_engine.Store, sid)
+        rt.add_message(db, conv, role="customer", text="هودی با طرح دلخواه چاپ میکنی؟")
+        await db.commit()
+        seen = {"kind": "product", "description": "اسپایدرمن قرمز", "product_id": spider["id"]}
+        got = await chat_engine.as_print_design(db, conv, store, seen, "این")
+        assert got["kind"] == "design" and got["product_id"] == printed["id"] and "custom print" in got["note"]
+        # Without the ask, a product photo stays that product.
+        other = await _real_conv(sid)
+        c2 = await db.get(chat_engine.ChatConversation, other)
+        assert (await chat_engine.as_print_design(db, c2, store, seen, "اینو دارین؟")) == seen
+        assert await db.get(Product, printed["id"])

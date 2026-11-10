@@ -19,6 +19,7 @@ from app.platforms.base import PlatformError
 from app.services import chat_messenger as tg
 from app.services.chat_engine import Reply, _aware, get_agent, run_turn
 from app.services.media import read_local, save_bytes
+from app.services import live
 from app.services.notify import notify
 
 log = logging.getLogger("sello.chat")
@@ -149,6 +150,7 @@ def add_message(db: AsyncSession, conv: ChatConversation, *, role: str, text: st
                     latency_ms=usage.get("latency_ms", 0), external_id=external_id, is_test=conv.is_test,
                     buttons=buttons or None)
     db.add(m)
+    live.mark(db.sync_session, conv.id)  # a web chat page waiting on this conversation hears about it on commit
     conv.message_count = (conv.message_count or 0) + 1
     conv.last_message_at = m.created_at
     conv.last_message_text = (text or ("[عکس]" if image_url else ""))[:300]

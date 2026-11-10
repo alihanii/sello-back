@@ -280,6 +280,12 @@ def product_card(p: Product, photos: int = 0, exact_stock: bool = True, full: bo
     if not full:
         items = [kv for kv in items if _VARIANT_KEY.search(str(kv[0]))][:2]
     attrs = "، ".join(f"{k}: {str(v)[:80]}" for k, v in items[:6])
+    # Sizes and colours that only the description lists, so every product line still shows them.
+    have = " ".join(str(k) for k, _ in items)
+    for kind, label, rx in (("size", "سایز", _SIZE_KEY), ("color", "رنگ", _COLOR_KEY)):
+        opts = variant_options(p).get(kind)
+        if opts and not rx.search(have):
+            attrs = (attrs + "، " if attrs else "") + f"{label}: {'، '.join(opts)[:80]}"
     # With "available only" the number never reaches the model, so it cannot say it.
     stock = ("ناموجود" if p.stock_qty <= 0 else f"موجودی {p.stock_qty}" if exact_stock else "موجود")
     desc = re.sub(r"\s+", " ", p.description or "")[:160] if full else ""
@@ -1426,8 +1432,9 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                 result.replies.append(Reply(PHOTO_TEXT, source="canned"))
                 return done()
         else:
+            seen = await as_print_design(db, conv, store, seen, text)
             text = (text + "\n" if text else "") + photo_line(seen)
-        if agent.orders_enabled and not image_fields and not (seen and seen["kind"] == "receipt"):
+        if not image_fields and not (seen and seen["kind"] == "receipt"):
             # Kept for the next print-product line (or one still without its design): "print this one".
             state["pending_design"] = photo
     found: list[int] = []
@@ -1643,7 +1650,7 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         if placed and placed.extras:
             order["extras"] = {**placed.extras, **(order.get("extras") or {})}
         state["order"] = order
-    if agent.orders_enabled and order.get("items") and state.get("pending_design"):
+    if order.get("items") and state.get("pending_design"):
         for it in order["items"]:
             p = await db.get(Product, it.get("product_id") or 0) if it.get("product_id") else None
             if p and takes_design(p) and not it.get("design"):
@@ -1784,6 +1791,36 @@ async def read_photo(db: AsyncSession, store: Store, agent: ChatAgent, url: str,
     pid = int(out["product_id"]) if str(out.get("product_id") or "").isdigit() else 0
     return {"kind": kind if kind in ("product", "design", "receipt", "other") else "other", "description": desc,
             "product_id": pid if any(p.id == pid for p in rows) else 0}
+
+
+_PRINT_ASK = re.compile(r"(چاپ|طرح\s*(دلخواه|خودم|خودمو|خودم\s*رو|شخصی|اختصاصی)|سفارشی)")
+
+
+async def as_print_design(db: AsyncSession, conv: ChatConversation, store: Store, seen: dict[str, Any],
+                          text: str) -> dict[str, Any]:
+    """"Do you print my own design?" then a picture (say, of Spider-Man): it is their design for the shop's print
+    product, not the ready-made Spider-Man hoodie it looks like."""
+    if seen["kind"] not in ("product", "design", "other"):
+        return seen
+    asked = [text] + list((await db.execute(select(ChatMessage.text).where(
+        ChatMessage.conversation_id == conv.id, ChatMessage.role == "customer")
+        .order_by(ChatMessage.id.desc()).limit(4))).scalars().all())
+    if not any(_PRINT_ASK.search(t or "") for t in asked):
+        return seen
+    prints = [p for p in await catalog_rows(db, store.id) if takes_design(p)]
+    if not prints:
+        return seen
+    target = next((p for p in prints if p.id == seen.get("product_id")), None) or max(
+        prints, key=lambda p: (_overlap(words(" ".join(asked)), words(f"{p.title} {p.category or ''}")),
+                               p.stock_qty > 0, p.status == "ready"))
+    return {**seen, "kind": "design", "product_id": target.id,
+            "note": f"the customer asked for a custom print: this picture is their design for «{target.title[:60]}», "
+                    "not a ready-made product that looks like it"}
+
+
+def public_media(url: str) -> str:
+    from app.core.config import settings
+    return f"{settings.public_base_url.rstrip('/')}{url}" if url.startswith("/media/") else url
 
 
 def photo_line(seen: dict[str, Any]) -> str:
@@ -2008,8 +2045,12 @@ async def order_handoff(db: AsyncSession, conv: ChatConversation, store: Store, 
     conv.status = "needs_human"
     result.replies.append(Reply(ORDER_HANDOFF_TEXT, source="handoff", intent="order", usage=usage or {}))
     chosen = ("\n" + order_summary(order, lines, total)) if lines else ""
+    designs = [str(it["design"]) for it in order.get("items") or [] if it.get("design")]
+    if state.get("pending_design"):
+        designs.append(str(state.pop("pending_design")))
+    pics = "".join(f"\n🎨 طرح مشتری: {public_media(d)}" for d in designs)
     result.notify_admin.append(f"🛍 {conv.customer_name or 'یک مشتری'} می‌خواهد سفارش بدهد (سفارش‌گیری AI خاموش است؛ "
-                               f"خودت ثبتش کن):{chosen}")
+                               f"خودت ثبتش کن):{chosen}{pics}")
 
 
 _STOCK_COUNT = re.compile(
@@ -2281,7 +2322,17 @@ def variant_options(p: Product) -> dict[str, list[str]]:
                 and all(len(x) <= 4 for x in parts[0].split()):
             parts = parts[0].split()  # "S M L XL"
         out[kind] = [x[:30] for x in parts][:15]
+    # Imports often put the choices only in the description: "رنگ‌ها: مشکی، سفید. سایزها: S، M، L".
+    for kind, rx in (("size", _DESC_SIZES), ("color", _DESC_COLORS)):
+        if kind not in out and (m := rx.search(p.description or "")):
+            parts = [x.strip(" .") for x in re.split(r"[،,/|؛;]|\s+و\s+", m.group(1)) if x.strip(" .")]
+            if len(parts) > 1:
+                out[kind] = [x[:30] for x in parts][:15]
     return out
+
+
+_DESC_SIZES = re.compile(r"(?:سایز|سايز|size)\S*\s*[:：]\s*([^.\n]+)", re.I)
+_DESC_COLORS = re.compile(r"(?:رنگ|color|colour)\S*\s*[:：]\s*([^.\n]+)", re.I)
 
 
 # ---------- editing the order at the summary, in code ----------

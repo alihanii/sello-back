@@ -69,3 +69,40 @@ async def test_chat_link_caps_ai_replies_per_hour(client, monkeypatch):
     r = (await client.post(f"/public/chat/shop{sid}/messages",
                            json={"name": "رضا", "visitor": r["visitor"], "text": "قیمت مانتو؟"})).json()
     assert [m["role"] for m in r["messages"]] == ["customer"] and r["notice"]
+
+
+async def test_chat_link_stream_pushes_new_messages(client, monkeypatch):
+    import asyncio
+    import json
+
+    from app.core.db import SessionLocal
+    from app.models import ChatConversation
+    from app.routers import chat_link
+    from app.services import chat_runtime as rt
+    from app.services import live
+
+    h, sid, _llm, *_ = await _setup(client, monkeypatch, "09125550904")
+    await client.get(f"/stores/{sid}/chat-link", headers=h)
+    r = (await client.post(f"/public/chat/shop{sid}/messages", json={"name": "نگار", "text": "سلام"})).json()
+    visitor, first = r["visitor"], r["messages"][0]["id"]
+    assert (await client.get(f"/public/chat/shop{sid}/stream", params={"visitor": "x" * 20})).status_code == 404
+
+    # A commit with a new message wakes whoever waits on the conversation.
+    async with SessionLocal() as db:
+        conv = (await db.execute(chat_link.select(ChatConversation).where(
+            ChatConversation.external_chat_id == visitor))).scalar_one()
+        with live.watch(conv.id) as woke:
+            rt.add_message(db, conv, role="seller", text="سلام نگار جان")
+            assert not woke.is_set()
+            await db.commit()
+            assert woke.is_set()
+
+    # The stream sends what is new after `after`, pings, and lets go when idle.
+    monkeypatch.setattr(chat_link, "STREAM_PING", 0.05)
+    monkeypatch.setattr(chat_link, "STREAM_IDLE", 0.1)
+    async with client.stream("GET", f"/public/chat/shop{sid}/stream", params={"visitor": visitor, "after": first}) as s:
+        body = await asyncio.wait_for(s.aread(), 5)
+    text = body.decode()
+    sent = json.loads(text.split("data: ", 1)[1].split("\n\n", 1)[0])
+    assert sent[-1]["role"] == "seller" and all(m["id"] > first for m in sent)
+    assert "event: bye" in text
