@@ -15,7 +15,7 @@ async def test_site_settings_catalog_checkout_and_sitemap(client):
 
     s = (await client.get(f"/stores/{sid}/site", headers=h)).json()
     assert not s["enabled"] and s["subdomain"] == "" and s["suggested_subdomain"] == f"shop{sid}"
-    assert s["config"]["palette"]["primary"] == "#28594d" and not s["payment_ready"]
+    assert s["config"]["palette"]["primary"] == "#173d35" and not s["payment_ready"]
 
     for bad in ("Ab", "www", "a_b", "-abc"):
         assert (await client.put(f"/stores/{sid}/site", headers=h, json={"subdomain": bad})).status_code == 422, bad

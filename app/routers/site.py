@@ -47,7 +47,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "title": "",  # shown in the header and as the home page title; empty = the store's name
     "tagline": "",
     "logo_url": "",  # empty = the store's logo
-    "palette": {"preset": "emerald", "primary": "#28594d", "accent": "#c6a66b"},
+    "palette": {"preset": "emerald", "primary": "#173d35", "accent": "#c6a66b"},
     "banners": [],  # [{"image_url", "mobile_image_url", "title", "subtitle", "link", "button"}]
     "about": {"title": "درباره ما", "text": "", "image_url": ""},
     "contact": {"phone": "", "email": "", "address": "", "hours": "", "instagram": "", "telegram": "",
@@ -292,7 +292,7 @@ async def put_site(store_id: int, body: SiteIn, user: CurrentUser, db: DB):
         for k in ("primary", "accent"):
             if k in body.palette:
                 if not HEX_RE.match(body.palette[k] or ""):
-                    raise HTTPException(422, "رنگ باید کد هگز مثل #28594d باشد.")
+                    raise HTTPException(422, "رنگ باید کد هگز مثل #173d35 باشد.")
                 pal[k] = body.palette[k].lower()
         if "preset" in body.palette:
             pal["preset"] = str(body.palette["preset"])[:20]
