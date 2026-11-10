@@ -75,7 +75,8 @@ def run(name, st):
             b = f"   [{' | '.join(sum(m['buttons'] or [], []))}]" if m.get("buttons") else ""
             print(f"🤖 {m['text']}{b}" + (" 🖼" if m.get("image_url") else ""))
     convs = c.get(f"/stores/{sid}/chat/conversations?platform=link", headers=h).json()
-    conv = next(x for x in (convs["items"] if isinstance(convs, dict) else convs))
+    rows = convs["items"] if isinstance(convs, dict) else convs
+    conv = next((x for x in rows if x.get("external_chat_id") == visitor), None) or max(rows, key=lambda x: x["id"])
     d = c.get(f"/chat/conversations/{conv['id']}", headers=h).json()
     tokens = sum(m.get("input_tokens", 0) + m.get("output_tokens", 0) for m in d["messages"])
     print(f"-- state.order: {json.dumps((d['conversation'].get('state') or {}).get('order'), ensure_ascii=False)[:500]}")

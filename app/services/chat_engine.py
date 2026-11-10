@@ -50,6 +50,10 @@ UNSUPPORTED_TEXT = "فعلاً فقط پیام متنی رو می‌تونم ب�
 PHOTO_TEXT = "عکس رسید 🙏 لطفاً اسم یا کد محصولی که می‌خوای رو بنویس تا راهنماییت کنم."
 RECEIPT_TEXT = "✅ اطلاعات پرداخت سفارش #{order} دریافت شد. بعد از بررسی، نتیجه رو همین‌جا خبر می‌دیم 🌸"
 CANCELLED_TEXT = "سفارش لغو شد. اگه چیز دیگه‌ای خواستی در خدمتم 🌸"
+# Slips the small chat models make in colloquial Persian.
+_TYPOS = (("دیه‌ای", "دیگه‌ای"), ("دیه ای", "دیگه‌ای"), ("دیگ‌ای", "دیگه‌ای"))
+CART_CLEARED_TEXT = "باشه، سفارشی ثبت نشده بود؛ سبدت رو خالی کردم 🌸 اگه چیز دیگه‌ای خواستی بگو."
+NOTHING_TO_CANCEL_TEXT = "سفارشی ثبت نکردی که لغو کنم 🌸 اگه چیزی خواستی بگو."
 ORDER_HANDOFF_TEXT = "عالیه 🌸 سفارشت رو به همکارم دادم؛ همین‌جا برای ثبت نهایی، پرداخت و ارسال بهت پیام می‌ده 🙏"
 AI_UNAVAILABLE_TEXT = "پیامت رسید 🙏 همکارم به‌زودی جواب می‌ده."
 ABUSE_TEXT = "لطفاً محترمانه صحبت کنیم 🙏 اگه مشکلی پیش اومده بگو تا پیگیری کنم."
@@ -74,6 +78,7 @@ _PAID = re.compile(r"(پیگیری|رهگیری|پرداخت|واریز|کارت
 _STOPWORDS = set("""از به با در که این آن را و یا برای تا هم یه یک چه چی چند چطور کدوم کدام دارید داری دارین هست است
 هستش چیه چطوره داره دارن دارین میخوام می‌خوام میخواستم می‌خواستم لطفا لطفاً سلام ممنون مرسی قیمت موجود موجوده چنده چقدره اینو اون این‌ها
 اره آره آری بله باشه خب خوب اوکی اکی حله پس اگه اگر خیلی ممنونم
+شما من تو ما او اونا اینا
 the a an is are""".split())
 
 
@@ -810,8 +815,13 @@ def fix_product_id(pid: int, products: list[Product], hint: str) -> int:
 
 async def _merge_order(db: AsyncSession, store_id: int, agent: ChatAgent, state: dict[str, Any],
                        update: dict[str, Any] | None, products: list[Product] | None = None,
-                       hint: str = "", action: str = "update") -> dict[str, Any]:
+                       hint: str = "", action: str = "update", said: str = "") -> dict[str, Any]:
+    """`said`: the customer's own recent words. With a cart already open, a product that is neither in it, nor
+    named by the customer, nor the one just talked about never comes in: the model sometimes re-lists the cart with
+    a wrong id ("my number was wrong" turned the black hoodie into the custom-print one)."""
     order = dict(state.get("order") or {})
+    old_ids = {o.get("product_id") for o in order.get("items") or [] if o.get("product_id")}
+    talked = set((state.get("recent_products") or [])[-2:])
     if not isinstance(update, dict):
         return order
     if isinstance(update.get("items"), list) and update["items"] == [] and action == "update" and order.get("items"):
@@ -832,6 +842,9 @@ async def _merge_order(db: AsyncSession, store_id: int, agent: ChatAgent, state:
             if str(pid or "").isdigit() and products:
                 pid = fix_product_id(int(pid), products, hint)
             p = await db.get(Product, int(pid)) if str(pid or "").isdigit() and int(pid) else None
+            if p and old_ids and said and p.id not in old_ids | talked \
+                    and not _strict_overlap(words(said), words(p.title)):
+                continue
             if p and p.store_id == store_id and p.status != "archived":
                 if (wrong := misfit(p, str(it.get("variant") or ""))):
                     opts = variant_options(p)
@@ -1499,6 +1512,8 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         complaint_handoff(conv, text, result, usage)
         return done()
     reply_text = clean_language(str(out.get("reply") or "").strip(), text, products, store)
+    for typo, right in _TYPOS:
+        reply_text = reply_text.replace(typo, right)
     if not re.search(r"(سلام|درود|salam|hi\b|hello)", text, re.IGNORECASE):
         # "Greet only if greeted": the model still opened every answer with «سلام».
         reply_text = re.sub(r"^(سلام|درود)\s*(و\s*وقت\s*بخیر|دوست\s*من|عزیزم)?\s*[!،,.🌸🙏😊]*\s*", "", reply_text).strip() \
@@ -1566,6 +1581,11 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         if awaiting:
             result.replies.append(Reply(reply_text or CANCELLED_TEXT, source="llm", intent="order", usage=usage))
             return done()
+        if not placed:
+            # Nothing was placed: the cart is emptied (or there was nothing), never "your order was cancelled".
+            result.replies.append(Reply(CART_CLEARED_TEXT if before.get("items") else NOTHING_TO_CANCEL_TEXT,
+                                        source="order", intent="order", usage=usage))
+            return done()
     else:
         # With AI ordering off this is only a note of what they chose, for the admin who takes the order.
         hint = " ".join([text, str(out.get("reply") or "")] + [m.text for m in history if m.role == "customer"][-3:])
@@ -1583,7 +1603,9 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                 out["order"] = {**given, "items": [{"product_id": last, "qty": int(have[0].get("qty") or 1) if have
                                                     else 1, "variant": pick}]}
                 action = "update" if action == "none" else action
-        state["order"] = await _merge_order(db, store.id, agent, state, out.get("order"), products, hint, action)
+        said = " ".join([text] + [m.text for m in history if m.role == "customer"][-3:])
+        state["order"] = await _merge_order(db, store.id, agent, state, out.get("order"), products, hint, action,
+                                            said)
         if not state["order"]:
             state.pop("order")
     order = state.get("order") or {}
@@ -1705,6 +1727,13 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                 and not _ASKS_KNOWN.search(reply.text)):
             # "Do you print your own design?": the answer first, then what the order needs next.
             lead = reply.text.strip() + "\n\n"
+        elif step.stage == "details" and changed:
+            # "مشکی XL پشت": what they just picked is said back, then what's still needed (not only "send your name").
+            had = {(i.get("product_id"), _flat(i.get("variant"))) for i in before.get("items") or []}
+            picked = [str(i.get("variant") or "").strip() for i in order.get("items") or []
+                      if str(i.get("variant") or "").strip() and (i.get("product_id"), _flat(i.get("variant"))) not in had]
+            if picked:
+                lead = f"باشه 👌 ({'؛ '.join(picked)[:120]})\n"
         reply.text, reply.buttons, reply.intent = lead + step.text, step.buttons, "order"
     elif agent.orders_enabled and not order.get("items") and _CLAIMS_PLACED.search(reply.text):
         reply.text = "برای ثبت، اسم محصول و سایز/رنگش رو بگو تا خلاصهٔ سفارش رو برات بفرستم 🌸"
@@ -1996,7 +2025,8 @@ async def items_complete(db: AsyncSession, store_id: int, items: list[dict[str, 
 _CLAIMS_SHIPPING = re.compile(r"(در\s*حال\s*(آماده|اماده|ارسال|پردازش)|آماده\s*‌?(سازی|ی\s*ارسال)|ارسال\s*(شد|کردیم|می\s*‌?شه|میشه)"
                               r"|فرستادیم|پست\s*(شد|کردیم))")
 _ASKS_KNOWN = re.compile(r"(سایز|رنگ|محل\s*چاپ|طرح)[^.!؟?\n]{0,40}?(بفرمایید|بگید|بگو|بفرستید|بفرست|مد\s*نظر|"
-                         r"می\s*‌?خوای|میخوای|می\s*‌?خواید|میخواید|انتخاب\s*کن)")
+                         r"می\s*‌?خوای|میخوای|می\s*‌?خواید|میخواید|می\s*‌?خواهید|میخواهید|می\s*‌?خواین|میخواین|"
+                         r"انتخاب\s*کن)|(کدوم|کدام|چه)\s*(سایز|رنگ)")
 _QUESTION = re.compile(r"[؟?]|چجوری|چطوری|چطوره|چنده|چقدره|چیه|چند\s*(سانت|سانتی)|ابعاد|جدول")
 _WANTS_IT = re.compile(r"(می\s*‌?خوام|میخوام|بردار|برمی\s*‌?دارم|ثبت|سفارش|بفرست\s*برام|بگیرم|می\s*‌?گیرم|میگیرم)")
 _CLAIMS_PLACED = re.compile(r"(ثبت\s*(شد|کردم|کردیم|گردید|می\s*‌?کنم|میکنم|می\s*‌?کنیم)|سفارش(ت|تون)?\s*(رو\s*)?(ثبت|گذاشتم|زدم)|در\s*نظر\s*گرفتم|"

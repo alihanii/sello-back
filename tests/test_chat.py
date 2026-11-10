@@ -2157,3 +2157,45 @@ async def test_design_after_asking_for_a_custom_print_goes_on_the_print_product(
         c2 = await db.get(chat_engine.ChatConversation, other)
         assert (await chat_engine.as_print_design(db, c2, store, seen, "اینو دارین؟")) == seen
         assert await db.get(Product, printed["id"])
+
+
+async def test_live_model_slips_with_a_real_chat(client, monkeypatch):
+    """From a run on gemini-2.5-flash-lite: a phone fix at the summary turned the cart into another product, the mug
+    got "which size or colour?", and "cancel it" with nothing placed said the order was cancelled."""
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550991")
+    printed = (await client.post(f"/stores/{sid}/products", headers=h, json={
+        "title": "هودی چاپ دلخواه (طرح شما)", "price": 2000000, "stock_qty": 50,
+        "description": "رنگ‌ها: مشکی، سفید، طوسی"})).json()
+    mug = (await client.post(f"/stores/{sid}/products", headers=h, json={
+        "title": "ماگ سرامیکی", "price": 250000, "stock_qty": 9})).json()
+    r = await _order_ready(client, h, sid, llm, p1)
+    assert "خلاصهٔ سفارشت" in r["messages"][-1]["text"]
+
+    async def say(text):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
+
+    # The model re-lists the cart with the wrong id while fixing the phone: the cart stays, the phone changes.
+    llm.answers = [{"reply": "", "intent": "order", "order_action": "update", "order": {
+        "items": [{"product_id": printed["id"], "qty": 1}], "phone": "09171234568"}}]
+    m = await say("شماره‌ام اشتباه شد 09171234568 درستشه")
+    assert "خلاصهٔ سفارشت" in m["text"] and "مانتو لینن کرم" in m["text"] and "چاپ دلخواه" not in m["text"]
+    assert "09171234568" in m["text"]
+
+    # A mug added: no "which size or colour" for a product without any.
+    llm.answers = [{"reply": "چشم، ماگ هم اضافه شد. کدوم سایز یا رنگ رو می‌خواهید؟", "intent": "order",
+                    "order_action": "update", "order": {"items": [{"product_id": p1["id"], "qty": 1, "variant": "L"},
+                                                                  {"product_id": mug["id"], "qty": 1}]}}]
+    m = await say("یه ماگ هم اضافه کن")
+    assert "ماگ سرامیکی" in m["text"] and "سایز یا رنگ" not in m["text"]
+
+    # "Cancel it" before anything was placed: the cart is emptied, not "your order was cancelled".
+    await client.post(f"/stores/{sid}/chat/test", headers=h, json={"reset": True})
+    await say("سلام")
+    llm.answers = [{"reply": "", "intent": "order", "order_action": "update",
+                    "order": {"items": [{"product_id": mug["id"], "qty": 1}]}}]
+    await say("یه ماگ میخوام")
+    llm.answers = [{"reply": "سفارشتون کنسل شد.", "intent": "order", "order_action": "cancel"}]
+    m = await say("کنسلش کن")
+    assert m["text"] == chat_engine.CART_CLEARED_TEXT
+    llm.answers = [{"reply": "سفارشتون کنسل شد.", "intent": "order", "order_action": "cancel"}]
+    assert (await say("کنسل")) ["text"] == chat_engine.NOTHING_TO_CANCEL_TEXT
