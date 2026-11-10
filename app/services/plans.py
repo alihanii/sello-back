@@ -14,13 +14,13 @@ PLAN_TIER = "sello"  # the default plan
 DURATIONS = (1, 3, 12)
 DISCOUNTS = {1: 0, 3: 10, 12: 25}  # % off the monthly price, for new tiers
 
-LIMIT_KEYS = ("max_stores", "max_channels_per_platform", "max_products", "monthly_publishes", "monthly_ai_credits",
-              "monthly_chat_messages")
+# Publishing and crawling have no cap.
+LIMIT_KEYS = ("max_stores", "max_channels_per_platform", "max_products", "monthly_ai_credits", "monthly_chat_messages")
 FLAG_KEYS = ("ai_images",)  # on/off features of a plan
 
 # Limits for users who never had a plan (trial). The admin edits them (app setting `plan:free`).
 FREE_LIMITS = {"max_stores": 1, "max_channels_per_platform": 2, "max_products": 30, "monthly_ai_credits": 30,
-               "monthly_publishes": 50, "monthly_chat_messages": 100, "ai_images": False}
+               "monthly_chat_messages": 100, "ai_images": False}
 FREE_KEY = "plan:free"
 # Limits added after a plan was saved: a paid plan without the key gets this instead of the free value.
 PAID_DEFAULTS = {"monthly_chat_messages": 5000, "max_channels_per_platform": 2}
@@ -40,11 +40,11 @@ IMAGE_TASKS = {"image_edit", "image_prompt"}
 DEFAULT_TIERS = [
     {"tier": PLAN_TIER, "name": "فروشیفای", "monthly": 790_000, "sort_order": 1, "is_featured": False,
      "description": "همهٔ امکانات؛ فقط مدت اشتراک فرق می‌کند.",
-     "limits": {"max_stores": 1, "max_channels_per_platform": 2, "max_products": 1500, "monthly_publishes": 2000,
+     "limits": {"max_stores": 1, "max_channels_per_platform": 2, "max_products": 1500,
                 "monthly_ai_credits": 100, "monthly_chat_messages": 2000, "ai_images": False},
      "store_by_months": {12: 2},  # the yearly plan can make a second store
      "features": ["۱ فروشگاه (اشتراک یک‌ساله: ۲ فروشگاه)", "از هر پلتفرم ۲ کانال (تلگرام، بله، دیجی‌کالا، اینستاگرام)",
-                  "۱٬۵۰۰ محصول", "کرال نامحدود", "ساخت ۱۰۰ محصول با AI از عکس در ماه",
+                  "۱٬۵۰۰ محصول", "انتشار و کرال نامحدود", "ساخت ۱۰۰ محصول با AI از عکس در ماه",
                   "دستیار چت فروش: ۲٬۰۰۰ جواب AI در ماه"]},
 ]
 
