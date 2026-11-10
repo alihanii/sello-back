@@ -581,8 +581,9 @@ async def checkout(key: str, body: CheckoutIn, request: Request, db: DB):
         platform="site", customer_name=body.name.strip(), customer_phone=phone, customer_address=address,
         items=[{k: ln[k] for k in ("product_id", "title", "variant", "qty", "unit_price", "image_url")}
                for ln in q["items"]],
-        discount_toman=0, shipping_toman=q["shipping_toman"], note=conf.get("note") or "",
-        payer_note=body.note.strip(), status="awaiting_payment", submitted_at=utcnow(),
+        # The customer's own note goes where the seller reads it on the order card.
+        discount_toman=0, shipping_toman=q["shipping_toman"], note=body.note.strip(), status="awaiting_payment",
+        submitted_at=utcnow(),
         expires_at=utcnow() + timedelta(hours=hours) if hours else None,
     )
     _totals(inv)
