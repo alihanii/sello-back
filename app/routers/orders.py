@@ -29,7 +29,7 @@ from app.services.ops import record_event
 router = APIRouter(tags=["orders"])
 
 STATUSES = ("awaiting_payment", "payment_submitted", "confirmed", "rejected", "cancelled")
-PLATFORMS = ("instagram", "telegram", "bale", "whatsapp", "rubika", "eitaa", "divar", "phone", "in_person", "site", "other")
+PLATFORMS = ("instagram", "telegram", "bale", "whatsapp", "rubika", "eitaa", "divar", "phone", "in_person", "site", "link", "other")
 SOURCE_EVENT = {"invoice": "sale_invoice_toman", "chat": "sale_chat_toman", "site": "sale_site_toman"}
 # Sources stored as Invoices: the seller's invoice links, chat orders logged by hand, and orders from the store's website.
 INVOICE_SOURCES = ("invoice", "chat", "site")

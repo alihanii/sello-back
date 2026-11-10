@@ -239,6 +239,13 @@ async def answer(conv_id: int, *, send: bool = True) -> list[ChatMessage]:
             if result.notify_admin:
                 await notify_admin_chat(bot, "\n".join(result.notify_admin), conv)
             await db.commit()
+        elif not conv.is_test and not conv.bot_id and result.notify_admin:
+            # A web chat (the chat link or the site widget) has no bot of its own: the seller still hears about orders
+            # and handoffs in the admin chat of the store's Telegram / Bale bot, when one is linked.
+            bot = (await db.execute(select(ChatBot).where(
+                ChatBot.store_id == conv.store_id, ChatBot.admin_chat_id != "", ChatBot.status != "disconnected")
+                .order_by(ChatBot.id).limit(1))).scalar_one_or_none()
+            await notify_admin_chat(bot, "\n".join(result.notify_admin), conv)
         return saved
 
 
