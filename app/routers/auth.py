@@ -13,6 +13,7 @@ from app.core.security import create_access_token, hash_code
 from app.deps import DB, CurrentUser
 from app.models import OtpCode, User
 from app.schemas import UserOut
+from app.services.features import user_features
 from app.services.text import to_en_digits
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -90,9 +91,10 @@ class ProfileIn(BaseModel):
     onboarded: bool | None = None
 
 
-@router.get("/me", response_model=UserOut)
-async def me(user: CurrentUser):
-    return user
+@router.get("/me")
+async def me(user: CurrentUser, db: DB):
+    # features: what the admin has opened to this user (admin panel › قابلیت‌ها), so the panel shows only those.
+    return {**UserOut.model_validate(user).model_dump(), "features": await user_features(db, user)}
 
 
 @router.patch("/me", response_model=UserOut)
