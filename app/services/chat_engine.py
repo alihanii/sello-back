@@ -937,13 +937,16 @@ _SEE_MINE = re.compile(r"(طرحم|طرح\s*(من|خودم)|طرحی\s*که\s*(�
                        r"(عکس|تصویر)\S*\s*(سفارش|سبد|خرید)\S*|(سفارشم|سبدم|سبد\s*خریدم|خریدم)\S*\s*(رو|را)?\s*"
                        r"(ببینم|بیینم|نشون))")
 _CHANGE_ASK = re.compile(r"(عوض|تغییر|حذف|جدید|دیگه|دیگر|اضافه|کنسل|لغو)")
+_SEE_VERB = re.compile(r"(ببینم|بیینم|ببینمش|ببینیم|نشونم|نشون\s*(بده|بدین|بدید)|نشان\s*(بده|بدهید)|بفرست\s*ببینم)")
+_DESIGN_WORD = re.compile(r"طرح(م|ی\s*که|\s*(رو|را|من|خودم|و\s)|\s*$)")  # "طرح رو", not "طرح ونگوگ"
+_MY_ORDER_WORD = re.compile(r"(سفارش|سبد)\S*")
 
 
 async def my_pictures(db: AsyncSession, conv: ChatConversation, store: Store, state: dict[str, Any],
                       text: str) -> list[Reply]:
     """"What's my design? / let me see my order": the design each line carries and the product's photo, from the cart,
     else the latest order of this chat. Empty when the message isn't that ask or there is nothing to show."""
-    if not _SEE_MINE.search(text) or _CHANGE_ASK.search(text):
+    if _CHANGE_ASK.search(text) or not (_SEE_MINE.search(text) or _SEE_VERB.search(text)):
         return []
     items = (state.get("order") or {}).get("items") or []
     placed = None
@@ -952,6 +955,19 @@ async def my_pictures(db: AsyncSession, conv: ChatConversation, store: Store, st
         items = list(placed.items or []) if placed else []
     if not items:
         return []
+    if not _SEE_MINE.search(text):
+        # "ببینم طرح رو و هودی رو" / "طرحی که برات دادم رو ببینم" at the summary: "the design" with a design in the
+        # cart, or the cart's own product named, is their order, not a browse of the catalog.
+        said = words(text)
+        titles = []
+        for it in items:
+            p = await db.get(Product, it.get("product_id") or 0) if it.get("product_id") else None
+            titles.append(p.title if p else str(it.get("title") or ""))
+        mine = ((_DESIGN_WORD.search(text) and any(it.get("design") for it in items))
+                or (state.get("awaiting") == "confirm" and any(_overlap(said, words(t)) for t in titles))
+                or _MY_ORDER_WORD.search(text))
+        if not mine:
+            return []
     out: list[Reply] = []
     for it in items[:MAX_PHOTOS]:
         title = str(it.get("title") or "")
@@ -973,7 +989,13 @@ async def my_pictures(db: AsyncSession, conv: ChatConversation, store: Store, st
                 + f"\nوضعیت سفارش: {STATUS_FA.get(placed.status, placed.status)}")
     else:
         tail = "این‌ها توی سبد خریدت هستن 🛒" + (" و همین طرح چاپ می‌شه." if designs else "")
-    out.append(Reply(tail.strip(), source="canned", intent="order"))
+    buttons = None
+    if not placed and state.get("awaiting") == "confirm":
+        # Still at the summary: the yes is asked again, with its buttons.
+        from app.services import chat_order
+        tail += "\nاگه همه‌چی درسته «بله» رو بزن تا ثبت بشه، یا بگو چی رو عوض کنم."
+        buttons = chat_order.SUMMARY_BUTTONS
+    out.append(Reply(tail.strip(), source="canned", intent="order", buttons=buttons))
     return out
 
 
@@ -1720,7 +1742,9 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         action == "confirm" or claims or (awaiting and changed)
         or (complete and changed and not missing and any(given_contact[k] and given_contact[k] != before.get(k)
                                                          for k in ("name", "phone", "address")))
-        or (complete and not awaiting and bool(_ASKS_KNOWN.search(reply.text))))
+        or (complete and not awaiting and bool(_ASKS_KNOWN.search(reply.text)))
+        # A line just put in still needs its size/colour/side: the shop asks it with buttons, whatever the model said.
+        or (changed and bool(order.get("items")) and not complete and not missing))
     if bad_now and agent.orders_enabled and order.get("items") and "phone" in _missing_fields(agent, order):
         reply.text, reply.intent = ask_missing(agent, state, _missing_fields(agent, order), thanks=False), "order"
         trigger = False
