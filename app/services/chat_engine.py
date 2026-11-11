@@ -1427,6 +1427,7 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         from app.services import chat_router
         skill = await chat_router.route(db, conv, store, agent, state, text)
         if skill and await code_skill(db, conv, store, agent, state, text, skill, result):
+            state.pop("thread", None)
             return done()
 
     # 5. The model reads every message first and decides what it is and how to answer; the code below only carries
@@ -1473,6 +1474,11 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                             policy(agent)["stock"] == "exact", placed, relevant_faqs(agent, text), my_orders)
     if skill:
         prompt += f"\nROUTER: this message is about «{skill}»."
+    if thread := state.pop("thread", None):
+        # Whether this message continues the last one, and what it points at: short answers ("پس M", "دوتا کن")
+        # stay on the product being talked about, and a new subject doesn't drag the old choices along.
+        prompt += ("\nTHREAD: it continues the chat so far" + (f", about «{thread['about']}»" if thread["about"] else "")
+                   + "." if thread["follows"] else "\nTHREAD: a new subject; earlier choices apply only if it names them.")
     if common_hint:
         prompt += common_hint
     try:

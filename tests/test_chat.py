@@ -1780,8 +1780,9 @@ async def test_router_sends_each_message_to_its_skill(client, monkeypatch):
 
     async def router_json(*, task, system, prompt, **kw):
         seen.append({"task": task, "prompt": prompt, "system": system})
-        return {"skill": next_skill.pop(0), "sure": True}
+        return {"skill": next_skill.pop(0), "sure": True, **(thread_answer.pop(0) if thread_answer else {})}
     next_skill: list[str] = []
+    thread_answer: list[dict] = []
     monkeypatch.setattr(chat_router.ai, "generate_json", router_json)
     monkeypatch.setattr(chat_router, "route", REAL_ROUTE)
 
@@ -1812,6 +1813,12 @@ async def test_router_sends_each_message_to_its_skill(client, monkeypatch):
     llm.answers = [{"reply": "شماره ثبت شد 🌸", "intent": "order"}]
     await say("09171234567", "off_topic")
     assert len(llm.calls) == n + 1
+    assert "THREAD: a new subject" in llm.calls[-1]["prompt"]
+    # the router also says whether the message continues the chat, and what it points at; the cart goes in by name
+    thread_answer.append({"follows": True, "about": "هودی چاپی سفید M"})
+    await say("دوتا کن", "cart")
+    assert "THREAD: it continues the chat so far, about «هودی چاپی سفید M»" in llm.calls[-1]["prompt"]
+    assert "CART: " in seen[-1]["prompt"] and "هودی" in seen[-1]["prompt"].split("CART: ")[1].split("\n")[0]
 
     # a person: handed over without the model, the cart kept
     last = (await say("آدمین رو میخوام", "human"))[-1]

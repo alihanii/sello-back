@@ -10,7 +10,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import ChatAgent, ChatConversation, ChatMessage, Store
+from app.models import ChatAgent, ChatConversation, ChatMessage, Product, Store
 from app.services import ai
 from app.services import chat_engine as ce
 
@@ -43,8 +43,13 @@ ROUTER_TIMEOUT = 15  # seconds: a slow router is skipped and the sales model ans
 ROUTER_SYSTEM = ("You sort ONE customer message in an Iranian online shop's chat into the part of the shopping journey it "
                  "belongs to. Read RECENT CHAT and STEP for context.\nSKILLS:\n"
                  + "\n".join(f"- {k}: {v}" for k, v in SKILLS.items())
-                 + '\nReply with ONE JSON object: {"skill":"<one of SKILLS>","sure":true|false}. '
-                   "Several asks in one message -> the main one. Not sure -> \"unclear\".")
+                 + '\nReply with ONE JSON object: {"skill":"<one of SKILLS>","sure":true|false,'
+                   '"follows":true|false,"about":"<what it refers to, max 8 words>"}. '
+                   "Several asks in one message -> the main one. Not sure -> \"unclear\". "
+                   "follows: true when the message answers or continues the shop's last message or the customer's "
+                   "previous one (\"پس M\", \"دوتا کن\", \"اون مشکیه\", \"آره\"); false for a new subject. "
+                   "about: the product/choice/question from RECENT CHAT or CART it is about "
+                   "(\"ست هودی اسپایدرمن سایز M\"), in Persian; \"\" when nothing earlier.")
 
 
 async def route(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent, state: dict[str, Any],
@@ -57,17 +62,24 @@ async def route(db: AsyncSession, conv: ChatConversation, store: Store, agent: C
     recent = "\n".join(f"{'customer' if m.role == 'customer' else 'shop'}: {(m.text or '[photo]')[:160]}"
                        for m in reversed(history[1:]))
     cart = (state.get("order") or {}).get("items") or []
+    names = []
+    for it in cart[:5]:
+        p = await db.get(Product, it.get("product_id") or 0) if it.get("product_id") else None
+        names.append(f"{p.title[:50] if p else it.get('title', '')} {it.get('variant') or ''} x{it.get('qty') or 1}".strip())
     step = {"confirm": "summary (the shop showed the order summary and waits for yes)",
             "receipt": "receipt (an order is placed and waits for payment)"}.get(str(state.get("awaiting") or ""), "browsing")
-    prompt = (f"STEP: {step}\nCART: {len(cart)} item(s)\nRECENT CHAT:\n{recent or '-'}\n\n"
+    prompt = (f"STEP: {step}\nCART: {'; '.join(names) or 'empty'}\nRECENT CHAT:\n{recent or '-'}\n\n"
               f"<customer>{text[:600]}</customer>")
     try:
         out = await ai.generate_json(task="chat_router", system=ROUTER_SYSTEM, prompt=prompt, store_id=store.id,
-                                     max_tokens=40, timeout=ROUTER_TIMEOUT)
+                                     max_tokens=80, timeout=ROUTER_TIMEOUT)
     except Exception:  # noqa: BLE001 - no router model or a bad answer: the sales model answers as before
         log.info("chat router unavailable", exc_info=True)
         return ""
     skill = str(out.get("skill") or "").strip()
+    about = " ".join(str(out.get("about") or "").split())[:80]
+    # How this message hangs on the chat so far, for the sales model (not kept past this turn).
+    state["thread"] = {"follows": out.get("follows") is True, "about": about}
     if skill not in SKILLS or out.get("sure") is False:
         return ""
     return skill
