@@ -1930,6 +1930,10 @@ def picked_option(options: list[str], text: str) -> str:
         if on and (on in norm(text) or any(len(w) >= 3 and len(w) == len(on)
                                            and sum(a != b for a, b in zip(w, on)) == 1 for w in said)):
             hits.append(o)
+    if len(hits) > 1:
+        # «پشت و جلو» names «پشت» and «جلو» too: the one option that holds the others is what they said.
+        whole = [h for h in hits if all(norm(x) in norm(h) for x in hits)]
+        hits = whole[:1] if len(whole) == 1 else hits
     return hits[0] if len(hits) == 1 else ""
 
 
@@ -2353,7 +2357,7 @@ async def add_to_order(db: AsyncSession, order: AiOrder, state: dict[str, Any]) 
 
 _SIZE_KEY = re.compile(r"(سایز|اندازه|size)", re.I)
 _COLOR_KEY = re.compile(r"(رنگ|color|colour)", re.I)
-_CHOICE_KEY = re.compile(r"(محل|جای|سمت|طرف)")  # other choices the customer must make, e.g. «محل چاپ: جلو، پشت»
+_CHOICE_KEY = re.compile(r"(محل|جای|سمت|طرف|ویژگی|ویژگي|مدل|نوع|طرح|چاپ|آپشن|option)", re.I)  # other choices the customer must make, e.g. «محل چاپ: جلو، پشت»
 
 
 def variant_options(p: Product) -> dict[str, list[str]]:
@@ -2365,6 +2369,12 @@ def variant_options(p: Product) -> dict[str, list[str]]:
         if not kind or kind in out or not str(v).strip():
             continue
         parts = [x.strip() for x in re.split(r"[،,/|؛;]|\s+و\s+|\s+-\s+", str(v)) if x.strip()]
+        if kind not in ("size", "color") and len(parts) == 2 and not re.search(r"[،,/|؛;]", str(v)):
+            # «ویژگی: طرح پشت و جلو»: back, front, or both — the shared first word («طرح») left out.
+            a, b = parts
+            if len(a.split()) > 1 and len(b.split()) == 1:
+                a = a.split(maxsplit=1)[1]
+            parts = [a, b, f"{a} و {b}"]
         if len(parts) == 1 and " " in parts[0] and not re.search(r"\sتا\s", parts[0]) and len(parts[0].split()) <= 8 \
                 and all(len(x) <= 4 for x in parts[0].split()):
             parts = parts[0].split()  # "S M L XL"

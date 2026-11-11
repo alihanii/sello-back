@@ -2233,3 +2233,11 @@ async def test_custom_print_product_known_by_its_description(client, monkeypatch
         agent = await chat_engine.get_agent(db, sid)
         step = await chat_order.next_step(db, conv, agent, state, None)
         assert step.stage == "choice" and "سایز" in step.text
+        # The seller's other detail with choices («ویژگی: طرح پشت و جلو») is asked too, and «پشت و جلو» is one pick.
+        opts = chat_engine.variant_options(rows[custom["id"]])
+        assert opts["ویژگی"] == ["پشت", "جلو", "پشت و جلو"]
+        assert chat_engine.picked_option(opts["ویژگی"], "پشت و جلو") == "پشت و جلو"
+        assert chat_engine.picked_option(opts["ویژگی"], "فقط پشت") == "پشت"
+        state["order"]["items"][0]["variant"] = "مشکی XL"
+        step = await chat_order.next_step(db, conv, agent, state, None)
+        assert step.stage == "choice" and "ویژگی" in step.text and "پشت و جلو" in step.text
