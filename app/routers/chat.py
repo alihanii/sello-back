@@ -594,7 +594,8 @@ async def list_orders(store_id: int, user: CurrentUser, db: DB, status: str = ""
     if status:
         stmt = stmt.where(AiOrder.status == status)
     total = await db.scalar(select(func.count()).select_from(stmt.subquery()))
-    rows = (await db.execute(stmt.order_by(AiOrder.id.desc()).limit(min(limit, 100)).offset(offset))).scalars().all()
+    rows = (await db.execute(stmt.order_by(AiOrder.id.desc()).limit(max(1, min(limit, 100)))
+                             .offset(max(0, offset)))).scalars().all()
     counts = dict((await db.execute(select(AiOrder.status, func.count()).where(
         AiOrder.store_id == store_id, ~AiOrder.is_test).group_by(AiOrder.status))).all())
     return {"total": total, "counts": counts, "items": [_order_out(o) for o in rows]}
@@ -625,14 +626,24 @@ async def update_order(order_id: int, body: OrderPatch, user: CurrentUser, db: D
         if body.status not in ("awaiting_payment", "payment_submitted", "confirmed", "rejected", "cancelled"):
             raise HTTPException(422, "وضعیت نامعتبر است.")
         if body.status == "confirmed" and o.status != "confirmed":
-            for it in o.items or []:  # stock goes down only when the seller confirms
+            for it in o.items or []:  # stock goes down only when the seller confirms, once per line
+                if it.get("confirmed") is True and not it.get("restocked"):
+                    continue  # confirmed before (confirmed → awaiting → confirmed again): already taken off
                 p = await db.get(Product, it.get("product_id") or 0) if it.get("product_id") else None
                 if p and p.store_id == o.store_id:
                     p.stock_qty = max(0, p.stock_qty - int(it.get("qty") or 0))
+        if body.status in ("cancelled", "rejected") and o.status == "confirmed":
+            for it in o.items or []:  # a confirmed order called off: what it took from the stock goes back
+                p = await db.get(Product, it.get("product_id") or 0) if it.get("product_id") else None
+                if p and p.store_id == o.store_id and it.get("confirmed") is True and not it.get("restocked"):
+                    p.stock_qty += int(it.get("qty") or 0)
+            # The lines stay "confirmed" (the income was counted once); "restocked" says the stock went back.
+            o.items = [{**i, "restocked": True} if i.get("confirmed") is True else i for i in o.items or []]
         if body.status == "confirmed":
             if o.status != "confirmed" and not o.is_test:  # today's income: what this confirmation adds
                 await record_event(db, o.store_id, "sale_toman", newly_confirmed_toman(o), payload={"order_id": o.id})
-            o.items = [{**i, "paid": True, "confirmed": True} for i in o.items or []]  # the seller says it's paid
+            o.items = [{**{k: v for k, v in i.items() if k != "restocked"}, "paid": True, "confirmed": True}
+                       for i in o.items or []]  # the seller says it's paid
         o.status = body.status
         conv = await db.get(ChatConversation, o.conversation_id)
         if conv:

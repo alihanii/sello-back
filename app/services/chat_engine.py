@@ -1687,6 +1687,7 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
     elif action == "cancel":
         state.pop("order", None)
         state.pop("form_sent", None)
+        state.pop("more_asked", None)
         if awaiting and state.pop("add_to", None):
             # Only the addition is dropped; the placed order stays as it was.
             prev = await open_order(db, store.id, state.get("order_id"))
@@ -1834,7 +1835,10 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                                          for k in ("name", "phone", "address")))
         or (complete and not awaiting and bool(_ASKS_KNOWN.search(reply.text)))
         # A line just put in still needs its size/colour/side: the shop asks it with buttons, whatever the model said.
-        or (changed and bool(order.get("items")) and not complete and not missing))
+        or (changed and bool(order.get("items")) and not complete and not missing)
+        # A line just added completes the cart: the shop says what went in and asks "anything else?".
+        or (complete and changed and not awaiting and not any(order.get(k) for k in ("name", "phone", "address"))
+            and len(order.get("items") or []) > max(len(before.get("items") or []), int(state.get("more_asked") or 0))))
     if bad_now and agent.orders_enabled and order.get("items") and "phone" in _missing_fields(agent, order):
         reply.text, reply.intent = ask_missing(agent, state, _missing_fields(agent, order), thanks=False), "order"
         trigger = False
@@ -1852,7 +1856,7 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                 and not _ASKS_KNOWN.search(reply.text)):
             # "Do you print your own design?": the answer first, then what the order needs next.
             lead = reply.text.strip() + "\n\n"
-        elif step.stage == "details" and changed:
+        elif step.stage in ("details", "more") and changed:
             # "مشکی XL پشت": what they just picked is said back, then what's still needed (not only "send your name").
             # A line just added ("یه ماگ هم اضافه کن") is named, so they see it went in.
             had_ids = {i.get("product_id") for i in before.get("items") or []}
@@ -2500,6 +2504,7 @@ async def add_to_order(db: AsyncSession, order: AiOrder, state: dict[str, Any]) 
     state.pop("order", None)
     state.pop("add_to", None)
     state.pop("form_sent", None)
+    state.pop("more_asked", None)
     state["order_id"] = order.id
     state["awaiting"] = "receipt"
     state["recent_products"] = ([i["product_id"] for i in lines if i.get("product_id")] or
@@ -2574,6 +2579,7 @@ async def create_order(db: AsyncSession, conv: ChatConversation, store: Store, a
         return None
     lines = [{**ln, "paid": False} for ln in lines]
     state.pop("form_sent", None)
+    state.pop("more_asked", None)
     state.pop("collecting", None)
     state.pop("add_to", None)
     state["recent_products"] = ([i["product_id"] for i in lines if i.get("product_id")] or

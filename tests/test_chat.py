@@ -2,6 +2,8 @@
 
 import re
 import copy
+
+from app.services import chat_order as co
 import json
 
 import pytest
@@ -241,6 +243,14 @@ async def test_full_chat_flow(client, monkeypatch):
     # seller confirms: stock goes down, customer is told
     r = (await client.patch(f"/ai-orders/{order['id']}", headers=h, json={"status": "confirmed"})).json()
     assert r["status"] == "confirmed"
+    assert (await client.get(f"/products/{p1['id']}", headers=h)).json()["stock_qty"] == 0
+    # a misclick back and forth takes the stock off once; cancelling a confirmed order puts it back
+    for st in ("payment_submitted", "confirmed"):
+        await client.patch(f"/ai-orders/{order['id']}", headers=h, json={"status": st, "notify_customer": False})
+    assert (await client.get(f"/products/{p1['id']}", headers=h)).json()["stock_qty"] == 0
+    await client.patch(f"/ai-orders/{order['id']}", headers=h, json={"status": "cancelled", "notify_customer": False})
+    assert (await client.get(f"/products/{p1['id']}", headers=h)).json()["stock_qty"] == 3
+    await client.patch(f"/ai-orders/{order['id']}", headers=h, json={"status": "confirmed", "notify_customer": False})
     assert (await client.get(f"/products/{p1['id']}", headers=h)).json()["stock_qty"] == 0
 
     # 7. conversation history shows everything, with the order linked
@@ -964,7 +974,8 @@ async def test_order_form_and_address_is_not_off_topic(client, monkeypatch):
     await say("سلام")
     llm.answers = [{"reply": "عالیه، لطفاً نام و شماره تماستون رو بفرمایید.", "intent": "order", "order_action": "update",
                     "order": {"items": [{"product_id": p1["id"], "qty": 1, "variant": "XL"}]}}]
-    assert (await say("اره همینو میخوام"))["text"] == form
+    assert co.MORE_ASK in (await say("اره همینو میخوام"))["text"]
+    assert (await say("نه"))["text"] == form
     # the model reads the filled-in form; with every detail known the code shows the summary
     llm.answers = [{"reply": "ممنون 🌸", "intent": "order", "order_action": "update", "order": {
         "name": "علی رضایی", "phone": "۰۹۱۲۳۳۳۳۴۳۴", "address": "قم خیابان صفاییه کوچه ۱۲"}}]
@@ -989,6 +1000,8 @@ async def test_contact_details_one_by_one_are_read_by_the_model(client, monkeypa
     llm.answers = [{"reply": "", "intent": "order", "order_action": "confirm",
                     "order": {"items": [{"product_id": p1["id"], "qty": 1, "variant": "۴۰"}]}}]
     m = await say("اره همینو میخوام")
+    assert co.MORE_ASK in m["text"]  # "anything else?" first
+    m = await say("نه ممنون")
     assert "نام و نام خانوادگی" in m["text"] and "آدرس کامل" in m["text"]
     llm.answers = [{"reply": "حتماً 🌸 فقط اسم، شماره و آدرست رو بفرست.", "intent": "order"}]
     m = await say("خب بفرستین برام")
@@ -1115,7 +1128,9 @@ async def test_a_new_customer_whose_order_the_model_claims_gets_asked_for_detail
     llm.answers = [{"reply": "سایز L ثبت شد.", "intent": "order", "order_action": "update",
                     "order": {"items": [{"product_id": p1["id"], "qty": 1, "variant": "L"}]}}]
     m = await say("L بزار برام")
-    assert "ثبت شد" not in m["text"] and "نام و نام خانوادگی" in m["text"] and "آدرس کامل" in m["text"]
+    assert "ثبت شد" not in m["text"] and co.MORE_ASK in m["text"]
+    m = await say("نه")
+    assert "نام و نام خانوادگی" in m["text"] and "آدرس کامل" in m["text"]
     llm.answers = [{"reply": "ممنون 🌸", "intent": "order", "order_action": "update", "order": {
         "name": "سید علی هانی", "phone": "۰۹۱۲۳۳۳۴۴۵۵", "address": "قم دورشهر کوچه ۲ کد پستی هم ۲۲۲۳۳۴۵۶۱۲"}}]
     m = await say("سید علی هانی\n۰۹۱۲۳۳۳۴۴۵۵\nقم دورشهر کوچه ۲ کد پستی هم ۲۲۲۳۳۴۵۶۱۲")
@@ -1642,7 +1657,8 @@ async def test_cart_and_order_buttons(client, monkeypatch):
     async with SessionLocal() as db:
         conv = await db.get(chat_engine.ChatConversation, scheduled[-1])
         assert conv.state["order"]["items"][0].get("design") == "/media/1/d.jpg"
-    assert (await tap(menu.ORDER))[-1].text == menu.ASK_FIELD["name"]
+    assert co.MORE_ASK in (await tap(menu.ORDER))[-1].text
+    assert (await tap(co.MORE_NO))[-1].text == menu.ASK_FIELD["name"]
     saved = await tap("سارا کریمی")
     assert saved[-1].text == menu.ASK_FIELD["phone"] and saved[-1].buttons == [[menu.SEND_PHONE]]
     assert SENT[-1][1]["reply_markup"]["keyboard"] == [[{"text": menu.SEND_PHONE, "request_contact": True}]]
@@ -2294,7 +2310,9 @@ async def test_ali_telegram_custom_print_chat_replayed(client, monkeypatch):
     m = (await say("سفید"))[-1]
     assert m["text"].startswith("سفید ✅") and "پشت و جلو" in m["text"]
     m = (await say("پشت و جلو"))[-1]
-    assert m["text"].startswith("پشت و جلو ✅") and form in m["text"]  # the seller's own message, once
+    assert m["text"].startswith("پشت و جلو ✅") and co.MORE_ASK in m["text"]
+    m = (await say("نه همینه"))[-1]
+    assert form in m["text"]  # the seller's own message, once
 
     llm.answers = [{"reply": "", "intent": "order", "order_action": "update", "order": {
         "name": "علی", "phone": "09125522708", "address": "تس تستخهستیبخ ستیبختیس 5646546"}}]
@@ -2352,6 +2370,8 @@ async def _p33_at_details(client, monkeypatch, phone):
     for pick in ("2xl", "آبی"):
         await say(pick)
     m = (await say("پشت و جلو"))[-1]
+    assert co.MORE_ASK in m["text"] and m["buttons"] == co.MORE_BUTTONS  # "anything else?" before the details
+    m = (await say(co.MORE_NO))[-1]
     assert "اسم و فامیلت" in m["text"]
     return h, sid, llm, p33, say
 
@@ -2491,3 +2511,31 @@ async def test_an_address_that_isnt_one_is_asked_again_once(client, monkeypatch)
         assert chat_engine.address_ok(ok), ok
     for bad in ("سلام", "fsd fdg", "اینجا", "سشیبس یبل"):
         assert not chat_engine.address_ok(bad), bad
+
+
+async def test_anything_else_is_asked_before_the_details(client, monkeypatch):
+    """ali: before the name/phone/address, the customer is asked whether they want to add something else."""
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550983")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        "orders_enabled": True, "payment": {"card_number": "6037991234567890"}})
+    mug = (await client.post(f"/stores/{sid}/products", headers=h, json={
+        "title": "ماگ سرامیکی", "price": 200000, "stock_qty": 9})).json()
+
+    async def say(text):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"][-1]
+
+    await say("سلام")
+    llm.answers = [{"reply": "", "intent": "order", "order_action": "confirm",
+                    "order": {"items": [{"product_id": p1["id"], "qty": 1, "variant": "۴۰"}]}}]
+    m = await say("مانتو ۴۰ میخوام")
+    assert co.MORE_ASK in m["text"] and m["buttons"] == co.MORE_BUTTONS and "اسم" not in m["text"]
+    assert (await say(co.MORE_YES))["text"] == co.MORE_WHAT
+    llm.answers = [{"reply": "", "intent": "order", "order_action": "update",
+                    "order": {"items": [{"product_id": p1["id"], "qty": 1, "variant": "۴۰"},
+                                        {"product_id": mug["id"], "qty": 1}]}}]
+    m = await say("یه ماگ هم بذار")
+    assert co.MORE_ASK in m["text"] and "ماگ سرامیکی" in m["text"] and "مانتو" in m["text"]
+    m = await say("نه همینا")
+    assert "نام و نام خانوادگی" in m["text"] and co.MORE_ASK not in m["text"]
+    items = (await _state(sid))["order"]["items"]
+    assert len(items) == 2
