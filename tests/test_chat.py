@@ -1780,8 +1780,9 @@ async def test_router_sends_each_message_to_its_skill(client, monkeypatch):
 
     async def router_json(*, task, system, prompt, **kw):
         seen.append({"task": task, "prompt": prompt, "system": system})
-        return {"skill": next_skill.pop(0), "sure": True}
+        return {"skill": next_skill.pop(0), "sure": True, **(thread_answer.pop(0) if thread_answer else {})}
     next_skill: list[str] = []
+    thread_answer: list[dict] = []
     monkeypatch.setattr(chat_router.ai, "generate_json", router_json)
     monkeypatch.setattr(chat_router, "route", REAL_ROUTE)
 
@@ -1812,6 +1813,12 @@ async def test_router_sends_each_message_to_its_skill(client, monkeypatch):
     llm.answers = [{"reply": "شماره ثبت شد 🌸", "intent": "order"}]
     await say("09171234567", "off_topic")
     assert len(llm.calls) == n + 1
+    assert "THREAD: a new subject" in llm.calls[-1]["prompt"]
+    # the router also says whether the message continues the chat, and what it points at; the cart goes in by name
+    thread_answer.append({"follows": True, "about": "هودی چاپی سفید M"})
+    await say("دوتا کن", "cart")
+    assert "THREAD: it continues the chat so far, about «هودی چاپی سفید M»" in llm.calls[-1]["prompt"]
+    assert "CART: " in seen[-1]["prompt"] and "هودی" in seen[-1]["prompt"].split("CART: ")[1].split("\n")[0]
 
     # a person: handed over without the model, the cart kept
     last = (await say("آدمین رو میخوام", "human"))[-1]
@@ -2201,3 +2208,43 @@ async def test_live_model_slips_with_a_real_chat(client, monkeypatch):
     assert m["text"] == chat_engine.CART_CLEARED_TEXT
     llm.answers = [{"reply": "سفارشتون کنسل شد.", "intent": "order", "order_action": "cancel"}]
     assert (await say("کنسل")) ["text"] == chat_engine.NOTHING_TO_CANCEL_TEXT
+
+
+async def test_custom_print_product_known_by_its_description(client, monkeypatch):
+    """ali's Telegram test: the print hoodie says «طرح دلخواه» only in its description and details, so the design
+    photo went on «هودی طرح چارلی چاپلین» instead, with no size asked."""
+    from app.core.db import SessionLocal
+    from app.services import chat_order
+    h, sid, *_ = await _setup(client, monkeypatch, "09125550992")
+    chaplin = (await client.post(f"/stores/{sid}/products", headers=h, json={
+        "title": "هودی طرح چارلی چاپلین برند SAW مشکی", "price": 1500000, "stock_qty": 3, "category": "هودی",
+        "description": "چاپ باکیفیت و ماندگار"})).json()
+    custom = (await client.post(f"/stores/{sid}/products", headers=h, json={
+        "title": "هودی طرح‌دار مشکی و آبی مدل کلاه‌دار", "price": 2000000, "stock_qty": 1000, "category": "هودی",
+        "tags": ["هودی", "هودی اسپرت", "هودی طرح دار"],
+        "description": "هودی کلاه‌دار با طرح دلخواه در قسمت پشت و جلو.",
+        "attributes": {"سایز": "M، 2XL، XL، 3XL", "رنگ": "مشکی، آبی، سفید", "ویژگی": "طرح پشت و جلو"}})).json()
+    conv_id = await _real_conv(sid)
+    async with SessionLocal() as db:
+        conv = await db.get(chat_engine.ChatConversation, conv_id)
+        store = await db.get(chat_engine.Store, sid)
+        rows = {p.id: p for p in await chat_engine.catalog_rows(db, sid)}
+        assert chat_engine.takes_design(rows[custom["id"]]) and not chat_engine.takes_design(rows[chaplin["id"]])
+        rt.add_message(db, conv, role="customer", text="هودی با طرح خودمم چاپ میکنید؟")
+        await db.commit()
+        seen = {"kind": "product", "description": "هودی مشکی با طرح", "product_id": chaplin["id"]}
+        got = await chat_engine.as_print_design(db, conv, store, seen, "")
+        assert got["kind"] == "design" and got["product_id"] == custom["id"]
+        # Its size is asked before the contact details.
+        state = {"order": {"items": [{"product_id": custom["id"], "qty": 1, "variant": "مشکی", "design": "/m/x.png"}]}}
+        agent = await chat_engine.get_agent(db, sid)
+        step = await chat_order.next_step(db, conv, agent, state, None)
+        assert step.stage == "choice" and "سایز" in step.text
+        # The seller's other detail with choices («ویژگی: طرح پشت و جلو») is asked too, and «پشت و جلو» is one pick.
+        opts = chat_engine.variant_options(rows[custom["id"]])
+        assert opts["ویژگی"] == ["پشت", "جلو", "پشت و جلو"]
+        assert chat_engine.picked_option(opts["ویژگی"], "پشت و جلو") == "پشت و جلو"
+        assert chat_engine.picked_option(opts["ویژگی"], "فقط پشت") == "پشت"
+        state["order"]["items"][0]["variant"] = "مشکی XL"
+        step = await chat_order.next_step(db, conv, agent, state, None)
+        assert step.stage == "choice" and "ویژگی" in step.text and "پشت و جلو" in step.text

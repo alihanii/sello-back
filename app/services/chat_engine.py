@@ -978,7 +978,7 @@ async def my_pictures(db: AsyncSession, conv: ChatConversation, store: Store, st
 
 
 _DESIGN_WANT = re.compile(r"(طرح|عکس|اینو|این\s*رو|همینو|همین\s*رو|اینه|این)")
-_DESIGN_VERB = re.compile(r"(می\s*‌?خوام|میخوام|بزن|بزنید|بزنین|چاپ|روی|رو\s*(هودی|تی|سوی|ماگ|کلاه|لیوان)|برای|واسه|میشه|می‌شه)")
+_DESIGN_VERB = re.compile(r"(می\s*‌?خوام|میخوام|بزن|بزنید|بزنین|چاپ(?!لین)|روی|رو\s*(هودی|تی|سوی|ماگ|کلاه|لیوان)|برای|واسه|میشه|می‌شه)")
 
 
 async def design_on_product(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent,
@@ -1427,6 +1427,7 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         from app.services import chat_router
         skill = await chat_router.route(db, conv, store, agent, state, text)
         if skill and await code_skill(db, conv, store, agent, state, text, skill, result):
+            state.pop("thread", None)
             return done()
 
     # 5. The model reads every message first and decides what it is and how to answer; the code below only carries
@@ -1473,6 +1474,11 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                             policy(agent)["stock"] == "exact", placed, relevant_faqs(agent, text), my_orders)
     if skill:
         prompt += f"\nROUTER: this message is about «{skill}»."
+    if thread := state.pop("thread", None):
+        # Whether this message continues the last one, and what it points at: short answers ("پس M", "دوتا کن")
+        # stay on the product being talked about, and a new subject doesn't drag the old choices along.
+        prompt += ("\nTHREAD: it continues the chat so far" + (f", about «{thread['about']}»" if thread["about"] else "")
+                   + "." if thread["follows"] else "\nTHREAD: a new subject; earlier choices apply only if it names them.")
     if common_hint:
         prompt += common_hint
     try:
@@ -1831,7 +1837,7 @@ async def read_photo(db: AsyncSession, store: Store, agent: ChatAgent, url: str,
             "product_id": pid if any(p.id == pid for p in rows) else 0}
 
 
-_PRINT_ASK = re.compile(r"(چاپ|طرح\s*(دلخواه|خودم|خودمو|خودم\s*رو|شخصی|اختصاصی)|سفارشی)")
+_PRINT_ASK = re.compile(r"(چاپ(?!لین)|طرح\s*(دلخواه|خودم|خودمو|خودم\s*رو|شخصی|اختصاصی)|سفارشی)")
 
 
 async def as_print_design(db: AsyncSession, conv: ChatConversation, store: Store, seen: dict[str, Any],
@@ -1893,13 +1899,21 @@ def _sizes_in(text: str) -> set[str]:
     return out
 
 
-_DESIGN_PRODUCT = re.compile(r"(چاپ|طرح\s*(دلخواه|شما|مشتری|اختصاصی)|سفارشی|custom|print)", re.I)
+# «چاپلین» (Charlie Chaplin) is a design name, not a print.
+_DESIGN_PRODUCT = re.compile(r"(چاپ(?!لین)|طرح\s*(دلخواه|شما|مشتری|اختصاصی)|سفارشی|custom|print)", re.I)
+_DESIGN_TEXT = re.compile(r"(طرح\s*(دلخواه|شما|خودتون|خودت|مشتری|اختصاصی)|چاپ\s*(دلخواه|اختصاصی|سفارشی|عکس\s*(شما|خودتون))|"
+                          r"custom\s*(print|design))", re.I)
 
 
 def takes_design(p: Product) -> bool:
-    """A product printed with the customer's own picture: its line keeps the design they sent."""
-    return bool(_DESIGN_PRODUCT.search(" ".join([p.title, " ".join(p.tags or []), " ".join((p.attributes or {}).keys()),
-                                                 p.category or ""])))
+    """A product printed with the customer's own picture: its line keeps the design they sent. The description and
+    the details count only with clear words ("با طرح دلخواه در قسمت پشت و جلو"), since a ready-made product's
+    description may well say "چاپ باکیفیت"."""
+    if _DESIGN_PRODUCT.search(" ".join([p.title, " ".join(p.tags or []), " ".join((p.attributes or {}).keys()),
+                                        p.category or ""])):
+        return True
+    return bool(_DESIGN_TEXT.search(" ".join([p.description or "",
+                                              " ".join(str(v) for v in (p.attributes or {}).values())])))
 
 
 def _option_chosen(kind: str, options: list[str], variant: str) -> bool:
@@ -1922,6 +1936,10 @@ def picked_option(options: list[str], text: str) -> str:
         if on and (on in norm(text) or any(len(w) >= 3 and len(w) == len(on)
                                            and sum(a != b for a, b in zip(w, on)) == 1 for w in said)):
             hits.append(o)
+    if len(hits) > 1:
+        # «پشت و جلو» names «پشت» and «جلو» too: the one option that holds the others is what they said.
+        whole = [h for h in hits if all(norm(x) in norm(h) for x in hits)]
+        hits = whole[:1] if len(whole) == 1 else hits
     return hits[0] if len(hits) == 1 else ""
 
 
@@ -2345,7 +2363,7 @@ async def add_to_order(db: AsyncSession, order: AiOrder, state: dict[str, Any]) 
 
 _SIZE_KEY = re.compile(r"(سایز|اندازه|size)", re.I)
 _COLOR_KEY = re.compile(r"(رنگ|color|colour)", re.I)
-_CHOICE_KEY = re.compile(r"(محل|جای|سمت|طرف)")  # other choices the customer must make, e.g. «محل چاپ: جلو، پشت»
+_CHOICE_KEY = re.compile(r"(محل|جای|سمت|طرف|ویژگی|ویژگي|مدل|نوع|طرح|چاپ|آپشن|option)", re.I)  # other choices the customer must make, e.g. «محل چاپ: جلو، پشت»
 
 
 def variant_options(p: Product) -> dict[str, list[str]]:
@@ -2357,6 +2375,12 @@ def variant_options(p: Product) -> dict[str, list[str]]:
         if not kind or kind in out or not str(v).strip():
             continue
         parts = [x.strip() for x in re.split(r"[،,/|؛;]|\s+و\s+|\s+-\s+", str(v)) if x.strip()]
+        if kind not in ("size", "color") and len(parts) == 2 and not re.search(r"[،,/|؛;]", str(v)):
+            # «ویژگی: طرح پشت و جلو»: back, front, or both — the shared first word («طرح») left out.
+            a, b = parts
+            if len(a.split()) > 1 and len(b.split()) == 1:
+                a = a.split(maxsplit=1)[1]
+            parts = [a, b, f"{a} و {b}"]
         if len(parts) == 1 and " " in parts[0] and not re.search(r"\sتا\s", parts[0]) and len(parts[0].split()) <= 8 \
                 and all(len(x) <= 4 for x in parts[0].split()):
             parts = parts[0].split()  # "S M L XL"
