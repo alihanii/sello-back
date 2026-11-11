@@ -47,12 +47,18 @@ async def test_zarinpal_payment_activates_plan(client, monkeypatch):
 
     r = await client.get(f"/payments/callback/?{cb.query}&Authority=A0000000000000000000000000000123456&Status=OK",
                          follow_redirects=False)
-    assert r.status_code == 303 and "payment=success" in r.headers["location"]
+    assert r.status_code == 303 and "/app/payment?status=success&id=" in r.headers["location"]
+    pid = int(parse_qs(urlparse(r.headers["location"]).query)["id"][0])
     sub = (await client.get("/me/subscription", headers=h)).json()["subscription"]
     assert sub and sub["plan"]["id"] == plan["id"]
+    d = (await client.get(f"/payments/{pid}", headers=h)).json()
+    assert d["status"] == "paid" and d["amount_toman"] == plan["price_toman"] and d["subscription"]["ends_at"]
+    assert d["plan"]["id"] == plan["id"] and d["bank_label"]
+    other = await login(client, "09127777778")
+    assert (await client.get(f"/payments/{pid}", headers=other)).status_code == 404
     # A repeated callback must not create a second subscription.
     r = await client.get(f"/payments/callback/?{cb.query}&Authority=A0000000000000000000000000000123456&Status=OK",
                          follow_redirects=False)
-    assert "payment=success" in r.headers["location"] or "payment=failed" in r.headers["location"]
+    assert "status=success" in r.headers["location"] or "status=failed" in r.headers["location"]
     pays = (await client.get("/admin/payments", headers=admin)).json()
     assert sum(1 for p in pays if p["status"] == "paid") == 1
