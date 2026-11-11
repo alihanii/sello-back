@@ -334,6 +334,10 @@ async def handle(db: AsyncSession, conv: ChatConversation, store: Store, agent: 
             return None  # a question or a sentence ("میتونم خود هودی رو ببینم"), not their name/address
         elif field_ == "address" and len(value) < 5:
             return [_r(ASK_FIELD["address"])]
+        elif field_ == "address" and not ce.address_ok(value) and not state.get("bad_address"):
+            state["bad_address"] = value[:200]  # once: the second try is taken as it is
+            state["bad_address_told"] = True
+            return [_r(ce.BAD_ADDRESS_TEXT)]
         if field_ in ASK_FIELD and value:
             state["order"] = {**order, field_: value[:500]}
             state.pop("menu", None)

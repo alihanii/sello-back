@@ -1,6 +1,7 @@
 """Sales chat assistant: connections, the cheap no-model paths, one model call per turn, orders, takeover, usage."""
 
 import re
+import copy
 import json
 
 import pytest
@@ -1278,6 +1279,10 @@ async def test_wrong_length_phones_and_fixing_a_placed_order(client, monkeypatch
     assert "۱۲ رقمیه" in m["text"] and "خلاصه" not in m["text"]
     llm.answers = [{"reply": "ممنون", "intent": "order", "order_action": "update", "order": {"phone": "09124443322"}}]
     m = await say("09124443322")
+    assert "آدرس" in m["text"] and "خلاصه" not in m["text"]  # «fsd fdg» isn't an address: still asked for
+    llm.answers = [{"reply": "ممنون", "intent": "order", "order_action": "update",
+                    "order": {"address": "تهران خیابان آزادی کوچه ۵ پلاک ۲"}}]
+    m = await say("تهران خیابان آزادی کوچه ۵ پلاک ۲")
     assert "خلاصهٔ سفارشت" in m["text"] and "09124443322" in m["text"]
     llm.answers = [{"reply": "", "intent": "order", "order_action": "confirm"}]
     assert "ثبت شد" in (await say("اره"))["text"]
@@ -2402,3 +2407,87 @@ def test_name_and_address_steps_skip_questions():
     assert not_a_detail("هزینه ارسال چقدره؟", "address") and not_a_detail("عکس هودی رو بفرست", "address")
     assert not not_a_detail("تهران خیابان ولیعصر کوچه ۳ پلاک ۷", "address")
     assert not not_a_detail("قم دورشهر", "address")
+
+
+async def _two_hoodies_at_summary(client, monkeypatch, phone, photo_again=False):
+    """ali's latest chat: a new design for the hoodie, then «another hoodie with this design» — two lines."""
+    h, sid, llm, p33, say = await _p33_at_details(client, monkeypatch, phone)
+    for t in ("علی", "09123454545"):
+        await say(t)
+    assert "خلاصهٔ سفارشت" in (await say("تهران خیابان ولیعصر کوچه ۳ پلاک ۷"))[-1]["text"]
+    llm.answers = [{"reply": "طرح جدیدتون رو بفرستید تا روی هودی اعمال کنم 🎨", "intent": "order"}]
+    await say("نه طرحم رو میخوام تغییرش بدم")
+    cid = await _send_photo(client, h, sid, "/media/1/new.jpg")
+    llm.answers = [{"reply": "طرح جدید رسید", "intent": "order"}]
+    out = await rt.answer(cid, send=False)
+    assert "جای طرح قبلی" in out[0].text
+    st = await _state(sid)
+    assert [i["design"] for i in st["order"]["items"]] == ["/media/1/new.jpg"] and not st.get("pending_design")
+    shown = await say("طرحی ک گذاشتی ببینم")
+    assert "/media/1/new.jpg" in [x.get("image_url") for x in shown]
+    m = (await say("نه میخوام ی هودی دیگه هم باشه تو این طرح ولی"))[-1]
+    assert "دیگه هم با همین طرح اضافه شد" in m["text"] or "سایز" in m["text"]
+    if photo_again:
+        # The same design sent once more while the new line's size is asked: the model lists one hoodie only.
+        cid = await _send_photo(client, h, sid, "/media/1/new.jpg")
+        llm.answers = [{"reply": "سایز رو انتخاب کن", "intent": "order", "order_action": "update",
+                        "order": {"items": [{"product_id": p33["id"], "qty": 1}]}}]
+        await rt.answer(cid, send=False)
+        assert len((await _state(sid))["order"]["items"]) == 2
+    llm.answers = [{"reply": "رنگ رو انتخاب کن", "intent": "order", "order_action": "update",
+                    "order": {"items": [{"product_id": p33["id"], "qty": 1, "variant": "2xl"}]}}]
+    for pick in ("2xl", "مشکی"):
+        await say(pick)
+    m = (await say("جلو"))[-1]
+    return h, sid, llm, p33, say, m
+
+
+async def test_ali_another_hoodie_with_the_same_design_keeps_the_first(client, monkeypatch):
+    h, sid, llm, p33, say, m = await _two_hoodies_at_summary(client, monkeypatch, "09125550996")
+    items = (await _state(sid))["order"]["items"]
+    assert len(items) == 2 and all(i["design"] == "/media/1/new.jpg" for i in items)
+    assert "آبی" in items[0]["variant"] and "مشکی" in items[1]["variant"] and "جلو" in items[1]["variant"]
+    assert "خلاصهٔ سفارشت" in m["text"] and m["text"].count("هودی طرح‌دار") >= 2
+    # The order is what the summary showed, placed once; «ثبت سفارش» again doesn't place a second one.
+    llm.answers = [{"reply": "", "intent": "order", "order_action": "confirm"}]
+    assert "ثبت شد" in (await say("بله"))[-1]["text"]
+    llm.answers = [{"reply": "", "intent": "order", "order_action": "confirm"}]
+    await say("✅ ثبت سفارش")
+    rows = (await client.get(f"/stores/{sid}/ai-orders", headers=h, params={"include_test": True})).json()
+    rows = rows.get("items", rows) if isinstance(rows, dict) else rows
+    assert len(rows) == 1 and len(rows[0]["items"]) == 2
+
+
+async def test_ali_photo_again_while_the_new_line_is_asked_keeps_both(client, monkeypatch):
+    *_, sid, _, _, _, m = await _two_hoodies_at_summary(client, monkeypatch, "09125550997", photo_again=True)
+    assert len((await _state(sid))["order"]["items"]) == 2 and "خلاصهٔ سفارشت" in m["text"]
+
+
+async def test_cart_lines_are_only_dropped_when_asked(client, monkeypatch):
+    """The invariant: the model listing fewer lines never drops one; only «حذف/فقط همون/به جاش…» does."""
+    from app.core.db import SessionLocal
+    h, sid, llm, p1, _ = await _setup(client, monkeypatch, "09125550998")
+    p2 = (await client.post(f"/stores/{sid}/products", headers=h, json={
+        "title": "ماگ سرامیکی", "price": 200000, "stock_qty": 9})).json()
+    agent_state = {"order": {"items": [{"product_id": p1["id"], "qty": 1, "variant": "۴۰"},
+                                       {"product_id": p2["id"], "qty": 1, "variant": ""}]}}
+    async with SessionLocal() as db:
+        agent = await chat_engine.get_agent(db, sid)
+        for now, kept in (("سایزش ۴۲ باشه", 2), ("فقط همون مانتو رو میخوام", 1), ("ماگ رو حذف کن", 1)):
+            state = copy.deepcopy(agent_state)
+            update = {"items": [{"product_id": p1["id"], "qty": 1, "variant": "۴۲"}]}
+            order = await chat_engine._merge_order(db, sid, agent, state, update, [], "", "update", now, now)
+            assert len(order["items"]) == kept, now
+
+
+async def test_an_address_that_isnt_one_is_asked_again_once(client, monkeypatch):
+    h, sid, llm, p33, say = await _p33_at_details(client, monkeypatch, "09125550999")
+    for t in ("علی", "09123454545"):
+        await say(t)
+    m = (await say("سشیبس یبل"))[-1]
+    assert m["text"] == chat_engine.BAD_ADDRESS_TEXT and not (await _state(sid))["order"].get("address")
+    assert "خلاصهٔ سفارشت" in (await say("تهران خیابان ولیعصر کوچه ۳ پلاک ۷"))[-1]["text"]
+    for ok in ("تهران، ونک", "مشهد بلوار وکیل‌آباد ۱۲", "کد پستی ۱۲۳۴۵۶۷۸۹۰"):
+        assert chat_engine.address_ok(ok), ok
+    for bad in ("سلام", "fsd fdg", "اینجا", "سشیبس یبل"):
+        assert not chat_engine.address_ok(bad), bad

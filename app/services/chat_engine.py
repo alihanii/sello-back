@@ -540,6 +540,9 @@ def dynamic_prompt(text: str, history: list[ChatMessage], products: list[Product
                      "message answers it.")
     elif state.get("awaiting") == "receipt" and placed:
         lines.append(f"STEP: order #{placed.id} is placed; the shop waits for the payment receipt or reference.")
+    if state.get("bad_address") and not (state.get("order") or {}).get("address"):
+        lines.append(f"NOTE: the address the customer sent ({state['bad_address'][:80]}) doesn't look complete, so it "
+                     "wasn't taken; ask once for the city, street, alley and plate (or postal code).")
     if state.get("bad_phone"):
         lines.append(f"NOTE: the phone the customer sent ({state['bad_phone']}) has the wrong length, so it wasn't "
                      "taken; say so and ask for the 11-digit 09… number.")
@@ -815,7 +818,7 @@ def fix_product_id(pid: int, products: list[Product], hint: str) -> int:
 
 async def _merge_order(db: AsyncSession, store_id: int, agent: ChatAgent, state: dict[str, Any],
                        update: dict[str, Any] | None, products: list[Product] | None = None,
-                       hint: str = "", action: str = "update", said: str = "") -> dict[str, Any]:
+                       hint: str = "", action: str = "update", said: str = "", now: str = "") -> dict[str, Any]:
     """`said`: the customer's own recent words. With a cart already open, a product that is neither in it, nor
     named by the customer, nor the one just talked about never comes in: the model sometimes re-lists the cart with
     a wrong id ("my number was wrong" turned the black hoodie into the custom-print one)."""
@@ -856,15 +859,32 @@ async def _merge_order(db: AsyncSession, store_id: int, agent: ChatAgent, state:
                 items.append({"product_id": p.id, "qty": qty, "variant": str(it.get("variant") or "")[:80]})
             elif not agent.catalog_enabled and it.get("title"):
                 items.append({"title": str(it["title"])[:200], "qty": qty, "variant": str(it.get("variant") or "")[:80]})
-        old_lines = order.get("items") or []
+        old_lines = list(order.get("items") or [])
+        matched: set[int] = set()
         for it in items:
-            # A line keeps the design it had; a new line of a print product takes the photo just sent.
-            same = [o for o in old_lines if o.get("product_id") == it.get("product_id") and o.get("design")]
-            match = next((o for o in same if _flat(o.get("variant")) == _flat(it["variant"])), None) or (
-                same[0] if len(same) == 1 and len([i for i in items if i.get("product_id") == it.get("product_id")]) == 1
-                else None)
-            if match:
-                it["design"] = match["design"]
+            # Each line the model sent is one of the cart's lines (same product), matched one to one: the line it
+            # extends ("" → "2xl") first, else the one whose choices it shares most. The line keeps its design.
+            cands = [i for i, o in enumerate(old_lines) if i not in matched and it.get("product_id")
+                     and o.get("product_id") == it.get("product_id")]
+            if not cands:
+                continue
+            new_w = words(str(it["variant"]))
+            extends = [i for i in cands if words(str(old_lines[i].get("variant") or "")) <= new_w]
+            pool = extends or cands
+            best = max(pool, key=lambda i: (len(words(str(old_lines[i].get("variant") or "")) & new_w),
+                                            len(words(str(old_lines[i].get("variant") or ""))), i))
+            matched.add(best)
+            if old_lines[best].get("design"):
+                it["design"] = old_lines[best]["design"]
+        # A line never drops off without a «remove»/«cancel»: the model re-listing the cart with one hoodie when it
+        # had two (ali: «یه هودی دیگه هم با این طرح» lost the first one) keeps the other one.
+        # A product left out is kept too when the model only edited the cart's own lines; one left out while a new
+        # product came in is a swap («نه، ماگ بذار»), unless they said «also».
+        sent_ids = {it.get("product_id") for it in items}
+        swap = bool(sent_ids - {o.get("product_id") for o in old_lines})
+        keep = [o for i, o in enumerate(old_lines) if i not in matched
+                and (o.get("product_id") in sent_ids or not swap or _ADD_MORE.search(now))
+                and not _DROP_LINE.search(now) and str(o.get("product_id") or o.get("title")) not in removed]
         if not items and removed:
             # Only the removed lines were sent: the rest of the order stays.
             left = [i for i in order.get("items") or [] if str(i.get("product_id") or i.get("title")) not in removed]
@@ -881,7 +901,7 @@ async def _merge_order(db: AsyncSession, store_id: int, agent: ChatAgent, state:
             for it in items:  # the model sometimes lists the same line twice
                 key = (it.get("product_id") or it.get("title"), it["variant"], it.get("design", ""))
                 merged[key] = {**it, "qty": max(it["qty"], merged.get(key, {}).get("qty", 0))}
-            order["items"] = list(merged.values())
+            order["items"] = list(merged.values()) + keep
     if isinstance(update.get("extras"), dict):
         text_fields = {f["label"] for f in order_fields(agent) if f["kind"] == "text"}
         extras = dict(order.get("extras") or {})
@@ -900,6 +920,8 @@ async def _merge_order(db: AsyncSession, store_id: int, agent: ChatAgent, state:
                 state.pop("bad_phone", None)
             else:  # a number of the wrong length is never kept or cut down: the customer is told why
                 state["bad_phone"] = to_en_digits(v).strip()[:20]
+        elif v and k == "address" and not address_ok(v) and not state.get("bad_address"):
+            state["bad_address"] = v[:200]  # asked once to complete it; the second try is taken as it is
         elif v:
             order[k] = v[:500]
     return order
@@ -937,6 +959,9 @@ _SEE_MINE = re.compile(r"(طرحم|طرح\s*(من|خودم)|طرحی\s*که\s*(�
                        r"(عکس|تصویر)\S*\s*(سفارش|سبد|خرید)\S*|(سفارشم|سبدم|سبد\s*خریدم|خریدم)\S*\s*(رو|را)?\s*"
                        r"(ببینم|بیینم|نشون))")
 _CHANGE_ASK = re.compile(r"(عوض|تغییر|حذف|جدید|دیگه|دیگر|اضافه|کنسل|لغو)")
+# "one more / also / another": a new line, never a change of the one in the cart.
+_ADD_MORE = re.compile(r"(یکی\s*دیگه|یه\s*دونه\s*دیگه|\S+\s*دیگه\s*هم|\sهم\s|\sهم$|اضافه|علاوه|به\s*علاوه|دوتا|دو\s*تا)")
+_DROP_LINE = re.compile(r"(حذف|بردار|نمی\s*‌?خوام|نمیخوام|کنسل|لغو|به\s*جای|بجای|جاش|عوضش|فقط\s+(همون|این|اون|یه))")
 _SEE_VERB = re.compile(r"(ببینم|بیینم|ببینمش|ببینیم|نشونم|نشون\s*(بده|بدین|بدید)|نشان\s*(بده|بدهید)|بفرست\s*ببینم)")
 _DESIGN_WORD = re.compile(r"طرح(م|ی\s*که|\s*(رو|را|من|خودم|و\s)|\s*$)")  # "طرح رو", not "طرح ونگوگ"
 # "the hoodie you'll print on" / "هودی که قراره روش طرح چاپ بشه": the cart's print product.
@@ -1014,8 +1039,41 @@ async def my_pictures(db: AsyncSession, conv: ChatConversation, store: Store, st
     return out
 
 
+_SAME_DESIGN = re.compile(r"(دیگه|دیگر|یکی|هم)[^.؟?\n]{0,30}(همین|این|با\s*این|با\s*همین|تو\s*این|توی\s*این)\s*طرح|"
+                          r"(همین|این)\s*طرح[^.؟?\n]{0,30}(دیگه|هم\b|یکی)")
+_NEW_DESIGN = re.compile(r"(طرح\S*[^.؟?\n]{0,25}(عوض|تغییر|جدید|دیگه)|(عوض|تغییر|جدید)[^.؟?\n]{0,25}طرح)")
 _DESIGN_WANT = re.compile(r"(طرح|عکس|اینو|این\s*رو|همینو|همین\s*رو|اینه|این)")
 _DESIGN_VERB = re.compile(r"(می\s*‌?خوام|میخوام|بزن|بزنید|بزنین|چاپ(?!لین)|روی|رو\s*(هودی|تی|سوی|ماگ|کلاه|لیوان)|برای|واسه|میشه|می‌شه)")
+
+
+async def replace_design(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent,
+                         state: dict[str, Any], photo: str, text: str) -> list[Reply]:
+    """"طرحم رو میخوام عوض کنم" then a new picture: it takes the place of the design on the cart's print line (only
+    when there is one such line), and the shop says so before the next step. Empty when it isn't that."""
+    asked = [text] + list((await db.execute(select(ChatMessage.text).where(
+        ChatMessage.conversation_id == conv.id, ChatMessage.role == "customer", ChatMessage.text != "")
+        .order_by(ChatMessage.id.desc()).limit(3))).scalars().all())
+    if not any(_NEW_DESIGN.search(t or "") for t in asked) or any(_SAME_DESIGN.search(t or "") for t in asked[:2]):
+        return []
+    order = dict(state.get("order") or {})
+    items = [dict(i) for i in order.get("items") or []]
+    lines = [i for i, it in enumerate(items) if it.get("design")]
+    if len(lines) != 1:
+        return []
+    it = items[lines[0]]
+    p = await db.get(Product, it.get("product_id") or 0) if it.get("product_id") else None
+    it["design"] = photo
+    order["items"] = items
+    state["order"] = order
+    state.pop("pending_design", None)
+    state.pop("awaiting", None)
+    from app.services import chat_order
+    placed = await open_order(db, store.id, state.get("order_id"))
+    step = await chat_order.next_step(db, conv, agent, state, placed)
+    lead = f"🎨 طرح جدید جای طرح قبلی روی «{(p.title if p else 'محصول')[:60]}» نشست."
+    if not step:
+        return [Reply(lead, source="order", intent="order")]
+    return [Reply(f"{lead}\n\n{step.text}", source="order", intent="order", buttons=step.buttons)]
 
 
 async def design_on_product(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent,
@@ -1042,8 +1100,16 @@ async def design_on_product(db: AsyncSession, conv: ChatConversation, store: Sto
     from app.services import chat_order
     order = dict(state.get("order") or {})
     items = list(order.get("items") or [])
-    design = state.pop("pending_design")
-    line = next((i for i, it in enumerate(items) if it.get("product_id") == pick.id and not it.get("design")), None)
+    design = state.pop("pending_design", None)
+    had = [it for it in items if it.get("product_id") == pick.id and it.get("design")]
+    if not design:
+        # "یه هودی دیگه هم با همین طرح": no new picture, the design already in the cart goes on a new line.
+        if not (_SAME_DESIGN.search(text) and len({it["design"] for it in had}) == 1):
+            return []
+        design = had[0]["design"]
+        line = None
+    else:
+        line = next((i for i, it in enumerate(items) if it.get("product_id") == pick.id and not it.get("design")), None)
     if line is None:
         items.append({"product_id": pick.id, "qty": 1, "variant": "", "design": design})
         line = len(items) - 1
@@ -1066,7 +1132,9 @@ async def design_on_product(db: AsyncSession, conv: ChatConversation, store: Sto
         state.pop("awaiting")  # the summary changed; it is shown again when the line is complete
     placed = await open_order(db, store.id, state.get("order_id"))
     step = await chat_order.next_step(db, conv, agent, state, placed)
-    lead = f"عالیه 🎨 طرحت رو روی «{pick.title[:60]}» چاپ می‌کنیم ({money(pick.price)})."
+    lead = (f"باشه 🎨 یه «{pick.title[:60]}» دیگه هم با {'همین طرح' if design in {h['design'] for h in had} else 'این طرح'} "
+            f"اضافه شد؛ قبلی‌ها سر جاشونن." if had else
+            f"عالیه 🎨 طرحت رو روی «{pick.title[:60]}» چاپ می‌کنیم ({money(pick.price)}).")
     if not step:
         return [Reply(lead, source="order", intent="order")]
     return [Reply(f"{lead}\n{step.text}", source="order", intent="order", buttons=step.buttons)]
@@ -1371,7 +1439,8 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         result.replies += shown
         return done()
 
-    if text and not photo and agent.orders_enabled and state.get("pending_design") \
+    if text and not photo and agent.orders_enabled \
+            and (state.get("pending_design") or _SAME_DESIGN.search(text)) \
             and (step_replies := await design_on_product(db, conv, store, agent, state, text)):
         # "I want this design on a hoodie": the print product goes in the cart with the picture they sent, and the
         # journey asks what it still needs (colour, size, side) with buttons, instead of a list of hoodies.
@@ -1484,6 +1553,10 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                 return done()
         else:
             seen = await as_print_design(db, conv, store, seen, text)
+            if seen["kind"] != "receipt" and agent.orders_enabled and (
+                    swapped := await replace_design(db, conv, store, agent, state, photo, text)):
+                result.replies += swapped
+                return done()
             text = (text + "\n" if text else "") + photo_line(seen)
         if not image_fields and not (seen and seen["kind"] == "receipt"):
             # Kept for the next print-product line (or one still without its design): "print this one".
@@ -1592,6 +1665,7 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
 
     action = str(out.get("order_action") or "none")
     bad_before = state.get("bad_phone")
+    bad_address_before = state.get("bad_address")
     awaiting = state.pop("awaiting", None) if state.get("awaiting") == "confirm" else None
     before = state.get("order") or {}
     if placed and not before.get("items") and isinstance(out.get("order"), dict) and action == "update" \
@@ -1648,7 +1722,7 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                 action = "update" if action == "none" else action
         said = " ".join([text] + [m.text for m in history if m.role == "customer"][-3:])
         state["order"] = await _merge_order(db, store.id, agent, state, out.get("order"), products, hint, action,
-                                            said)
+                                            said, text)
         if not state["order"]:
             state.pop("order")
     order = state.get("order") or {}
@@ -1755,12 +1829,18 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
     claims = bool(_CLAIMS_PLACED.search(reply.text) or _CLAIMS_SHIPPING.search(reply.text)) and order.get("items")
     trigger = action != "cancel" and (
         action == "confirm" or claims or (awaiting and changed)
-        or (complete and changed and not missing and any(given_contact[k] and given_contact[k] != before.get(k)
-                                                         for k in ("name", "phone", "address")))
+        # Details the customer just gave: the shop says what's still needed, or shows the summary when nothing is.
+        or (complete and changed and any(given_contact[k] and given_contact[k] != before.get(k)
+                                         for k in ("name", "phone", "address")))
         or (complete and not awaiting and bool(_ASKS_KNOWN.search(reply.text)))
         # A line just put in still needs its size/colour/side: the shop asks it with buttons, whatever the model said.
         or (changed and bool(order.get("items")) and not complete and not missing))
     if bad_now and agent.orders_enabled and order.get("items") and "phone" in _missing_fields(agent, order):
+        reply.text, reply.intent = ask_missing(agent, state, _missing_fields(agent, order), thanks=False), "order"
+        trigger = False
+    elif (agent.orders_enabled and order.get("items") and state.get("bad_address") != bad_address_before
+          and "address" in _missing_fields(agent, order)):
+        # An address that isn't one ("fsd fdg"): asked once to write it fully, the model's words aside.
         reply.text, reply.intent = ask_missing(agent, state, _missing_fields(agent, order), thanks=False), "order"
         trigger = False
     from app.services import chat_order
@@ -2327,16 +2407,46 @@ def bad_phone(text: str) -> str:
     return re.sub(r"[ -]", "", m.group()) if m and not _PHONE.search(t) else ""
 
 
+_ADDRESS_WORDS = re.compile(
+    r"(خیابان|خیابون|خ\s|خ\.|کوچه|ک\.|پلاک|بلوار|میدان|میدون|کوی|محله|طبقه|واحد|بن\s*بست|بزرگراه|جاده|روستا|شهرک|"
+    r"مجتمع|برج|ساختمان|کد\s*پستی|استان|شهر|تهران|مشهد|اصفهان|شیراز|تبریز|کرج|قم|اهواز|کرمان|رشت|ارومیه|یزد|"
+    r"همدان|زاهدان|اراک|قزوین|ساری|گرگان|سنندج|کرمانشاه|بندرعباس|بوشهر|خرم\s*آباد|زنجان|سمنان|بجنورد|بیرجند|"
+    r"اردبیل|ایلام|یاسوج|شهرکرد|کیش|street|st\.|ave|road|alley|no\.)", re.I)
+
+
+def address_ok(value: str) -> bool:
+    """An address looks like one: it has a place word (street, alley, a city…) or a postal code, or it is long enough
+    to be one. "سلام", "اینجا" or a key-mash isn't: the customer is asked once to write it fully."""
+    v = " ".join(to_en_digits(value).split())
+    if _ADDRESS_WORDS.search(v) or re.search(r"\d{5,}", v):
+        return True
+    words = [w for w in v.split() if len(w) > 1]
+    return len(words) >= 4 and len(v) >= 20 and bool(re.search(r"\d", v))
+
+
+BAD_ADDRESS_TEXT = "این آدرس کامل به نظر نمی‌رسه 🙏 لطفاً شهر، خیابان، کوچه و پلاک (یا کد پستی) رو بنویس."
+
+
 def ask_missing(agent: ChatAgent, state: dict[str, Any], missing: list[str], thanks: bool = True) -> str:
     """What's still needed — and why the phone they sent wasn't taken, instead of asking for it again blindly."""
     bad = state.get("bad_phone") if "phone" in missing else ""
     head = "ممنون 🌸 " if thanks else ""
+    if not bad and "address" in missing and state.get("bad_address") and not state.get("bad_address_told"):
+        state["bad_address_told"] = True
+        rest = [m for m in missing if m != "address"]
+        return (f"{head}{BAD_ADDRESS_TEXT}" + (f" ({'، '.join(FIELD_NAMES.get(m, m) for m in rest)} رو هم بفرست.)"
+                                                if rest else ""))
     if bad:
         n = len(re.sub(r"\D", "", bad))
         rest = [m for m in missing if m != "phone"]
+        tail = ""
+        if "address" in rest and state.get("bad_address") and not state.get("bad_address_told"):
+            state["bad_address_told"] = True
+            rest = [m for m in rest if m != "address"]
+            tail = "\n" + BAD_ADDRESS_TEXT
         return (f"{head}شماره‌ای که فرستادی ({ltr(bad)}) {fa_number(n)} رقمیه؛ شماره موبایل باید ۱۱ رقم باشه و با ۰۹ "
                 "شروع بشه. لطفاً شماره درست رو بفرست" + (f" (و {'، '.join(FIELD_NAMES.get(m, m) for m in rest)})"
-                                                          if rest else "") + ".")
+                                                          if rest else "") + "." + tail)
     return f"{head}لطفاً " + "، ".join(FIELD_NAMES.get(m, m) for m in missing) + " رو هم بفرست."
 
 
