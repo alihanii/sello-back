@@ -38,13 +38,15 @@ SKILLS = {
 # Answered by the shop's code; every other skill goes to the sales model.
 CODE_SKILLS = {"browse", "status", "confirm", "cart_view", "checkout", "human", "complaint", "off_topic", "abuse"}
 
+# Persian costs several tokens a word: at 80 the «about» was cut mid-JSON on flash-lite (6 of 32 unreadable).
+ROUTER_MAX_TOKENS = 200
 ROUTER_TIMEOUT = 15  # seconds: a slow router is skipped and the sales model answers, the chat never hangs on it
 
 ROUTER_SYSTEM = ("You sort ONE customer message in an Iranian online shop's chat into the part of the shopping journey it "
                  "belongs to. Read RECENT CHAT and STEP for context.\nSKILLS:\n"
                  + "\n".join(f"- {k}: {v}" for k, v in SKILLS.items())
                  + '\nReply with ONE JSON object: {"skill":"<one of SKILLS>","sure":true|false,'
-                   '"follows":true|false,"about":"<what it refers to, max 8 words>"}. '
+                   '"follows":true|false,"about":"<what it refers to, max 6 words>"}. '
                    "Several asks in one message -> the main one. Not sure -> \"unclear\". "
                    "follows: true when the message answers or continues the shop's last message or the customer's "
                    "previous one (\"پس M\", \"دوتا کن\", \"اون مشکیه\", \"آره\"); false for a new subject. "
@@ -72,7 +74,7 @@ async def route(db: AsyncSession, conv: ChatConversation, store: Store, agent: C
               f"<customer>{text[:600]}</customer>")
     try:
         out = await ai.generate_json(task="chat_router", system=ROUTER_SYSTEM, prompt=prompt, store_id=store.id,
-                                     max_tokens=80, timeout=ROUTER_TIMEOUT)
+                                     max_tokens=ROUTER_MAX_TOKENS, timeout=ROUTER_TIMEOUT)
     except Exception:  # noqa: BLE001 - no router model or a bad answer: the sales model answers as before
         log.info("chat router unavailable", exc_info=True)
         return ""
