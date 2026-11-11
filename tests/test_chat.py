@@ -1623,7 +1623,7 @@ async def test_cart_and_order_buttons(client, monkeypatch):
     assert "محل چاپ" in saved[-1].text and saved[-1].buttons == [["جلو", "پشت"]]
     assert SENT[-1][1]["reply_markup"]["one_time_keyboard"]
     saved = await tap("پشت")
-    assert saved[-1].text.startswith(menu.DONE) and "طرحی که می‌خوای چاپ بشه" in saved[-1].text
+    assert saved[-1].text.startswith("پشت ✅") and "طرحی که می‌خوای چاپ بشه" in saved[-1].text
     assert len(llm.calls) == calls
 
     # the design photo goes the usual way (the model reads it), then the order button asks the details one by one
@@ -2248,3 +2248,59 @@ async def test_custom_print_product_known_by_its_description(client, monkeypatch
         state["order"]["items"][0]["variant"] = "مشکی XL"
         step = await chat_order.next_step(db, conv, agent, state, None)
         assert step.stage == "choice" and "ویژگی" in step.text and "پشت و جلو" in step.text
+
+
+async def test_ali_telegram_custom_print_chat_replayed(client, monkeypatch):
+    """ali's whole Telegram chat: design photo → his print hoodie (P33) with size, colour and back/front asked
+    ("2xl ✅", not "عوض شد" on a first pick), the seller's ready-made details message, the summary, and then
+    "show me my design and the hoodie" answered with his own design, not a catalog dump."""
+    from app.services import chat_menu
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550993")
+    form = "برای ثبت سفارش لطفاً بفرست:\n۱. نام و نام خانوادگی\n۲. شماره موبایل\n۳. آدرس کامل با کد پستی"
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        "enabled": True, "orders_enabled": True, "payment": {"card_number": "6037991234567890", "order_form": form}})
+    chaplin = (await client.post(f"/stores/{sid}/products", headers=h, json={
+        "title": "هودی طرح چارلی چاپلین برند SAW مشکی", "price": 3000000, "stock_qty": 3, "category": "هودی",
+        "attributes": {"طرح": "چارلی چاپلین", "رنگ": "مشکی"}})).json()
+    custom = (await client.post(f"/stores/{sid}/products", headers=h, json={
+        "title": "هودی طرح‌دار مشکی و آبی مدل کلاه‌دار", "price": 4000000, "stock_qty": 1000, "category": "هودی",
+        "sku": "P33", "description": "هودی کلاه‌دار با طرح دلخواه در قسمت پشت و جلو.",
+        "attributes": {"سایز": "MD، 2xl، xl، sm، 3XL", "رنگ": "مشکی، آبی، سفید", "ویژگی": "طرح پشت و جلو"}})).json()
+    from app.services import media
+    monkeypatch.setattr(media, "read_local", lambda url: (b"img", "image/png") if url.startswith("/media/") else None)
+
+    async def vision(*, task, system, prompt, images=None, store_id=None, **kw):
+        return {"kind": "product", "description": "هودی مشکی با طرح", "product_id": chaplin["id"]}
+    monkeypatch.setattr(chat_engine.ai, "generate_json", vision)
+
+    async def say(text):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"]
+
+    llm.answers = [{"reply": "بله، طرح دلخواهتون رو روی هودی چاپ میکنیم 😊 عکس طرحتون رو بفرستین.", "intent": "product"}]
+    await say("هودی با طرح خودمم چاپ میکنید؟")
+    cid = await _send_photo(client, h, sid, "/media/1/mine.jpg")
+    llm.answers = [{"reply": "طرح قشنگیه!", "intent": "order", "order_action": "update",
+                    "order": {"items": [{"product_id": custom["id"], "qty": 1}]}}]
+    saved = await rt.answer(cid, send=False)
+    assert "هودی طرح‌دار" in saved[-1].text and "سایز" in saved[-1].text and "چاپلین" not in saved[-1].text
+
+    m = (await say("2xl"))[-1]
+    assert m["text"].startswith("2xl ✅") and "عوض شد" not in m["text"] and "رنگ" in m["text"]
+    m = (await say("سفید"))[-1]
+    assert m["text"].startswith("سفید ✅") and "پشت و جلو" in m["text"]
+    m = (await say("پشت و جلو"))[-1]
+    assert m["text"].startswith("پشت و جلو ✅") and form in m["text"]  # the seller's own message, once
+
+    llm.answers = [{"reply": "", "intent": "order", "order_action": "update", "order": {
+        "name": "علی", "phone": "09125522708", "address": "تس تستخهستیبخ ستیبختیس 5646546"}}]
+    m = (await say("علی 09125522708 تس تستخهستیبخ ستیبختیس 5646546"))[-1]
+    assert "خلاصهٔ سفارشت" in m["text"] and "2xl سفید پشت و جلو" in m["text"] and "🎨 طرح رسید" in m["text"]
+
+    n = len(llm.calls)
+    for ask in ("ببینم طرح رو و هودی رو", "نه طرح و هودی که میخوای روش چچاپ کنی رو ببینم", "طرحی که برات دادم رو ببینم"):
+        out = await say(ask)
+        assert any(x.get("image_url") == "/media/1/mine.jpg" for x in out), ask
+        assert not any("چاپلین" in (x["text"] or "") or "کد " in (x["text"] or "") for x in out), ask
+        assert out[-1]["buttons"] == chat_menu.co.SUMMARY_BUTTONS and "«بله»" in out[-1]["text"]
+    assert len(llm.calls) == n  # answered by the shop, no model call
+    assert (await _state(sid))["awaiting"] == "confirm"

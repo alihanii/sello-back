@@ -273,10 +273,13 @@ async def handle(db: AsyncSession, conv: ChatConversation, store: Store, agent: 
         pick = t.removeprefix("✔️").strip()
         pick = pick if pick in options else ce.picked_option(options, pick)  # typed: "قرمز میخوام"
         if p and pick in options:
-            items[idx] = {**items[idx], "variant": set_choice(p, str(items[idx].get("variant") or ""), kind, pick)}
+            old = str(items[idx].get("variant") or "")
+            items[idx] = {**items[idx], "variant": set_choice(p, old, kind, pick)}
             state["order"] = {**order, "items": items}
             state.pop("menu", None)
-            return await next_step(db, conv, store, agent, state, lead=DONE)
+            # The first pick of a missing option is "noted", only a real change is "changed".
+            had = ce._option_chosen(kind, options, old)  # noqa: SLF001
+            return await next_step(db, conv, store, agent, state, lead=DONE if had else f"{pick} ✅")
     elif step == "qty":
         idx = int(menu.get("line") or 0)
         n = int(to_en_digits(t)) if to_en_digits(t).isdigit() else 0
