@@ -7,6 +7,7 @@ The model only reads the customer's words into the cart (which product, which ch
 writes the chat text; whether the summary shows, what is asked next and when an order is placed is decided here,
 for typed messages and button taps alike."""
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,16 +21,24 @@ from app.services.text import fa_number
 YES_BUTTON = "✅ بله، ثبت کن"
 CHANGE_BUTTON = "✏️ تغییر می‌خوام"
 SUMMARY_BUTTONS = [[YES_BUTTON, CHANGE_BUTTON]]
-SUMMARY_ASK = "همه‌چی درسته؟ اگه درسته «بله» یا «آره» بفرست، وگرنه بگو چی رو عوض کنم."
+SUMMARY_ASK = ("همه‌چی درسته؟ اگه درسته «بله» یا «آره» بفرست، وگرنه بگو چی رو عوض کنم "
+               "(یا اگه چیز دیگه‌ای هم می‌خوای، بگو تا اضافه‌ش کنم).")
 ASK_FIELD = {"name": "اسم و فامیلت رو بنویس 👤", "phone": "شماره موبایلت رو بفرست 📞",
              "address": "آدرس کامل رو با کد پستی بنویس 📍"}
 SEND_PHONE = "📱 ارسال شماره‌ی من"
 _KIND_NAMES = {"color": "رنگ", "size": "سایز"}
+MORE_YES = "➕ آره، یه چیز دیگه"
+MORE_NO = "✅ نه، ادامه‌ی ثبت سفارش"
+MORE_BUTTONS = [[MORE_YES, MORE_NO]]
+MORE_ASK = "چیز دیگه‌ای هم می‌خوای به سفارشت اضافه کنی؟ 🌸"
+MORE_WHAT = "باشه 🌸 اسم یا عکس محصول بعدی رو بفرست تا اضافه‌ش کنم."
+MORE_DONE = re.compile(r"^(نه|نخیر|خیر|نچ|no|nope)?\s*(ممنون|مرسی|کافیه|بسه|همین(ه|ا|ها|قدر)?|تموم(ه)?|نه|نمی\s*‌?خوام|"
+                       r"نیست|نه\s*دیگه|ادامه|ثبت\s*کن|بریم)?\s*[.!🌸🙏]*$", re.I)
 
 
 @dataclass
 class Step:
-    """The next thing the shop says: `stage` is choice | design | details | summary."""
+    """The next thing the shop says: `stage` is choice | design | more | details | summary."""
     stage: str
     text: str
     buttons: list[list[str]] | None = None
@@ -107,6 +116,15 @@ async def next_step(db: AsyncSession, conv: ChatConversation, agent: ChatAgent, 
     await carry_over(db, conv, order, placed)
     state["order"] = order
     missing = ce._missing_fields(agent, order)  # noqa: SLF001
+    if (missing and len(items) > int(state.get("more_asked") or 0) and not state.get("awaiting")
+            and not any(order.get(k) for k in ("name", "phone", "address"))):
+        # The cart is ready and the checkout comes next: "anything else?" first — once, again only after a new line.
+        # (With the details already given, the summary comes straight away and says the same.)
+        state["more_asked"] = len(items)
+        state["menu"] = {"step": "more"}
+        lines, total = await ce.priced_lines(db, store_id, items)
+        rows = "\n".join(ce.line_text(i) for i in lines)
+        return Step("more", f"🛒 سبد خریدت:\n{rows}\n💰 جمع: {ce.money(total)}\n\n{MORE_ASK}", MORE_BUTTONS)
     if missing:
         form = str((agent.payment or {}).get("order_form") or "").strip()
         contact = [m for m in missing if m in ASK_FIELD]

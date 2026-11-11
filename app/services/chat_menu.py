@@ -249,16 +249,29 @@ async def handle(db: AsyncSession, conv: ChatConversation, store: Store, agent: 
         state.pop("menu", None)
         return await next_step(db, conv, store, agent, state)
     if t == YES_CLEAR and step == "clear":
-        for k in ("order", "awaiting", "menu", "add_to", "form_sent"):
+        for k in ("order", "awaiting", "menu", "add_to", "form_sent", "more_asked"):
             state.pop(k, None)
         return [_r(CLEARED)]
     if t == YES_CANCEL and step == "cancel":
-        for k in ("order", "awaiting", "menu", "add_to", "form_sent"):
+        for k in ("order", "awaiting", "menu", "add_to", "form_sent", "more_asked"):
             state.pop(k, None)
         return [_r(CANCELLED)]
 
     if not step or not items and step != "field":
         return None
+    if step == "more":
+        # "Anything else?" before the details: no / done goes on, yes waits for the next product.
+        if t == co.MORE_NO:
+            state.pop("menu", None)
+            return await next_step(db, conv, store, agent, state)
+        if co.MORE_DONE.search(t):  # typed: the details asked as a typed chat asks them (all at once)
+            state.pop("menu", None)
+            placed = await ce.open_order(db, store.id, state.get("order_id"))
+            nxt = await co.next_step(db, conv, agent, state, placed)
+            return [_r(nxt.text, nxt.buttons)] if nxt else None
+        if t == co.MORE_YES or (ce.plain_yes(t) and len(t.split()) <= 3):
+            state.pop("menu", None)
+            return [_r(co.MORE_WHAT)]
     if step == "change":
         if t == CH_CANCEL:
             state["menu"] = {"step": "cancel"}
