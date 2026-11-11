@@ -978,7 +978,7 @@ async def my_pictures(db: AsyncSession, conv: ChatConversation, store: Store, st
 
 
 _DESIGN_WANT = re.compile(r"(طرح|عکس|اینو|این\s*رو|همینو|همین\s*رو|اینه|این)")
-_DESIGN_VERB = re.compile(r"(می\s*‌?خوام|میخوام|بزن|بزنید|بزنین|چاپ|روی|رو\s*(هودی|تی|سوی|ماگ|کلاه|لیوان)|برای|واسه|میشه|می‌شه)")
+_DESIGN_VERB = re.compile(r"(می\s*‌?خوام|میخوام|بزن|بزنید|بزنین|چاپ(?!لین)|روی|رو\s*(هودی|تی|سوی|ماگ|کلاه|لیوان)|برای|واسه|میشه|می‌شه)")
 
 
 async def design_on_product(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent,
@@ -1831,7 +1831,7 @@ async def read_photo(db: AsyncSession, store: Store, agent: ChatAgent, url: str,
             "product_id": pid if any(p.id == pid for p in rows) else 0}
 
 
-_PRINT_ASK = re.compile(r"(چاپ|طرح\s*(دلخواه|خودم|خودمو|خودم\s*رو|شخصی|اختصاصی)|سفارشی)")
+_PRINT_ASK = re.compile(r"(چاپ(?!لین)|طرح\s*(دلخواه|خودم|خودمو|خودم\s*رو|شخصی|اختصاصی)|سفارشی)")
 
 
 async def as_print_design(db: AsyncSession, conv: ChatConversation, store: Store, seen: dict[str, Any],
@@ -1893,13 +1893,21 @@ def _sizes_in(text: str) -> set[str]:
     return out
 
 
-_DESIGN_PRODUCT = re.compile(r"(چاپ|طرح\s*(دلخواه|شما|مشتری|اختصاصی)|سفارشی|custom|print)", re.I)
+# «چاپلین» (Charlie Chaplin) is a design name, not a print.
+_DESIGN_PRODUCT = re.compile(r"(چاپ(?!لین)|طرح\s*(دلخواه|شما|مشتری|اختصاصی)|سفارشی|custom|print)", re.I)
+_DESIGN_TEXT = re.compile(r"(طرح\s*(دلخواه|شما|خودتون|خودت|مشتری|اختصاصی)|چاپ\s*(دلخواه|اختصاصی|سفارشی|عکس\s*(شما|خودتون))|"
+                          r"custom\s*(print|design))", re.I)
 
 
 def takes_design(p: Product) -> bool:
-    """A product printed with the customer's own picture: its line keeps the design they sent."""
-    return bool(_DESIGN_PRODUCT.search(" ".join([p.title, " ".join(p.tags or []), " ".join((p.attributes or {}).keys()),
-                                                 p.category or ""])))
+    """A product printed with the customer's own picture: its line keeps the design they sent. The description and
+    the details count only with clear words ("با طرح دلخواه در قسمت پشت و جلو"), since a ready-made product's
+    description may well say "چاپ باکیفیت"."""
+    if _DESIGN_PRODUCT.search(" ".join([p.title, " ".join(p.tags or []), " ".join((p.attributes or {}).keys()),
+                                        p.category or ""])):
+        return True
+    return bool(_DESIGN_TEXT.search(" ".join([p.description or "",
+                                              " ".join(str(v) for v in (p.attributes or {}).values())])))
 
 
 def _option_chosen(kind: str, options: list[str], variant: str) -> bool:

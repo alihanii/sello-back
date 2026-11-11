@@ -2201,3 +2201,35 @@ async def test_live_model_slips_with_a_real_chat(client, monkeypatch):
     assert m["text"] == chat_engine.CART_CLEARED_TEXT
     llm.answers = [{"reply": "سفارشتون کنسل شد.", "intent": "order", "order_action": "cancel"}]
     assert (await say("کنسل")) ["text"] == chat_engine.NOTHING_TO_CANCEL_TEXT
+
+
+async def test_custom_print_product_known_by_its_description(client, monkeypatch):
+    """ali's Telegram test: the print hoodie says «طرح دلخواه» only in its description and details, so the design
+    photo went on «هودی طرح چارلی چاپلین» instead, with no size asked."""
+    from app.core.db import SessionLocal
+    from app.services import chat_order
+    h, sid, *_ = await _setup(client, monkeypatch, "09125550992")
+    chaplin = (await client.post(f"/stores/{sid}/products", headers=h, json={
+        "title": "هودی طرح چارلی چاپلین برند SAW مشکی", "price": 1500000, "stock_qty": 3, "category": "هودی",
+        "description": "چاپ باکیفیت و ماندگار"})).json()
+    custom = (await client.post(f"/stores/{sid}/products", headers=h, json={
+        "title": "هودی طرح‌دار مشکی و آبی مدل کلاه‌دار", "price": 2000000, "stock_qty": 1000, "category": "هودی",
+        "tags": ["هودی", "هودی اسپرت", "هودی طرح دار"],
+        "description": "هودی کلاه‌دار با طرح دلخواه در قسمت پشت و جلو.",
+        "attributes": {"سایز": "M، 2XL، XL، 3XL", "رنگ": "مشکی، آبی، سفید", "ویژگی": "طرح پشت و جلو"}})).json()
+    conv_id = await _real_conv(sid)
+    async with SessionLocal() as db:
+        conv = await db.get(chat_engine.ChatConversation, conv_id)
+        store = await db.get(chat_engine.Store, sid)
+        rows = {p.id: p for p in await chat_engine.catalog_rows(db, sid)}
+        assert chat_engine.takes_design(rows[custom["id"]]) and not chat_engine.takes_design(rows[chaplin["id"]])
+        rt.add_message(db, conv, role="customer", text="هودی با طرح خودمم چاپ میکنید؟")
+        await db.commit()
+        seen = {"kind": "product", "description": "هودی مشکی با طرح", "product_id": chaplin["id"]}
+        got = await chat_engine.as_print_design(db, conv, store, seen, "")
+        assert got["kind"] == "design" and got["product_id"] == custom["id"]
+        # Its size is asked before the contact details.
+        state = {"order": {"items": [{"product_id": custom["id"], "qty": 1, "variant": "مشکی", "design": "/m/x.png"}]}}
+        agent = await chat_engine.get_agent(db, sid)
+        step = await chat_order.next_step(db, conv, agent, state, None)
+        assert step.stage == "choice" and "سایز" in step.text
