@@ -178,6 +178,24 @@ async def _for_line(db: AsyncSession, conv: ChatConversation, store: Store, agen
     return [r] if r else [_r(head)]
 
 
+_NOT_DETAIL = re.compile(r"([؟?]|\b(نه|چی|چرا|چطور|چجوری|کجا|کی|چند|چقدر|چنده)\b|می\s*‌?(تونم|شه|خوام|خوای|خواین)|"
+                         r"میتونم|میشه|میخوام|میخوای|ببینم|نشون|بفرست|عکس|طرح|سایز|رنگ|قیمت|هودی|سفارش|سبد|ارسال|"
+                         r"تخفیف|موجود|کنسل|لغو|عوض)")
+_NAME_WORDS = 4
+
+
+def not_a_detail(value: str, field_: str) -> bool:
+    """A question or a request typed at the name/address step: the model reads it instead of it being stored."""
+    v = " ".join(value.split())
+    if field_ == "name":
+        return bool(_NOT_DETAIL.search(v)) or len(v.split()) > _NAME_WORDS
+    # An address has its own words (خیابان، کوچه، پلاک…); a question without any of them isn't one.
+    return bool(re.search(r"[؟?]", v) or (_NOT_DETAIL.search(v) and not _ADDRESS_HINT.search(v)))
+
+
+_ADDRESS_HINT = re.compile(r"(خیابان|خ\.|کوچه|ک\.|پلاک|بلوار|میدان|کوی|محله|طبقه|واحد|کد\s*پستی|\d{5,})")
+
+
 async def handle(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent, state: dict[str, Any],
                  text: str, result: ce.TurnResult, sent_at: datetime | None = None) -> list[Reply] | None:
     """The answer to a button tap (or to the one thing a button step asked for); None: the model path answers."""
@@ -312,6 +330,8 @@ async def handle(db: AsyncSession, conv: ChatConversation, store: Store, agent: 
         elif field_ == "name" and (ce.norm_phone(value) or len(value) > 60 or "\n" in value):
             state.pop("menu", None)
             return None  # name, phone and address in one message: the model sorts them out
+        elif field_ in ("name", "address") and not_a_detail(value, field_):
+            return None  # a question or a sentence ("میتونم خود هودی رو ببینم"), not their name/address
         elif field_ == "address" and len(value) < 5:
             return [_r(ASK_FIELD["address"])]
         if field_ in ASK_FIELD and value:

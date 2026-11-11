@@ -2304,3 +2304,101 @@ async def test_ali_telegram_custom_print_chat_replayed(client, monkeypatch):
         assert out[-1]["buttons"] == chat_menu.co.SUMMARY_BUTTONS and "«بله»" in out[-1]["text"]
     assert len(llm.calls) == n  # answered by the shop, no model call
     assert (await _state(sid))["awaiting"] == "confirm"
+
+
+async def _p33_at_details(client, monkeypatch, phone):
+    """ali's shop and chat up to the details: design photo on P33, 2xl, آبی, پشت و جلو picked."""
+    from app.core.db import SessionLocal
+    from app.models import ProductImage
+    h, sid, llm, *_ = await _setup(client, monkeypatch, phone)
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        "enabled": True, "orders_enabled": True, "payment": {"card_number": "6037991234567890"}})
+    rows = {}
+    for title, extra in (("هودی طرح چارلی چاپلین برند SAW مشکی", {"attributes": {"طرح": "چارلی چاپلین", "رنگ": "مشکی"}}),
+                         ("هودی طرح ونگوگ گلدوزی شده", {"attributes": {"سایز": "S، M، L، XL", "رنگ": "سرمه‌ای، سفید"}}),
+                         ("بافت برند PULLMARK طرح CLUB STUDIOS", {}),
+                         ("هودی طرح‌دار مشکی و آبی مدل کلاه‌دار", {
+                             "sku": "P33", "description": "هودی کلاه‌دار با طرح دلخواه در قسمت پشت و جلو.",
+                             "attributes": {"سایز": "MD، 2xl، xl، sm، 3XL", "رنگ": "مشکی، آبی، سفید",
+                                            "ویژگی": "طرح پشت و جلو"}})):
+        rows[title] = (await client.post(f"/stores/{sid}/products", headers=h, json={
+            "title": title, "price": 3000000, "stock_qty": 50, "category": "هودی", **extra})).json()
+    p33 = rows["هودی طرح‌دار مشکی و آبی مدل کلاه‌دار"]
+    async with SessionLocal() as db:
+        db.add_all([ProductImage(product_id=r["id"], url=f"/media/x/{r['id']}.jpg") for r in rows.values()])
+        await db.commit()
+    from app.services import media
+    monkeypatch.setattr(media, "read_local", lambda url: (b"img", "image/png") if url.startswith("/media/") else None)
+    chaplin = rows["هودی طرح چارلی چاپلین برند SAW مشکی"]
+
+    async def vision(*, task, system, prompt, images=None, store_id=None, **kw):
+        return {"kind": "product", "description": "هودی مشکی با طرح", "product_id": chaplin["id"]}
+    monkeypatch.setattr(chat_engine.ai, "generate_json", vision)
+
+    async def say(text):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"]
+
+    llm.answers = [{"reply": "بله، طرح دلخواهتون رو روی هودی چاپ میکنیم 😊 عکس طرحتون رو بفرستید.", "intent": "product"}]
+    await say("هودی با طرح خودمم چاپ میکنید؟")
+    cid = await _send_photo(client, h, sid, "/media/1/mine.jpg")
+    llm.answers = [{"reply": "طرح قشنگیه!", "intent": "order", "order_action": "update",
+                    "order": {"items": [{"product_id": p33["id"], "qty": 1}]}}]
+    await rt.answer(cid, send=False)
+    for pick in ("2xl", "آبی"):
+        await say(pick)
+    m = (await say("پشت و جلو"))[-1]
+    assert "اسم و فامیلت" in m["text"]
+    return h, sid, llm, p33, say
+
+
+def _shows_mine(out, p33):
+    urls = [x.get("image_url") for x in out]
+    texts = " ".join(x["text"] or "" for x in out)
+    return (f"/media/x/{p33['id']}.jpg" in urls and "/media/1/mine.jpg" in urls
+            and "ونگوگ" not in texts and "PULLMARK" not in texts and "چاپلین" not in texts)
+
+
+async def test_ali_see_the_hoodie_in_the_middle_of_the_details(client, monkeypatch):
+    """ali's second Telegram retest: «میتونم خود هودی رو ببینم» at the name step dumped the catalog, and «نه هودی
+    که میخوای روش طرح چاپ بشه» was then stored as his name. The cart's product stays the subject at every step."""
+    h, sid, llm, p33, say = await _p33_at_details(client, monkeypatch, "09125550994")
+    n = len(llm.calls)
+    out = await say("میتونم خود هودی رو ببینم")
+    assert _shows_mine(out, p33) and "اسم و فامیلت" in out[-1]["text"]
+    out = await say("نه هودی ک میخوای روش طرح چاپ بشه")
+    assert _shows_mine(out, p33) and "اسم و فامیلت" in out[-1]["text"]
+    assert len(llm.calls) == n and not ((await _state(sid)).get("order") or {}).get("name")
+
+    # The name step still takes a name, then the phone step: the same ask there keeps the phone question.
+    m = (await say("علی"))[-1]
+    assert "شماره موبایلت" in m["text"]
+    out = await say("هودیه رو نشونم بده")
+    assert _shows_mine(out, p33) and "شماره موبایلت" in out[-1]["text"]
+    m = (await say("09125522708"))[-1]
+    assert "آدرس کامل" in m["text"]
+    # A question at the address step is not their address.
+    llm.answers = [{"reply": "ارسال با پست پیشتاز ۸۰ هزار تومانه 🌸", "intent": "faq"}]
+    await say("هزینه ارسال چقدره؟")
+    assert not ((await _state(sid)).get("order") or {}).get("address")
+    out = await say("عکس هودی رو بفرست ببینم")
+    assert _shows_mine(out, p33)
+    m = (await say("تهران خیابان ولیعصر کوچه ۳ پلاک ۷"))[-1]
+    assert "خلاصهٔ سفارشت" in m["text"] and "2xl آبی پشت و جلو" in m["text"]
+    out = await say("میتونم خود هودی رو ببینم")
+    assert _shows_mine(out, p33) and "«بله»" in out[-1]["text"]
+
+    # Another product named clearly is a real browse, not the cart.
+    llm.answers = [{"reply": "این هودی ونگوگه 🌸", "intent": "product"}]
+    out = await say("هودی ونگوگ رو ببینم")
+    assert "/media/1/mine.jpg" not in [x.get("image_url") for x in out]
+
+
+def test_name_and_address_steps_skip_questions():
+    from app.services.chat_menu import not_a_detail
+    for v in ("میتونم خود هودی رو ببینم", "نه هودی ک میخوای روش طرح چاپ بشه", "قیمتش چنده؟", "سایز بزرگتر دارین"):
+        assert not_a_detail(v, "name"), v
+    for v in ("علی", "علی رضایی", "سارا محمدی نژاد"):
+        assert not not_a_detail(v, "name"), v
+    assert not_a_detail("هزینه ارسال چقدره؟", "address") and not_a_detail("عکس هودی رو بفرست", "address")
+    assert not not_a_detail("تهران خیابان ولیعصر کوچه ۳ پلاک ۷", "address")
+    assert not not_a_detail("قم دورشهر", "address")

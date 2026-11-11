@@ -939,6 +939,8 @@ _SEE_MINE = re.compile(r"(طرحم|طرح\s*(من|خودم)|طرحی\s*که\s*(�
 _CHANGE_ASK = re.compile(r"(عوض|تغییر|حذف|جدید|دیگه|دیگر|اضافه|کنسل|لغو)")
 _SEE_VERB = re.compile(r"(ببینم|بیینم|ببینمش|ببینیم|نشونم|نشون\s*(بده|بدین|بدید)|نشان\s*(بده|بدهید)|بفرست\s*ببینم)")
 _DESIGN_WORD = re.compile(r"طرح(م|ی\s*که|\s*(رو|را|من|خودم|و\s)|\s*$)")  # "طرح رو", not "طرح ونگوگ"
+# "the hoodie you'll print on" / "هودی که قراره روش طرح چاپ بشه": the cart's print product.
+_ON_IT = re.compile(r"(روش\s*(طرح\s*)?چاپ|که\s*(می\s*‌?خوای|میخوای|می\s*‌?خواین|میخواین|قراره)\s*روش)")
 _MY_ORDER_WORD = re.compile(r"(سفارش|سبد)\S*")
 
 
@@ -946,7 +948,7 @@ async def my_pictures(db: AsyncSession, conv: ChatConversation, store: Store, st
                       text: str) -> list[Reply]:
     """"What's my design? / let me see my order": the design each line carries and the product's photo, from the cart,
     else the latest order of this chat. Empty when the message isn't that ask or there is nothing to show."""
-    if _CHANGE_ASK.search(text) or not (_SEE_MINE.search(text) or _SEE_VERB.search(text)):
+    if _CHANGE_ASK.search(text) or not (_SEE_MINE.search(text) or _SEE_VERB.search(text) or _ON_IT.search(text)):
         return []
     items = (state.get("order") or {}).get("items") or []
     placed = None
@@ -963,8 +965,15 @@ async def my_pictures(db: AsyncSession, conv: ChatConversation, store: Store, st
         for it in items:
             p = await db.get(Product, it.get("product_id") or 0) if it.get("product_id") else None
             titles.append(p.title if p else str(it.get("title") or ""))
+        # The cart's product named ("خود هودی رو ببینم") at any step stays the cart's, unless another product of
+        # the shop fits the words better ("هودی ونگوگ رو ببینم" is a browse).
+        mine_fit = max((_overlap(said, words(t)) for t in titles), default=0)
+        cart_ids = {it.get("product_id") for it in items}
+        other_fit = max((_overlap(said, words(p.title)) for p in await catalog_rows(db, store.id)
+                         if p.id not in cart_ids), default=0) if mine_fit else 0
         mine = ((_DESIGN_WORD.search(text) and any(it.get("design") for it in items))
-                or (state.get("awaiting") == "confirm" and any(_overlap(said, words(t)) for t in titles))
+                or (_ON_IT.search(text) and any(it.get("design") for it in items))
+                or (mine_fit and mine_fit >= other_fit)
                 or _MY_ORDER_WORD.search(text))
         if not mine:
             return []
@@ -990,7 +999,13 @@ async def my_pictures(db: AsyncSession, conv: ChatConversation, store: Store, st
     else:
         tail = "این‌ها توی سبد خریدت هستن 🛒" + (" و همین طرح چاپ می‌شه." if designs else "")
     buttons = None
-    if not placed and state.get("awaiting") == "confirm":
+    menu = state.get("menu") or {}
+    if not placed and menu.get("step") == "field" and menu.get("field") in ("name", "phone", "address"):
+        # Asked in the middle of the details: the same question again, so the next answer still lands there.
+        from app.services import chat_order
+        tail += "\n" + chat_order.ASK_FIELD[menu["field"]]
+        buttons = [[chat_order.SEND_PHONE]] if menu["field"] == "phone" else None
+    elif not placed and state.get("awaiting") == "confirm":
         # Still at the summary: the yes is asked again, with its buttons.
         from app.services import chat_order
         tail += "\nاگه همه‌چی درسته «بله» رو بزن تا ثبت بشه، یا بگو چی رو عوض کنم."
