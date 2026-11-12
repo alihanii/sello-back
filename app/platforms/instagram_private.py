@@ -242,8 +242,9 @@ class PrivateInstagram:
 
         def ask(kind: str) -> str:
             """Runs in the login thread: tell the seller a code is needed, then wait for it."""
+            wait.event.clear()  # before asking: a code typed right after the ask must not be wiped
+            wait.code = ""
             asyncio.run_coroutine_threadsafe(self._need_code(ctx, kind), loop).result(30)
-            wait.event.clear()
             if not wait.event.wait(CODE_WAIT_SECONDS):
                 return ""
             return wait.code
