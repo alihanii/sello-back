@@ -412,8 +412,81 @@ async def test_seller_own_proxy_is_the_only_route(client, monkeypatch):
     assert proxy_pool.pool.sticky("instagram", None, channel_id=ch["id"]) == (own, "socks5://1.2.3.4:1080")
     assert proxy_pool.pool.sticky("instagram", own, channel_id=ch["id"] + 999) is None  # not shared
 
+    async with SessionLocal() as db:
+        row = await db.get(Channel, ch["id"])
+        row.config, row.status = {**row.config, "mode": "private"}, "connected"
+        await db.commit()
+    # Test it later.
+    health = {"ok": True, "latency_ms": 420}
+    r = await client.post(f"/channels/{ch['id']}/instagram/proxy/test", headers=h)
+    assert r.status_code == 200 and r.json()["ok"] and r.json()["own"] and r.json()["address"] == "1.2.3.4:1080"
+    # A new config that does not reach Instagram keeps the old one.
+    health = {"ok": False, "error": "ConnectTimeout"}
+    r = await client.put(f"/channels/{ch['id']}/instagram/proxy", headers=h, json={"link": "socks5://5.6.7.8:1080"})
+    assert r.status_code == 422
+    async with SessionLocal() as db:
+        row = await db.get(Channel, ch["id"])
+        node = (await db.execute(select(ProxyNode).where(ProxyNode.channel_id == ch["id"]))).scalar_one()
+        assert row.config["proxy_address"] == "1.2.3.4:1080" and node.address == "1.2.3.4:1080"
+    assert proxy_pool.pool.sticky("instagram", None, channel_id=ch["id"])[0] == own
+    health = {"ok": True, "latency_ms": 300}
+    r = await client.put(f"/channels/{ch['id']}/instagram/proxy", headers=h, json={"link": "socks5://5.6.7.8:1080"})
+    assert r.status_code == 200, r.text
+    assert r.json()["config"]["proxy_address"] == "5.6.7.8:1080" and r.json()["config"]["proxy_health"]["ok"]
+    assert r.json()["config"]["proxy_node_id"] == own  # same node, new link
+
+    # The account never falls back to the shared proxies when its own one is missing.
+    from app.platforms.base import PlatformError
+    from app.platforms.instagram_private import _route
+    from app.services.ig_chat import _Ctx
+
+    proxy_pool.pool.nodes = {7: proxy_pool._Node(7, "shared", "socks", ["instagram"], proxy_url="socks5://9.9.9.9:1")}
+    async with SessionLocal() as db:
+        with pytest.raises(PlatformError) as e:
+            await _route(_Ctx(db), await db.get(Channel, ch["id"]))
+        assert e.value.code == "own_proxy_down"
+    await reload()
+
     r = await client.delete(f"/channels/{ch['id']}/instagram/proxy", headers=h)
     assert r.status_code == 200 and "own_proxy" not in r.json()["config"]
     async with SessionLocal() as db:
         assert not (await db.execute(select(ProxyNode).where(ProxyNode.channel_id == ch["id"]))).scalars().all()
     proxy_pool.pool.nodes = {}
+
+
+async def test_chat_page_lists_social_channels_with_switches(client):
+    from app.core.db import SessionLocal
+    from app.models import Channel, ChatBot
+    from tests.conftest import login
+
+    h = await login(client, "09128880456")
+    sid = (await client.post("/stores", json={"name": "چت کانال"}, headers=h)).json()["id"]
+    async with SessionLocal() as db:
+        login_ch = Channel(store_id=sid, platform="instagram", display_name="شاپ", status="connected",
+                           config={"mode": "private", "username": "shop"})
+        oauth_ch = Channel(store_id=sid, platform="instagram", display_name="رسمی", status="connected", config={})
+        tg_ch = Channel(store_id=sid, platform="telegram", display_name="کانال", status="connected", config={})
+        db.add_all([login_ch, oauth_ch, tg_ch])
+        await db.commit()
+        ids = login_ch.id, oauth_ch.id
+
+    rows = (await client.get(f"/stores/{sid}/chat/channels", headers=h)).json()
+    assert [r["channel_id"] for r in rows] == list(ids)  # social channels only
+    assert rows[0]["available"] and not rows[0]["active"] and [f["key"] for f in rows[0]["features"]] == ["dm", "comments"]
+    assert not rows[1]["available"] and "نام کاربری" in rows[1]["unavailable_reason"]
+
+    r = await client.put(f"/chat/channels/{ids[0]}", headers=h, json={"dm": True, "comments": False})
+    assert r.status_code == 200 and r.json()["active"] and r.json()["dm"] and not r.json()["comments"]
+    assert (await client.put(f"/chat/channels/{ids[1]}", headers=h, json={"dm": True})).status_code == 422
+    # Its bot is not a Telegram/Bale bot: not in the bots list, and the bots' check refuses it.
+    assert (await client.get(f"/stores/{sid}/chat/bots", headers=h)).json() == []
+    async with SessionLocal() as db:
+        from sqlalchemy import select
+        bot = (await db.execute(select(ChatBot).where(ChatBot.channel_id == ids[0]))).scalar_one()
+        assert bot.status == "connected"
+    assert (await client.post(f"/chat/bots/{bot.id}/check", headers=h)).status_code == 422
+
+    r = await client.put(f"/chat/channels/{ids[0]}", headers=h, json={"dm": False, "comments": False})
+    assert not r.json()["active"]
+    async with SessionLocal() as db:
+        assert (await db.get(ChatBot, bot.id)).status == "disconnected"
