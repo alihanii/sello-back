@@ -121,7 +121,12 @@ async def receive(db: AsyncSession, bot: ChatBot, inbound: tg.Inbound) -> int | 
     image_url = ""
     if inbound.photo_file_id:
         try:
-            data, name = await tg.download(bot, inbound.photo_file_id)
+            if bot.platform == "instagram":
+                from app.services import ig_chat
+
+                data, name = await ig_chat.download(inbound.photo_file_id)
+            else:
+                data, name = await tg.download(bot, inbound.photo_file_id)
             image_url = save_bytes(bot.store_id, data, name)
         except (PlatformError, Exception):  # noqa: BLE001 - a lost photo must not drop the message
             log.warning("chat photo download failed", exc_info=True)
@@ -275,6 +280,15 @@ async def deliver(db: AsyncSession, bot: ChatBot | None, conv: ChatConversation,
                   saved: list[ChatMessage], menu: bool = False) -> None:
     if not bot or bot.status == "disconnected":
         return
+    if bot.platform == "instagram":
+        from app.services import ig_chat
+
+        try:
+            await ig_chat.deliver(db, bot, conv, replies, saved)
+        except PlatformError as exc:
+            bot.last_error = exc.message_fa
+            log.warning("instagram send failed: %s", exc.message_fa)
+        return
     biz = conv.business_connection_id if conv.mode == "business" else ""
     last = len(replies) - 1
     for n, (reply, row) in enumerate(zip(replies, saved)):
@@ -306,7 +320,7 @@ def _ext(mime: str) -> str:
 
 
 async def notify_admin_chat(bot: ChatBot | None, text: str, conv: ChatConversation | None = None) -> None:
-    if not bot or not bot.admin_chat_id:
+    if not bot or not bot.admin_chat_id or bot.platform == "instagram":
         return
     link = f"\n{settings.frontend_base_url}{_conv_link(conv)}" if conv else ""
     try:
@@ -324,6 +338,11 @@ async def seller_send(db: AsyncSession, conv: ChatConversation, text: str) -> Ch
         bot = await db.get(ChatBot, conv.bot_id)
         if not bot or bot.status == "disconnected":
             raise PlatformError("اتصال این گفتگو قطع است؛ پیام فرستاده نشد.", "bot_disconnected")
+        if bot.platform == "instagram":
+            from app.services import ig_chat
+
+            row.external_id = await ig_chat.send_text(db, bot, conv, text)
+            return row
         biz = conv.business_connection_id if conv.mode == "business" else ""
         row.external_id = await tg.send_text(bot, conv.external_chat_id, text, biz)
     return row
@@ -407,7 +426,7 @@ async def poller_loop(stop: asyncio.Event) -> None:
         try:
             async with SessionLocal() as db:
                 ids = set((await db.execute(select(ChatBot.id).where(
-                    ChatBot.status.in_(["connected", "waiting_business"]),
+                    ChatBot.status.in_(["connected", "waiting_business"]), ChatBot.platform != "instagram",
                     ChatBot.credentials_encrypted.is_not(None)))).scalars())
             for bid in ids - tasks.keys():
                 tasks[bid] = asyncio.create_task(_poll_bot(bid, stop))

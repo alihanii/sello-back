@@ -161,7 +161,8 @@ async def chat_platforms(store_id: int, user: CurrentUser, db: DB):
 @router.get("/stores/{store_id}/chat/bots")
 async def list_bots(store_id: int, user: CurrentUser, db: DB):
     await get_store_for(db, user, store_id)
-    rows = (await db.execute(select(ChatBot).where(ChatBot.store_id == store_id, ChatBot.status != "disconnected")
+    rows = (await db.execute(select(ChatBot).where(ChatBot.store_id == store_id, ChatBot.status != "disconnected",
+                                                   ChatBot.platform != "instagram")  # set on the channels page
                              .order_by(ChatBot.id))).scalars().all()
     return [_bot_out(b) for b in rows]
 
@@ -238,6 +239,8 @@ async def _bot_for(db, user: User, bot_id: int) -> ChatBot:
 @router.post("/chat/bots/{bot_id}/check")
 async def check_bot(bot_id: int, user: CurrentUser, db: DB):
     bot = await _bot_for(db, user, bot_id)
+    if bot.platform == "instagram":
+        raise HTTPException(422, "جواب خودکار اینستاگرام از صفحهٔ کانال‌ها تنظیم می‌شود.")
     bot.last_check_at = utcnow()
     try:
         me = await tg.call(bot, "getMe")

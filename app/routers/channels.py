@@ -16,6 +16,7 @@ from app.platforms.instagram import authorize_url
 from app.platforms.instagram_private import submit_code
 from app.platforms.registry import PLATFORM_INFO
 from app.schemas import ChannelOut, OperationOut
+from app.services import ig_chat
 from app.services.integrations import instagram_app, instagram_crawler
 from app.services.ops import OpContext, enqueue, fail_operation
 from app.services.plans import check_limit
@@ -161,6 +162,27 @@ async def instagram_code(channel_id: int, body: CodeIn, user: CurrentUser, db: D
     return {"ok": True}
 
 
+class InboxIn(BaseModel):
+    dm: bool = False
+    comments: bool = False
+    comment_text: str = ""
+
+
+@router.put("/channels/{channel_id}/instagram/inbox", response_model=ChannelOut)
+async def instagram_inbox(channel_id: int, body: InboxIn, user: CurrentUser, db: DB):
+    """The chat assistant answers this account's DMs and/or comments (username + password accounts only)."""
+    ch = await db.get(Channel, channel_id)
+    if not ch or ch.platform != "instagram":
+        raise HTTPException(404, "کانال پیدا نشد.")
+    await get_store_for(db, user, ch.store_id)
+    if (ch.config or {}).get("mode") != "private":
+        raise HTTPException(422, "جواب خودکار فقط برای حسابی است که با نام کاربری و رمز وصل شده.")
+    await ig_chat.configure(db, ch, dm=body.dm, comments=body.comments, comment_text=body.comment_text)
+    await db.commit()
+    await db.refresh(ch)
+    return ch
+
+
 class ChannelPatch(BaseModel):
     display_name: str | None = None
 
@@ -185,5 +207,7 @@ async def disconnect(channel_id: int, user: CurrentUser, db: DB):
         raise HTTPException(404, "کانال پیدا نشد.")
     await get_store_for(db, user, ch.store_id)
     ch.status, ch.credentials_encrypted = "disconnected", None
+    if ch.platform == "instagram" and (bot := await ig_chat.bot_for(db, ch)):
+        bot.status = "disconnected"
     await db.commit()
     return {"ok": True}

@@ -481,8 +481,10 @@ class ChatBot(TimestampMixin, Base):
     __tablename__ = "chat_bots"
     id: Mapped[int] = mapped_column(primary_key=True)
     store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), index=True)
-    platform: Mapped[str] = mapped_column(String(20))  # telegram | bale
+    platform: Mapped[str] = mapped_column(String(20))  # telegram | bale | instagram
     mode: Mapped[str] = mapped_column(String(12), default="bot")  # bot | business
+    # Instagram: the channel (username + password account) whose DMs and comments the assistant answers.
+    channel_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     # connected | waiting_business | error | disconnected
     status: Mapped[str] = mapped_column(String(20), default="connected")
     credentials_encrypted: Mapped[str | None] = mapped_column(Text)
