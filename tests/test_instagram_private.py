@@ -235,6 +235,17 @@ async def test_paced_publish_goes_back_to_the_queue(client, monkeypatch):
     r = await client.post(f"/products/{p['id']}/publish", headers=h, json={"channel_ids": [cid], "format": "story"})
     assert r.status_code == 202, r.text
     op_id = r.json()[0]["id"]
+    # The seller sees the turn right away, before the worker touches it.
+    assert "در صف؛ نوبت انتشار حدود" in r.json()[0]["current_step"] and "جلوگیری از بن" in r.json()[0]["current_step"]
+    first_at = r.json()[0]["run_after"]
+    post = await client.post(f"/products/{p['id']}/publish", headers=h, json={"channel_ids": [cid]})
+    assert post.json()[0]["run_after"] > first_at  # behind the story, at least one gap later
+    p2 = (await client.post(f"/stores/{sid}/products", headers=h, json={"title": "کفش", "price": 1000,
+                                                                       "images": ["/media/b.png"]})).json()
+    bulk = await client.post(f"/stores/{sid}/products/bulk", headers=h,
+                             json={"action": "publish", "channel_ids": [cid], "product_ids": [p2["id"]]})
+    assert bulk.status_code == 200, bulk.text
+    assert bulk.json()["paced"][0]["count"] == 1 and bulk.json()["paced"][0]["last_at"] > post.json()[0]["run_after"]
     again = await client.post(f"/products/{p['id']}/publish", headers=h, json={"channel_ids": [cid], "format": "story"})
     assert again.json() == []  # the same story is already queued
     assert (await client.post(f"/products/{p['id']}/publish", headers=h,
