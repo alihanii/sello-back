@@ -100,6 +100,13 @@ def fail_operation(op: Operation, exc: Exception) -> None:
 FORMAT_FA = {"post": "", "story": "استوری ", "reel": "ریلز "}
 
 
+def turn_text(local: datetime, today, app: dict[str, Any], paused: bool = False) -> str:
+    """The queued step text (the column holds 80 characters)."""
+    text = f"در صف؛ نوبت حدود {local:%H:%M}" + (f" ({local:%m/%d})" if local.date() != today else "")
+    text += "، حساب در استراحت است" if paused else f"، فاصلهٔ ضدبن {app['gap_min_minutes']}–{app['gap_max_minutes']} دقیقه"
+    return text[:80]
+
+
 async def _pacing_app(db: AsyncSession, channel: Channel) -> dict[str, Any] | None:
     from app.services.integrations import instagram_app, linkedin_app
 
@@ -138,10 +145,8 @@ async def estimate_turn(db: AsyncSession, channel: Channel, op: Operation) -> da
         return None
     local, today = when + timedelta(hours=3, minutes=30), (now + timedelta(hours=3, minutes=30)).date()
     op.run_after = when
-    reason = "حساب موقتاً استراحت می‌کند" if igp._parse(cfg.get("paused_until")) and igp._parse(cfg.get("paused_until")) > now \
-        else f"برای جلوگیری از بن، بین انتشارهای هر حساب {app['gap_min_minutes']} تا {app['gap_max_minutes']} دقیقه فاصله است"
-    op.current_step = (f"در صف؛ نوبت انتشار حدود {local:%H:%M}" + (f" ({local:%m/%d})" if local.date() != today else "")
-                       + f"، چون {reason}")
+    paused = igp._parse(cfg.get("paused_until"))
+    op.current_step = turn_text(local, today, app, bool(paused and paused > now))
     return when
 
 

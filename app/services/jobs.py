@@ -96,9 +96,9 @@ async def _paced(ctx: OpContext, channel: Channel) -> bool:
     op.status, op.started_at, op.run_after = "queued", None, when
     local = when + timedelta(hours=3, minutes=30)
     reason = (channel.config or {}).get("pause_reason") if (channel.config or {}).get("paused_until") else ""
-    op.current_step = (f"در صف؛ نوبت انتشار حدود {local:%H:%M}" + (f" ({local:%m/%d})" if local.date() != (now + timedelta(hours=3, minutes=30)).date() else "")
-                       + ("، چون حساب موقتاً استراحت می‌کند" if reason
-                          else f"، چون برای جلوگیری از بن، بین انتشارهای هر حساب {app['gap_min_minutes']} تا {app['gap_max_minutes']} دقیقه فاصله است"))
+    from app.services.ops import turn_text
+
+    op.current_step = turn_text(local, (now + timedelta(hours=3, minutes=30)).date(), app, bool(reason))
     await db.commit()
     return True
 
