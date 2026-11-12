@@ -534,10 +534,10 @@ async def test_photos_variants_and_clarify(client, monkeypatch):
     llm.answers = [{"reply": "بله موجوده، عکسش رو بفرستم؟", "intent": "product", "images": [hid]}]
     r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "موجوده؟"})).json()
     assert not any(m["image_url"] for m in r["messages"][-2:])
-    # an id the model made up gets no photo
+    # an id the model made up never picks the photo: "عکسشو ببینم" is the hoodie just shown, sent by the shop
     llm.answers = [{"reply": "بفرما", "intent": "product", "images": [99999]}]
     r = (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": "عکسشو ببینم"})).json()
-    assert not any(m["image_url"] for m in r["messages"][-2:])
+    assert [m["image_url"] for m in r["messages"] if m["image_url"]][-1:] == ["/media/x/h0.jpg"]
 
 
 async def test_answer_rules_and_stock_only_available(client, monkeypatch):
@@ -2539,3 +2539,64 @@ async def test_anything_else_is_asked_before_the_details(client, monkeypatch):
     assert "نام و نام خانوادگی" in m["text"] and co.MORE_ASK not in m["text"]
     items = (await _state(sid))["order"]["items"]
     assert len(items) == 2
+
+
+async def _sullivan_shop(client, monkeypatch, phone, only_sullivan=False):
+    """ali's test bot: the Ronaldo hoodie in the cart, then «what designs do you have?» and «عکس»."""
+    from app.core.db import SessionLocal
+    from app.models import ProductImage
+    h, sid, llm, *_ = await _setup(client, monkeypatch, phone)
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        "enabled": True, "orders_enabled": True, "payment": {"card_number": "6037991234567890"}})
+    specs = [("هودی مشکی طرح رونالدو", "3", ""), ("هودی طرح سالیوان سفید", "4", "پارچه دورس، موجود در همه سایزها")]
+    if not only_sullivan:
+        specs += [("ست هودی کاپلی مشکی طرح قاب عکس", "6", ""), ("هودی کاپلی طرح ملاه و سالی", "10", "")]
+    rows = {}
+    for title, sku, desc in specs:
+        rows[sku] = (await client.post(f"/stores/{sid}/products", headers=h, json={
+            "title": title, "sku": sku, "price": 3000000, "stock_qty": 5, "category": "هودی",
+            "description": desc})).json()
+    async with SessionLocal() as db:
+        db.add_all([ProductImage(product_id=r["id"], url=f"/media/x/{r['id']}.jpg") for r in rows.values()])
+        await db.commit()
+
+    async def say(text):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": text})).json()["messages"]
+
+    llm.answers = [{"reply": "", "intent": "order", "order_action": "update",
+                    "order": {"items": [{"product_id": rows["3"]["id"], "qty": 1}]}}]
+    assert co.MORE_ASK in (await say("سلام هودی مشکی رونالدو میخوام"))[-1]["text"]
+    llm.answers = [{"reply": "", "intent": "catalog"}]
+    listing = (await say("طرح موجودی هارو واسم بفرست"))[-1]
+    return h, sid, llm, rows, say, listing
+
+
+async def test_ali_photo_of_the_only_suggested_product(client, monkeypatch):
+    """«عکس» after a list of one: that product's photo, not «it has no photo» or another product's."""
+    h, sid, llm, rows, say, listing = await _sullivan_shop(client, monkeypatch, "09125550984", only_sullivan=True)
+    assert "سالیوان" in listing["text"] and "رونالدو" not in listing["text"]
+    llm.answers = [{"reply": "ببخشید، هودی طرح سالیوان سفید عکس نداره.", "intent": "product"}]
+    out = await say("عکس")
+    imgs = [m["image_url"] for m in out if m["image_url"]]
+    assert imgs[-1:] == [f"/media/x/{rows['4']['id']}.jpg"]
+    assert not any("عکس نداره" in (m["text"] or "") for m in out[-3:])
+
+
+async def test_ali_five_of_the_category_with_buttons_and_the_named_photo(client, monkeypatch):
+    h, sid, llm, rows, say, listing = await _sullivan_shop(client, monkeypatch, "09125550985")
+    # the category they're on (hoodies), not the one in the cart, with a ready button each and an invitation
+    assert "از دستهٔ «هودی»" in listing["text"] and "رونالدو" not in listing["text"]
+    assert all(t in listing["text"] for t in ("سالیوان", "قاب عکس", "ملاه و سالی"))
+    assert "سفارشت رو هم همین‌جا ثبت می‌کنم" in listing["text"]
+    labels = [b[0] for b in listing["buttons"]]
+    assert len(labels) == 3 and all(x.startswith("🔎") for x in labels)
+    # «نه، عکس سالیوان رو ببینم»: Sullivan's own photo, never the picture-frame set's
+    out = await say("خب نه عکس سالیوان رو ببینم")
+    imgs = [m["image_url"] for m in out if m["image_url"]]
+    assert imgs[-1:] == [f"/media/x/{rows['4']['id']}.jpg"]
+    # a button: that product's photo and details, and how to order it
+    tap = next(x for x in labels if "ملاه" in x)
+    out = await say(tap)
+    assert out[-2]["image_url"] == f"/media/x/{rows['10']['id']}.jpg" and "کد 10" in out[-2]["text"]
+    assert "همین‌جا برات ثبت کنم" in out[-1]["text"]
+    assert len((await _state(sid))["order"]["items"]) == 1  # looking is not ordering

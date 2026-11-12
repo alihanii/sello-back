@@ -560,31 +560,46 @@ def dynamic_prompt(text: str, history: list[ChatMessage], products: list[Product
 
 
 CATALOG_SHOW = 6
+BROWSE_SHOW = 5  # "what do you have?": five products, of the category they're on, else the newest
+PICK = "🔎 "  # a suggested product's button: tapping it sends its photo and details
+PICK_INVITE = ("روی هرکدوم بزنی عکس و جزئیاتش رو می‌فرستم 👇\nسفارشت رو هم همین‌جا ثبت می‌کنم و هر سؤالی درباره‌ی "
+               "سفارش داشتی بپرس 🌸")
 
 
-def catalog_overview(rows: list[Product], exact_stock: bool) -> str:
+def pick_label(p: Product) -> str:
+    return PICK + p.title[:40]
+
+
+def pick_buttons(rows: list[Product], ids: list[int]) -> list[list[str]] | None:
+    """One ready button per suggested product."""
+    by_id = {p.id: p for p in rows}
+    labels = list(dict.fromkeys(pick_label(by_id[i]) for i in ids if i in by_id))[:BROWSE_SHOW + 1]
+    return [[x] for x in labels] or None
+
+
+def catalog_overview(rows: list[Product], exact_stock: bool, show: int = CATALOG_SHOW, head_text: str = "") -> str:
     """A true, free answer to "what do you have?": in-stock products first, with code and price."""
     if not rows:
         return "فعلاً محصولی توی فروشگاه ثبت نشده 🙏 اگه دنبال چیز خاصی هستی بگو تا از همکارم بپرسم."
     ordered = sorted(rows, key=lambda p: (p.stock_qty <= 0, p.status != "ready"))
     lines = []
-    for p in ordered[:CATALOG_SHOW]:
+    for p in ordered[:show]:
         code = f" (کد {p.sku})" if p.sku else ""
         price = f" — {money(p.price)}" if p.price else ""
         lines.append(f"▫️ {p.title[:80]}{code}{price}" + (" (ناموجود)" if p.stock_qty <= 0 else ""))
     in_stock = sum(p.stock_qty > 0 for p in rows)
-    head = ("این‌ها رو داریم 🌸" if in_stock else
-            "این‌ها محصولات ما هستن، ولی الان همه‌شون ناموجودن 🙏")
+    head = head_text or ("این‌ها رو داریم 🌸" if in_stock else
+                         "این‌ها محصولات ما هستن، ولی الان همه‌شون ناموجودن 🙏")
     # The seller's categories, most products first: the whole range at a glance, beyond the first few products.
     counts: dict[str, int] = {}
     for p in rows:
         if p.category:
             counts[p.category] = counts.get(p.category, 0) + 1
-    if len(counts) > 1:
+    if len(counts) > 1 and not head_text:
         head += "\nدسته‌ها: " + "، ".join(sorted(counts, key=lambda c: -counts[c])[:12])
-    more = len(rows) - CATALOG_SHOW
-    tail = (f"و {fa_number(more)} محصول دیگه؛ اسم یا نوع چیزی که می‌خوای رو بگو تا پیداش کنم." if more > 0
-            else "کدوم رو بیشتر توضیح بدم؟")
+    more = len(rows) - show
+    tail = (f"و {fa_number(more)} محصول دیگه؛ اسم یا نوع چیزی که می‌خوای رو بگو تا پیداش کنم.\n" if more > 0
+            else "") + PICK_INVITE
     return f"{head}\n" + "\n".join(lines) + f"\n{tail}"
 
 
@@ -592,7 +607,8 @@ _BROWSE_WORDS = set("""دیگه دیگر دیگری مدل مدلا مدلای �
 بدی بده بهم میتونی می‌تونی میشه داریم دارید ببینم چیزی چیا چیزایی چیزای هایی های رنگ رنگای سایز جنس نوع انواع بیشتر
 بقیه همه همین اون محصول محصولات محصولی جنس کار کارای لباس ببینمشون ببینمش ببینمشو ببینمشونو ببینیم دیدن عکس عکسش
 عکساش عکسشون عکسا عکسای تصویر تصاویر جزئیات جزییات توضیح توضیحات بفرست بفرستی بفرستید نشونشون یکی دوتا دو سه چهار
-تا تاش تاشو تاشون تاییش چندتا چندتاش رنگشون رنگش رنگاش سایزش سایزشون""".split())
+تا تاش تاشو تاشون تاییش چندتا چندتاش رنگشون رنگش رنگاش سایزش سایزشون موجودی موجودیا موجودیها موجودی‌ها موجودیارو
+هارو هاتون هاشون هاتونو واسم برام برامون واسمون جدید جدیدا جدیدها جدیدتون دارین داری چی چیه محصولاتتون محصولاتو""".split())
 # "other designs / what models of X do you have": the shop's own search answers, even when the model missed it.
 _BROWSE_Q = re.compile(r"((مدل|طرح)\S*\s*(های|‌های)?\s*(دیگه|دیگر|دیگری)|یه\s*(طرح|مدل)\s*دیگه|دیگه\s*چه\s*(مدل|طرح)|"
                        r"(چه|کدوم|چند)\s*(تا\s*)?(مدل|طرح)\S*\s*(از|اسپ|دارین|دارید|داری|موجود))")
@@ -662,7 +678,7 @@ def _first(rows: list[Product]) -> list[Product]:
 
 
 async def catalog_answer(db: AsyncSession, store_id: int, text: str, recent: list[int], exact_stock: bool,
-                         listed: list[int] | None = None) -> str:
+                         listed: list[int] | None = None, cart: list[int] | None = None) -> str:
     """"What do you have / other Spider-Man designs?": the products the words name (by title, category, kind and
     tags; then by description). None of them: we don't have it, and what we do have in that category. `listed` gets
     the products the answer shows, for "can I see them?" next."""
@@ -678,8 +694,19 @@ async def catalog_answer(db: AsyncSession, store_id: int, text: str, recent: lis
     if not q and not any(_overlap({w}, _BROWSE_WORDS) for w in norm(text).split()):
         return ""  # "اره" / "خب" alone: an answer to the last question, the assistant reads it
     if not q:
-        listed[:] = [p.id for p in _first(rows)]
-        return catalog_overview(rows, exact_stock)
+        # "What do you have?": five of the category they're on (the cart's, else the product last talked about),
+        # the ones not in the cart first; else the five newest.
+        by_id = {p.id: p for p in rows}
+        on = [by_id[i] for i in list(reversed(cart or [])) + list(reversed(recent or [])) if i in by_id]
+        cat = next((p.category for p in on if p.category), "")
+        pool = [p for p in rows if cat and p.category == cat]
+        pool = [p for p in pool if p.id not in (cart or [])] if cart else pool
+        if pool and (cart or len(pool) >= 2):
+            pick = _first(pool)[:BROWSE_SHOW]
+            listed[:] = [p.id for p in pick]
+            return catalog_overview(pool, exact_stock, BROWSE_SHOW, f"از دستهٔ «{cat}» این‌ها رو داریم 🌸")
+        listed[:] = [p.id for p in _first(rows)[:BROWSE_SHOW]]
+        return catalog_overview(rows, exact_stock, BROWSE_SHOW)
     named, _, generic = _named(rows, q)
     last = next((p for p in rows if recent and p.id == recent[-1]), None)
     asked = " ".join(sorted(q, key=lambda w: norm(text).find(w)))
@@ -1201,9 +1228,45 @@ _SEE_THEM = re.compile(r"(ببینم|ببینیم|نشون\S*\s*(بده|بدین
                        r"توضیح\S*\s*(بیشتر|بده|بدین)|بیشتر\s*توضیح)")
 
 
+def cart_ids(state: dict[str, Any]) -> list[int]:
+    return [int(i["product_id"]) for i in (state.get("order") or {}).get("items") or [] if i.get("product_id")]
+
+
+async def one_product(db: AsyncSession, state: dict[str, Any], p: Product, text: str) -> list[Reply]:
+    """One product's photos and details, sent by the shop itself: the product asked about, never another one's
+    photo or a "no photo" for a product that has one."""
+    per = MAX_PHOTOS if _MORE_PHOTOS.search(text) else 1
+    urls = (await db.execute(select(ProductImage.url).where(ProductImage.product_id == p.id)
+                             .order_by(ProductImage.position, ProductImage.id).limit(per))).scalars().all()
+    caption = (p.title[:80] + (f" (کد {p.sku})" if p.sku else "") + (f" — {money(p.price)}" if p.price else "")
+               + (" (ناموجود)" if p.stock_qty <= 0 else ""))
+    opts = variant_options(p)
+    extra = "\n".join(f"{_KIND_FA.get(k, k)}: {'، '.join(v)}" for k, v in opts.items() if v)
+    desc = re.sub(r"\s+", " ", p.description or "").strip()
+    detail = "\n".join(x for x in (extra, desc[:300] + ("…" if len(desc) > 300 else "")) if x)
+    body = caption + (f"\n{detail}" if detail else "")
+    out = [Reply(body if n == 0 else "", image_url=u, source="catalog", intent="product") for n, u in enumerate(urls)]
+    if not urls:
+        out.append(Reply(body + "\n(عکسی ازش ثبت نشده 🙏)", source="catalog", intent="product"))
+    need = [_KIND_FA.get(k, k) for k, v in opts.items() if len(v) > 1]
+    out.append(Reply(("بخوای سفارشش بدی، " + (" و ".join(need) + "ش رو بگو" if need else "بگو") +
+                      " تا همین‌جا برات ثبت کنم 🌸 سؤالی هم داشتی بپرس."), source="catalog", intent="product"))
+    state["listed"] = [p.id]
+    state["recent_products"] = [i for i in state.get("recent_products") or [] if i != p.id][-3:] + [p.id]
+    return out
+
+
 async def see_them(db: AsyncSession, store: Store, agent: ChatAgent, state: dict[str, Any], text: str) -> list[Reply]:
     """The photo and details of each product the customer asks to see: the ones the words name, else the ones the
     last answer listed. Empty when it isn't that ask (another design, the order…) or there is nothing to show."""
+    if text.startswith(PICK.strip()):
+        # A suggested product's button: that product, found by the label it carries.
+        label = text.removeprefix(PICK.strip()).strip()
+        rows = await catalog_rows(db, store.id)
+        listed_ids = state.get("listed") or []
+        hits = [p for p in rows if p.title[:40].strip() == label]
+        p = next((x for x in hits if x.id in listed_ids), hits[0] if hits else None)
+        return await one_product(db, state, p, text) if p else []
     if (not _SEE_THEM.search(text) or _ANOTHER.search(text) or _MY_ORDER.search(text) or _PAID.search(text)
             or norm_phone(text) or bad_phone(text) or _CONTACT_FORM.search(text) or len(text) > 160):
         return []  # a filled-in contact form ("…توی یک پیام بفرست") is the order's details, never a photo ask
@@ -1214,6 +1277,11 @@ async def see_them(db: AsyncSession, store: Store, agent: ChatAgent, state: dict
     colours = _colors_in(text)
     narrowed = (_rank(listed, q, lambda p: f"{p.title} {p.category or ''} {' '.join(p.tags or [])}", strict=True)
                 if listed and q else [])
+    if narrowed:
+        # "عکس هودی اختاپوس" with the Sullivan hoodie listed: "هودی" fits it, but another product fits the words
+        # better — the list doesn't win over the product they named.
+        shop = _named(rows, q)[0]
+        narrowed = [p for p in narrowed if p in shop] if shop else narrowed
     from_list = bool(listed) and (not q or bool(narrowed))
     if from_list:
         # "the two or three of them in black": out of the list just shown, never the whole shop by stray words.
@@ -1231,8 +1299,12 @@ async def see_them(db: AsyncSession, store: Store, agent: ChatAgent, state: dict
             return [Reply(f"از این‌ها رنگ {asked} پیدا نکردم 🙏 رنگ‌هاشون:\n" + "\n".join(lines)
                           + "\nرنگ دیگه‌ای می‌خوای یا یکی‌شون رو ببینی؟", source="catalog", intent="product")]
         products = has
+    if len(products) == 1 and not colours and from_list:
+        # One product of the list just shown ("عکس", "عکس سالیوان رو ببینم"): the shop sends that product's own
+        # photos — the model, given other products to talk about, sent a different one's photo or said it had none.
+        # A product named out of the blue ("عکس هودی اختاپوس") goes to the model, which has it in its list.
+        return await one_product(db, state, products[0], text)
     if len(products) < 2 and not (from_list and colours):
-        # One product ("عکس هودی اختاپوس", "عکسشو ببینم"): the assistant sends that product's photos itself.
         return []
     out: list[Reply] = []
     for p in products[:MAX_PHOTOS]:
@@ -1251,7 +1323,8 @@ async def see_them(db: AsyncSession, store: Store, agent: ChatAgent, state: dict
     state["recent_products"] = (list(state.get("recent_products") or []) + shown)[-4:]
     more = len(products) - len(shown)
     tail = (f"{fa_number(more)} تای دیگه هم هست؛ بگو تا اون‌ها رو هم بفرستم. " if more > 0 else "")
-    out.append(Reply(tail + "کدوم رو می‌خوای؟ سایز و رنگش رو هم بگو 🌸", source="catalog", intent="product"))
+    out.append(Reply(tail + "کدوم رو می‌خوای؟ سایز و رنگش رو هم بگو 🌸", source="catalog", intent="product",
+                     buttons=pick_buttons(products, shown)))
     return out
 
 
@@ -1275,11 +1348,12 @@ async def code_skill(db: AsyncSession, conv: ChatConversation, store: Store, age
     if skill == "browse" and agent.catalog_enabled:
         listed: list[int] = []
         answer = await catalog_answer(db, store.id, text, state.get("recent_products") or [],
-                                      policy(agent)["stock"] == "exact", listed)
+                                      policy(agent)["stock"] == "exact", listed, cart_ids(state))
         if not answer:
             return False
         state["listed"] = listed
-        result.replies.append(Reply(answer, source="catalog", intent="product"))
+        result.replies.append(Reply(answer, source="catalog", intent="product",
+                                    buttons=pick_buttons(await catalog_rows(db, store.id), listed)))
         return True
     if skill == "status":
         if answer := await order_status_reply(db, conv, store, text, state):
@@ -1651,10 +1725,11 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         # A product or kind named in the message: only the matching products, not the whole shop.
         listed: list[int] = []
         answer = await catalog_answer(db, store.id, text, state.get("recent_products") or [],
-                                      policy(agent)["stock"] == "exact", listed)
+                                      policy(agent)["stock"] == "exact", listed, cart_ids(state))
         if answer:
             state["listed"] = listed
-            result.replies.append(Reply(answer, source="catalog", intent="product", usage=usage))
+            result.replies.append(Reply(answer, source="catalog", intent="product", usage=usage,
+                                        buttons=pick_buttons(await catalog_rows(db, store.id), listed)))
             return done()
     if intent == "order_status" and not reply_text.strip():
         # "Where is my order?": the details come from the orders themselves. A follow-up ("why?", "when?") is
