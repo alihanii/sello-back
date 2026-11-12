@@ -117,6 +117,7 @@ def pause(channel: Channel, kind: str, reason: str) -> None:
 # ---------- errors ----------
 
 def _humanize(exc: Exception, channel: Channel | None = None) -> PlatformError:
+    import requests
     from instagrapi import exceptions as e
 
     name = type(exc).__name__
@@ -163,8 +164,12 @@ def _humanize(exc: Exception, channel: Channel | None = None) -> PlatformError:
             channel.config = cfg
         return PlatformError("اینستاگرام IP این پروکسی را بسته؛ دفعهٔ بعد پروکسی دیگری از پنل ادمین استفاده می‌شود.",
                              "ig_proxy_blocked", PROXY_HELP, name)
-    if isinstance(exc, (e.ClientConnectionError, e.ClientRequestTimeout, e.ProxyError, OSError)) or \
-            "ConnectionError" in name or "Timeout" in name:
+    if isinstance(exc, (e.ClientConnectionError, e.ClientRequestTimeout, requests.exceptions.ConnectionError,
+                        requests.exceptions.Timeout, OSError)) or \
+            "ConnectionError" in name or "ProxyError" in name or "Timeout" in name:
+        if channel and (channel.config or {}).get("own_proxy"):
+            return PlatformError("ارتباط با اینستاگرام از پروکسی اختصاصی این حساب برقرار نشد؛ در صفحهٔ کانال‌ها «تست» یا «تغییر» پروکسی را بزن.",
+                                 "network", RECONNECT, str(exc)[:300])
         return PlatformError("ارتباط با اینستاگرام از طریق پروکسی برقرار نشد؛ پروکسی‌های اینستاگرام را در پنل ادمین بررسی کن.",
                              "network", PROXY_HELP, str(exc)[:300])
     return PlatformError(f"اینستاگرام خطا داد: {str(exc)[:200] or name}", "platform_error", detail=name)
