@@ -322,3 +322,27 @@ async def test_messages_and_comments_reach_the_assistant(client, fake):
     assert await li_chat.poll_once(bot_id, comments_due=False) == []
     async with SessionLocal() as db:
         assert (await db.get(ChatConversation, convs["ACoAAB2222"].id)).status == "human"
+
+
+async def test_linkedin_on_the_chat_connections_switch(client, fake):
+    from app.core.db import SessionLocal
+    from app.models import Channel
+
+    from tests.conftest import login
+
+    h = await login(client, "09128880463")
+    sid = (await client.post("/stores", json={"name": "سوییچ لینکدین"}, headers=h)).json()["id"]
+    async with SessionLocal() as db:
+        ch = Channel(store_id=sid, platform="linkedin", status="connected", display_name="Ali Shop",
+                     credentials_encrypted=_channel().credentials_encrypted, config={"mode": "session", "profile_id": ME})
+        db.add(ch)
+        await db.commit()
+        cid = ch.id
+    rows = (await client.get(f"/stores/{sid}/chat/channels", headers=h)).json()
+    row = next(r for r in rows if r["channel_id"] == cid)
+    assert row["platform"] == "linkedin" and row["available"] and not row["active"]
+    assert [f["key"] for f in row["features"]] == ["dm", "comments"]
+    r = await client.put(f"/chat/channels/{cid}", headers=h, json={"dm": True, "comments": False, "comment_text": ""})
+    assert r.status_code == 200, r.text
+    assert r.json()["active"] and r.json()["dm"] and not r.json()["comments"]
+    assert (await client.get(f"/stores/{sid}/chat/bots", headers=h)).json() == []
