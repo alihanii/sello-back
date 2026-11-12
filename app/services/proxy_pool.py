@@ -54,6 +54,7 @@ class _Node:
     error: str = ""  # can't run at all (bad link, no xray)
     health: dict[str, dict[str, Any]] = field(default_factory=dict)
     failed_at: dict[str, float] = field(default_factory=dict)
+    channel_id: int | None = None  # a seller's own proxy for one account; never shared
 
     @property
     def url(self) -> str:
@@ -146,7 +147,8 @@ class Pool:
             nodes: list[_Node] = []
             for r in rows:
                 old = self.nodes.get(r.id)
-                n = _Node(r.id, r.name, r.protocol, list(r.purposes or []), health=dict(r.health or {}))
+                n = _Node(r.id, r.name, r.protocol, list(r.purposes or []), health=dict(r.health or {}),
+                          channel_id=r.channel_id)
                 if old:
                     n.failed_at = old.failed_at
                     n.health = {**n.health, **old.health}
@@ -165,7 +167,7 @@ class Pool:
             self.ports = {k: v for k, v in self.ports.items() if k in self.nodes}
 
     def _usable(self, purpose: str) -> list[_Node]:
-        return [n for n in self.nodes.values() if purpose in n.purposes and n.url and not n.error]
+        return [n for n in self.nodes.values() if purpose in n.purposes and n.url and not n.error and n.channel_id is None]
 
     def candidates(self, purpose: str) -> list[_Node]:
         """Healthy nodes by latency, then not yet tested ones; nodes failed recently come last."""
@@ -197,10 +199,14 @@ class Pool:
         return out
 
     def sticky(self, purpose: str, preferred: int | None, load: dict[int, int] | None = None,
-               exclude: tuple[int, ...] = ()) -> tuple[int | None, str] | None:
+               exclude: tuple[int, ...] = (), channel_id: int | None = None) -> tuple[int | None, str] | None:
         """One fixed route for an account (Instagram app-API logins must keep one IP): the account's own node while
         it is healthy, else the healthy node fewest accounts use. Only the admin's nodes, never direct, unless the
-        admin set the service to "direct". None when there is no usable node."""
+        admin set the service to "direct". None when there is no usable node.
+        An account with its own proxy (the seller's fixed IP) always uses that one and nothing else."""
+        own = next((n for n in self.nodes.values() if channel_id is not None and n.channel_id == channel_id), None)
+        if own:
+            return (own.id, own.url) if own.url and not own.error else None
         if self.modes.get(purpose, "auto") == "direct":
             return (None, "")
         good = [n for n in self.candidates(purpose) if n.id not in exclude]

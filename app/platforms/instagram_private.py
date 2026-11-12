@@ -153,6 +153,9 @@ def _humanize(exc: Exception, channel: Channel | None = None) -> PlatformError:
     if isinstance(exc, e.LoginRequired):
         return PlatformError("نشست اینستاگرام تمام شد؛ دوباره وصل شو.", "expired", RECONNECT, name)
     if isinstance(exc, e.ProxyAddressIsBlocked):
+        if channel and (channel.config or {}).get("own_proxy"):
+            return PlatformError("اینستاگرام IP پروکسی اختصاصی این حساب را بسته؛ کانفیگ دیگری بده و دوباره وصل شو.",
+                                 "ig_proxy_blocked", RECONNECT, name)
         if channel:
             cfg = dict(channel.config or {})
             cfg["bad_nodes"] = sorted(set(cfg.get("bad_nodes") or []) | {cfg.get("proxy_node_id")} - {None})
@@ -181,7 +184,11 @@ async def _route(ctx, channel: Channel) -> str:
     for c in rows:
         if (c or {}).get("proxy_node_id"):
             load[c["proxy_node_id"]] = load.get(c["proxy_node_id"], 0) + 1
-    route = proxy_pool.pool.sticky("instagram", cfg.get("proxy_node_id"), load, tuple(cfg.get("bad_nodes") or ()))
+    route = proxy_pool.pool.sticky("instagram", cfg.get("proxy_node_id"), load, tuple(cfg.get("bad_nodes") or ()),
+                                   channel_id=channel.id)
+    if route is None and cfg.get("own_proxy"):
+        raise PlatformError("پروکسی اختصاصی این حساب (IP ثابت خودت) کار نمی‌کند؛ کانفیگ را بررسی کن یا با کانفیگ جدید دوباره وصل شو.",
+                            "own_proxy_down", RECONNECT)
     if route is None:
         raise PlatformError("هیچ پروکسی سالمی برای اینستاگرام در پنل ادمین › پروکسی‌ها نیست؛ ادمین باید پروکسی اضافه کند.",
                             "no_proxy", PROXY_HELP)
