@@ -11,7 +11,7 @@ from app.services.media import public_url, put, read_local
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
 
-async def load_bytes(url: str) -> bytes:
+async def load_bytes(url: str, max_bytes: int = MAX_IMAGE_BYTES) -> bytes:
     if url.startswith("/media/"):
         if not (local := read_local(url)):
             raise PlatformError("فایل عکس محصول پیدا نشد.", "image_missing", EDIT_PRODUCT)
@@ -24,8 +24,8 @@ async def load_bytes(url: str) -> bytes:
                 data = resp.content
         except httpx.HTTPError as exc:
             raise PlatformError("دانلود عکس محصول ناموفق بود.", "image_download", EDIT_PRODUCT, str(exc)) from exc
-    if len(data) > MAX_IMAGE_BYTES:
-        raise PlatformError("حجم یکی از عکس‌ها بیش از ۱۰ مگابایت است.", "image_too_large", EDIT_PRODUCT)
+    if len(data) > max_bytes:
+        raise PlatformError("حجم یکی از فایل‌های محصول از حد مجاز بیشتر است.", "image_too_large", EDIT_PRODUCT)
     return data
 
 

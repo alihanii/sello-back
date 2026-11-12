@@ -6,7 +6,7 @@ import asyncio
 import logging
 from datetime import timedelta
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
@@ -21,7 +21,10 @@ SCHEDULE_DELTA = {"hourly": timedelta(hours=1), "daily": timedelta(days=1), "wee
 
 async def _claim() -> int | None:
     async with SessionLocal() as db:
-        candidate = await db.scalar(select(Operation.id).where(Operation.status == "queued").order_by(Operation.id).limit(1))
+        now = utcnow()
+        candidate = await db.scalar(select(Operation.id).where(
+            Operation.status == "queued", or_(Operation.run_after.is_(None), Operation.run_after <= now))
+            .order_by(Operation.id).limit(1))
         if candidate is None:
             return None
         res = await db.execute(update(Operation).where(Operation.id == candidate, Operation.status == "queued")
@@ -40,6 +43,9 @@ async def run_operation(op_id: int) -> None:
             if not handler:
                 raise RuntimeError(f"no handler for {op.type}")
             await handler(ctx)
+            if op.status == "queued":  # the handler put it back for later (paced publishes)
+                await db.commit()
+                return
             if op.status == "running":
                 op.status = "succeeded"
             op.progress, op.finished_at, op.current_step = 100, utcnow(), ""

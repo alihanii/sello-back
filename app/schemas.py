@@ -60,10 +60,16 @@ class ListingOut(ORM):
     status: str
     remote_id: str
     remote_url: str
+    format: str = "post"
     published_by: str
     published_at: datetime | None
     last_error_fa: str
     updated_at: datetime
+
+    @field_validator("format", mode="before")
+    @classmethod
+    def _post_by_default(cls, v):
+        return v or "post"
 
 
 class ProductIn(BaseModel):
@@ -80,6 +86,7 @@ class ProductIn(BaseModel):
     tags: list[str] = []
     status: str = "ready"
     images: list[str] = []
+    video_url: str = ""
 
 
 class ProductPatch(BaseModel):
@@ -96,6 +103,7 @@ class ProductPatch(BaseModel):
     tags: list[str] | None = None
     status: str | None = None
     images: list[str] | None = None
+    video_url: str | None = None
 
 
 class ProductOut(ORM):
@@ -119,9 +127,10 @@ class ProductOut(ORM):
     created_at: datetime
     updated_at: datetime
     images: list[ImageOut] = []
+    video_url: str = ""
     listings: list[ListingOut] = []
 
-    @field_validator("category", mode="before")
+    @field_validator("category", "video_url", mode="before")
     @classmethod
     def _no_null_category(cls, v):
         return v or ""
@@ -163,6 +172,7 @@ class OperationOut(ORM):
     started_at: datetime | None
     finished_at: datetime | None
     seen: bool
+    run_after: datetime | None = None
 
 
 class OperationDetail(OperationOut):

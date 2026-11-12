@@ -97,8 +97,27 @@ def fail_operation(op: Operation, exc: Exception) -> None:
         op.suggested_action = {"type": "retry", "label": "تلاش دوباره"}
 
 
+FORMAT_FA = {"post": "", "story": "استوری ", "reel": "ریلز "}
+
+
 async def queue_publish(db: AsyncSession, product: Product, channel: Channel, *, trigger: str, actor: str,
-                        show_price: bool | None = None) -> int | None:
+                        show_price: bool | None = None, format: str = "post") -> int | None:
+    """Queue one publish. `format` is post | story | reel (story and reel: Instagram only). A post or reel is the
+    product's listing on the channel; a story lasts a day, so it keeps no listing and may be posted again."""
+    payload: dict[str, Any] = {"show_price": show_price} if show_price is not None else {}
+    if format != "post":
+        payload["format"] = format
+    name = channel.display_name or channel.platform
+    if format == "story":
+        busy = await db.scalar(select(Operation.id).where(
+            Operation.type == "publish", Operation.ref_type == "story", Operation.product_id == product.id,
+            Operation.channel_id == channel.id, Operation.status.in_(("queued", "running"))).limit(1))
+        if busy:
+            return None
+        op = await enqueue(db, store_id=product.store_id, type="publish", channel_id=channel.id, product_id=product.id,
+                           ref_type="story", trigger=trigger, actor=actor, payload=payload,
+                           title_fa=f"استوری «{product.title[:60]}» در {name}")
+        return op.id
     listing = (await db.execute(select(ChannelListing).where(
         ChannelListing.product_id == product.id, ChannelListing.channel_id == channel.id))).scalar_one_or_none()
     if not listing:
@@ -109,7 +128,6 @@ async def queue_publish(db: AsyncSession, product: Product, channel: Channel, *,
         return None  # never run two publishes of the same product × channel at once
     listing.status = "queued"
     op = await enqueue(db, store_id=product.store_id, type="publish", channel_id=channel.id, product_id=product.id,
-                       ref_type="listing", ref_id=listing.id, trigger=trigger, actor=actor,
-                       payload={"show_price": show_price} if show_price is not None else None,
-                       title_fa=f"انتشار «{product.title[:60]}» در {channel.display_name or channel.platform}")
+                       ref_type="listing", ref_id=listing.id, trigger=trigger, actor=actor, payload=payload or None,
+                       title_fa=f"انتشار {FORMAT_FA.get(format, '')}«{product.title[:60]}» در {name}")
     return op.id

@@ -196,6 +196,23 @@ class Pool:
             out.append((None, None))
         return out
 
+    def sticky(self, purpose: str, preferred: int | None, load: dict[int, int] | None = None,
+               exclude: tuple[int, ...] = ()) -> tuple[int | None, str] | None:
+        """One fixed route for an account (Instagram app-API logins must keep one IP): the account's own node while
+        it is healthy, else the healthy node fewest accounts use. Only the admin's nodes, never direct, unless the
+        admin set the service to "direct". None when there is no usable node."""
+        if self.modes.get(purpose, "auto") == "direct":
+            return (None, "")
+        good = [n for n in self.candidates(purpose) if n.id not in exclude]
+        now = time.monotonic()
+        healthy = [n for n in good if (n.health.get(purpose) or {}).get("ok") is not False
+                   and now - n.failed_at.get(purpose, -1e9) >= FAIL_COOLDOWN]
+        for n in healthy:
+            if n.id == preferred:
+                return (n.id, n.url)
+        pick = sorted(healthy or good, key=lambda n: (load or {}).get(n.id, 0))
+        return (pick[0].id, pick[0].url) if pick else None
+
     def active(self, purpose: str) -> int | None:
         """The node requests for `purpose` use right now, if it passed its last check."""
         node_id, _ = self.routes(purpose)[0]

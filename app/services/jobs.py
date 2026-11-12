@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from datetime import timedelta
 import mimetypes
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -68,38 +69,79 @@ async def run_health(ctx: OpContext) -> None:
 
 # ---------- publish ----------
 
+async def _paced(ctx: OpContext, channel: Channel) -> bool:
+    """Instagram app-API accounts publish on a pace (random gap, daily cap, pauses). True when this publish must
+    wait: the operation goes back to the queue with `run_after` set, and nothing else changes."""
+    from app.platforms import instagram_private as igp
+    from app.services.integrations import instagram_app
+
+    if channel.platform != "instagram" or (channel.config or {}).get("mode") != "private":
+        return False
+    op, db = ctx.op, ctx.db
+    app = await instagram_app(db)
+    lock = igp._locks.setdefault(channel.id, asyncio.Lock())
+    async with lock:
+        await db.refresh(channel)
+        now = utcnow()
+        when = igp.next_slot(channel, app, now)
+        if when is None:
+            igp.reserve(channel, app, now)
+            await db.commit()
+            return False
+    op.status, op.started_at, op.run_after = "queued", None, when
+    local = when + timedelta(hours=3, minutes=30)
+    reason = (channel.config or {}).get("pause_reason") if (channel.config or {}).get("paused_until") else ""
+    op.current_step = (f"در صف؛ نوبت انتشار حدود {local:%H:%M}" + (f" ({local:%m/%d})" if local.date() != (now + timedelta(hours=3, minutes=30)).date() else "")
+                       + ("، چون حساب موقتاً استراحت می‌کند" if reason else ""))
+    await db.commit()
+    return True
+
+
 async def run_publish(ctx: OpContext) -> None:
     op, db = ctx.op, ctx.db
-    listing = await db.get(ChannelListing, op.ref_id)
-    channel = await db.get(Channel, listing.channel_id)
+    fmt = (op.payload or {}).get("format") or "post"
+    listing = await db.get(ChannelListing, op.ref_id) if op.ref_type == "listing" else None
+    channel = await db.get(Channel, listing.channel_id if listing else op.channel_id)
     store = await db.get(Store, op.store_id)
-    product = await _load_product(db, listing.product_id)
+    product = await _load_product(db, listing.product_id if listing else op.product_id)
     adapter = get_adapter(channel.platform)
-    listing.status = "publishing"
+    if channel.status == "connected" and await _paced(ctx, channel):
+        return
+    if listing:
+        listing.status = "publishing"
     await db.commit()
     try:
         if channel.status != "connected":
             raise PlatformError(f"کانال {adapter.label_fa} وصل نیست.", "channel_disconnected",
                                 {"type": "reconnect", "label": "اتصال مجدد"})
         async with ctx.step("validate", "بررسی محصول با قوانین پلتفرم",
-                            request={"title": product.title, "images": len(product.images)}) as s:
-            errors = adapter.validate(product)
+                            request={"title": product.title, "images": len(product.images), "format": fmt}) as s:
+            if hasattr(adapter, "validate_publish"):
+                errors = adapter.validate_publish(channel, product, fmt)
+            elif fmt != "post":
+                errors = [f"{adapter.label_fa} فقط پست معمولی دارد؛ استوری و ریلز مخصوص اینستاگرام است."]
+            else:
+                errors = adapter.validate(product)
             s.response = {"errors": errors}
             if errors:
                 raise PlatformError(" ".join(errors), "validation", EDIT_PRODUCT)
-        result = await adapter.publish(ctx, channel, product, store, existing_remote_id=listing.remote_id)
+        result = await adapter.publish(ctx, channel, product, store,
+                                       existing_remote_id=listing.remote_id if listing else "")
     except Exception as exc:
-        listing.status = "failed"
-        listing.last_error_fa = getattr(exc, "message_fa", "خطای داخلی سیستم.")
+        if listing:
+            listing.status = "failed"
+            listing.last_error_fa = getattr(exc, "message_fa", "خطای داخلی سیستم.")
         await record_event(db, op.store_id, "publish_failed", operation_id=op.id, channel_id=channel.id)
         raise
-    listing.status = "published"
-    listing.remote_id, listing.remote_url = result.remote_id, result.remote_url
-    listing.published_by = "ai" if op.actor == "ai" else "user"
-    listing.published_at = listing.published_at or utcnow()
-    listing.last_synced_at = utcnow()
-    listing.last_error_fa = ""
-    op.result = {"remote_id": result.remote_id, "remote_url": result.remote_url}
+    if listing:
+        listing.status = "published"
+        listing.remote_id, listing.remote_url = result.remote_id, result.remote_url
+        listing.format = fmt
+        listing.published_by = "ai" if op.actor == "ai" else "user"
+        listing.published_at = listing.published_at or utcnow()
+        listing.last_synced_at = utcnow()
+        listing.last_error_fa = ""
+    op.result = {"remote_id": result.remote_id, "remote_url": result.remote_url, "format": fmt}
     await record_event(db, op.store_id, "publish_ok", operation_id=op.id, channel_id=channel.id)
 
 

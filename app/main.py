@@ -17,6 +17,7 @@ from app.routers import (
 )
 from app.seed import seed
 from app.services.chat_runtime import poller_loop
+from app.services.ig_chat import poller_loop as ig_poller_loop
 from app.services.media import public_url, use_s3
 from app.services.proxy_pool import pool, pool_loop
 from app.services.worker import worker_loop
@@ -33,9 +34,11 @@ async def lifespan(_: FastAPI):
     chat = (asyncio.create_task(poller_loop(stop))
             if settings.worker_enabled and settings.chat_transport == "polling" else None)
     proxies = asyncio.create_task(pool_loop(stop)) if settings.worker_enabled else None
+    # Instagram has no webhooks for app-API accounts: their DMs and comments are read on a slow timer.
+    ig_inbox = asyncio.create_task(ig_poller_loop(stop)) if settings.worker_enabled else None
     yield
     stop.set()
-    for t in (task, chat, proxies):
+    for t in (task, chat, proxies, ig_inbox):
         if t:
             await t
     await pool.shutdown()
