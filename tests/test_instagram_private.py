@@ -236,7 +236,8 @@ async def test_paced_publish_goes_back_to_the_queue(client, monkeypatch):
     assert r.status_code == 202, r.text
     op_id = r.json()[0]["id"]
     # The seller sees the turn right away, before the worker touches it.
-    assert "در صف؛ نوبت انتشار حدود" in r.json()[0]["current_step"] and "جلوگیری از بن" in r.json()[0]["current_step"]
+    step = r.json()[0]["current_step"]
+    assert step.startswith("در صف؛ نوبت حدود") and "فاصلهٔ ضدبن" in step and len(step) <= 80  # String(80) in Postgres
     first_at = r.json()[0]["run_after"]
     post = await client.post(f"/products/{p['id']}/publish", headers=h, json={"channel_ids": [cid]})
     assert post.json()[0]["run_after"] > first_at  # behind the story, at least one gap later
