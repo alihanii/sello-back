@@ -70,15 +70,20 @@ async def run_health(ctx: OpContext) -> None:
 # ---------- publish ----------
 
 async def _paced(ctx: OpContext, channel: Channel) -> bool:
-    """Instagram app-API accounts publish on a pace (random gap, daily cap, pauses). True when this publish must
+    """Instagram app-API accounts and LinkedIn accounts publish on a pace (random gap, daily cap, pauses). True when this publish must
     wait: the operation goes back to the queue with `run_after` set, and nothing else changes."""
     from app.platforms import instagram_private as igp
-    from app.services.integrations import instagram_app
+    from app.services.integrations import instagram_app, linkedin_app
 
-    if channel.platform != "instagram" or (channel.config or {}).get("mode") != "private":
+    mode = (channel.config or {}).get("mode")
+    if channel.platform == "instagram" and mode == "private":
+        get_app = instagram_app
+    elif channel.platform == "linkedin":
+        get_app = linkedin_app  # same pacing rules, LinkedIn's own daily cap and gaps
+    else:
         return False
     op, db = ctx.op, ctx.db
-    app = await instagram_app(db)
+    app = await get_app(db)
     lock = igp._locks.setdefault(channel.id, asyncio.Lock())
     async with lock:
         await db.refresh(channel)

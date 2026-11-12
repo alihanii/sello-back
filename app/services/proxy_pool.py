@@ -33,6 +33,7 @@ log = logging.getLogger("sello.proxy")
 PURPOSES: dict[str, dict[str, str]] = {
     "telegram": {"label": "تلگرام", "test_url": "https://api.telegram.org/"},
     "instagram": {"label": "اینستاگرام", "test_url": "https://graph.instagram.com/"},
+    "linkedin": {"label": "لینکدین", "test_url": "https://www.linkedin.com/"},
 }
 MODES = ("auto", "proxy", "direct")
 MODES_KEY = "proxy_modes"

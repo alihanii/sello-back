@@ -136,7 +136,7 @@ async def test_admin_import_modes_and_delete(client):
 
     r = await client.put("/admin/proxies/modes", headers=h, json={"modes": {"instagram": "direct"}})
     assert r.status_code == 200
-    assert {p["id"]: p["mode"] for p in r.json()["purposes"]} == {"telegram": "auto", "instagram": "direct"}
+    assert {p["id"]: p["mode"] for p in r.json()["purposes"]} == {"telegram": "auto", "instagram": "direct", "linkedin": "auto"}
     assert proxy_pool.pool.routes("instagram") == [(None, None)]
 
     nid = nodes["2.2.2.2:3128"]["id"]

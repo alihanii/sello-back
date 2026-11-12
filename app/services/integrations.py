@@ -87,3 +87,31 @@ async def save_payment_config(db: AsyncSession, *, enabled: bool, bank: str, gat
         db.add(row)
     row.value = {"enabled": enabled, "bank": bank}
     row.secret_encrypted = encrypt_credentials({"gateways": gateways})
+
+
+LINKEDIN = "linkedin"
+# Sellers sign in with their own LinkedIn email + password (or paste the browser's li_at cookie); LinkedIn has no
+# public API for comments or messages, so this goes through LinkedIn's own web API. Paced to keep accounts safe.
+LI_PACING = {"daily_limit": 3, "gap_min_minutes": 90, "gap_max_minutes": 180}
+
+
+async def linkedin_app(db: AsyncSession) -> dict[str, Any]:
+    """{enabled, daily_limit, gap_min_minutes, gap_max_minutes, query_ids}. `query_ids` lets the admin replace
+    LinkedIn's messaging GraphQL ids from the panel when LinkedIn changes them, without a deploy."""
+    row = await db.get(AppSetting, LINKEDIN)
+    value = row.value if row else {}
+    return {"enabled": bool(value.get("enabled")),
+            **{k: int(value.get(k) or v) for k, v in LI_PACING.items()},
+            "query_ids": {k: str(v) for k, v in (value.get("query_ids") or {}).items() if v}}
+
+
+async def save_linkedin_app(db: AsyncSession, *, enabled: bool, pacing: dict[str, int],
+                            query_ids: dict[str, str] | None = None) -> None:
+    row = await db.get(AppSetting, LINKEDIN)
+    if not row:
+        row = AppSetting(key=LINKEDIN, value={})
+        db.add(row)
+    old = row.value or {}
+    row.value = {"enabled": enabled, **{k: int(pacing.get(k) or old.get(k) or v) for k, v in LI_PACING.items()},
+                 "query_ids": {k: v.strip() for k, v in (query_ids if query_ids is not None else old.get("query_ids") or {}).items()
+                               if v and v.strip()}}
