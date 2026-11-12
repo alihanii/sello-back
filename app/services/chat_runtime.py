@@ -124,7 +124,7 @@ async def receive(db: AsyncSession, bot: ChatBot, inbound: tg.Inbound) -> int | 
             if bot.platform == "instagram":
                 from app.services import ig_chat
 
-                data, name = await ig_chat.download(inbound.photo_file_id)
+                data, name = await ig_chat.download(inbound.photo_file_id, bot.channel_id)
             else:
                 data, name = await tg.download(bot, inbound.photo_file_id)
             image_url = save_bytes(bot.store_id, data, name)
@@ -320,7 +320,7 @@ def _ext(mime: str) -> str:
 
 
 async def notify_admin_chat(bot: ChatBot | None, text: str, conv: ChatConversation | None = None) -> None:
-    if not bot or not bot.admin_chat_id or bot.platform == "instagram":
+    if not bot or not bot.admin_chat_id or bot.channel_id is not None:
         return
     link = f"\n{settings.frontend_base_url}{_conv_link(conv)}" if conv else ""
     try:
@@ -426,7 +426,7 @@ async def poller_loop(stop: asyncio.Event) -> None:
         try:
             async with SessionLocal() as db:
                 ids = set((await db.execute(select(ChatBot.id).where(
-                    ChatBot.status.in_(["connected", "waiting_business"]), ChatBot.platform != "instagram",
+                    ChatBot.status.in_(["connected", "waiting_business"]), ChatBot.channel_id.is_(None),
                     ChatBot.credentials_encrypted.is_not(None)))).scalars())
             for bid in ids - tasks.keys():
                 tasks[bid] = asyncio.create_task(_poll_bot(bid, stop))

@@ -19,6 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -153,9 +154,20 @@ async def _seen(db: AsyncSession, bot: ChatBot, thread_id: str, msg_id: str) -> 
                                        ChatMessage.external_id == msg_id).limit(1)))
 
 
-async def download(url: str) -> tuple[bytes, str]:
-    """A photo a customer sent (Instagram's CDN is filtered in Iran too, so through the proxies)."""
-    resp = await proxy_pool.request("instagram", "GET", url, timeout=60, follow_redirects=True)
+async def download(url: str, channel_id: int | None = None) -> tuple[bytes, str]:
+    """A photo a customer sent (Instagram's CDN is filtered in Iran too, so through the proxies). An account with
+    the seller's own proxy downloads through that one only."""
+    own = next((n for n in proxy_pool.pool.nodes.values() if channel_id is not None and n.channel_id == channel_id), None)
+    if own:
+        if not own.url or own.error:
+            raise PlatformError("پروکسی اختصاصی این حساب کار نمی‌کند؛ عکس دایرکت دانلود نشد.", "own_proxy_down")
+        try:
+            async with httpx.AsyncClient(timeout=60, proxy=own.url, follow_redirects=True) as client:
+                resp = await client.get(url)
+        except httpx.HTTPError as exc:
+            raise PlatformError("دانلود عکس دایرکت ناموفق بود.", "ig_photo") from exc
+    else:
+        resp = await proxy_pool.request("instagram", "GET", url, timeout=60, follow_redirects=True)
     if resp.status_code >= 400 or not resp.content:
         raise PlatformError("دانلود عکس دایرکت ناموفق بود.", "ig_photo")
     return resp.content, "photo.jpg"

@@ -19,7 +19,7 @@ from app.models import (
 from app.platforms.base import PlatformError
 from app.services import chat_messenger as tg
 from app.services import chat_runtime as rt
-from app.services import chat_faq
+from app.services import chat_channels, chat_faq
 from app.services.ai import AIError, route_problem
 from app.services.ops import record_event
 from app.services.chat_engine import (
@@ -162,9 +162,40 @@ async def chat_platforms(store_id: int, user: CurrentUser, db: DB):
 async def list_bots(store_id: int, user: CurrentUser, db: DB):
     await get_store_for(db, user, store_id)
     rows = (await db.execute(select(ChatBot).where(ChatBot.store_id == store_id, ChatBot.status != "disconnected",
-                                                   ChatBot.platform != "instagram")  # set on the channels page
+                                                   ChatBot.channel_id.is_(None))  # social channels: /chat/channels
                              .order_by(ChatBot.id))).scalars().all()
     return [_bot_out(b) for b in rows]
+
+
+@router.get("/stores/{store_id}/chat/channels")
+async def list_chat_channels(store_id: int, user: CurrentUser, db: DB):
+    """Connected social channels (Instagram, ...) the assistant can answer in, with their on/off switches."""
+    await get_store_for(db, user, store_id)
+    return await chat_channels.list_for_store(db, store_id)
+
+
+class ChatChannelIn(BaseModel):
+    dm: bool = False
+    comments: bool = False
+    comment_text: str = Field("", max_length=200)
+
+
+@router.put("/chat/channels/{channel_id}")
+async def set_chat_channel(channel_id: int, body: ChatChannelIn, user: CurrentUser, db: DB):
+    ch = await db.get(Channel, channel_id)
+    support = chat_channels.support_for(ch.platform) if ch else None
+    if not ch or not support or ch.status == "disconnected":
+        raise HTTPException(404, "کانال پیدا نشد.")
+    await get_store_for(db, user, ch.store_id)
+    keys = {f.key for f in support.features}
+    if (body.dm or body.comments) and (why := support.unavailable(ch) if ch.status == "connected"
+                                       else "کانال وصل نیست؛ از صفحهٔ کانال‌ها دوباره وصلش کن."):
+        raise HTTPException(422, why)
+    await support.configure(db, ch, dm=body.dm and "dm" in keys, comments=body.comments and "comments" in keys,
+                            comment_text=body.comment_text)
+    await db.commit()
+    await db.refresh(ch)
+    return await chat_channels.channel_out(db, ch)
 
 
 class BotIn(BaseModel):
@@ -239,8 +270,8 @@ async def _bot_for(db, user: User, bot_id: int) -> ChatBot:
 @router.post("/chat/bots/{bot_id}/check")
 async def check_bot(bot_id: int, user: CurrentUser, db: DB):
     bot = await _bot_for(db, user, bot_id)
-    if bot.platform == "instagram":
-        raise HTTPException(422, "جواب خودکار اینستاگرام از صفحهٔ کانال‌ها تنظیم می‌شود.")
+    if bot.channel_id is not None:
+        raise HTTPException(422, "این اتصال از «اتصال‌ها › شبکه‌های اجتماعی» روشن و خاموش می‌شود.")
     bot.last_check_at = utcnow()
     try:
         me = await tg.call(bot, "getMe")

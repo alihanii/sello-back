@@ -3,7 +3,7 @@ from typing import Any
 
 import jwt
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.core.config import settings
@@ -145,9 +145,75 @@ async def _own_proxy(db, ch: Channel, link: str) -> None:
     await db.commit()
     await pool.reload()
     res = await pool.check(row.id, "instagram")
+    await pool.persist()
+    _proxy_health(ch, res)
+    await db.commit()
     if not res.get("ok"):
         raise HTTPException(422, "با این کانفیگ به اینستاگرام وصل نشد" + (f": {res.get('error')}" if res.get("error") else "")
                             + ". کانفیگ را بررسی کن یا خالی بگذار تا از پروکسی‌های فروشگاه استفاده شود.")
+
+
+async def _ig_channel(db, user, channel_id: int) -> Channel:
+    ch = await db.get(Channel, channel_id)
+    if not ch or ch.platform != "instagram":
+        raise HTTPException(404, "کانال پیدا نشد.")
+    await get_store_for(db, user, ch.store_id)
+    return ch
+
+
+def _proxy_health(ch: Channel, res: dict) -> None:
+    ch.config = {**(ch.config or {}), "proxy_health": {k: res.get(k) for k in ("ok", "latency_ms", "error", "checked_at")}}
+
+
+class ProxyIn(BaseModel):
+    link: str = Field(min_length=8, max_length=4000)
+
+
+@router.put("/channels/{channel_id}/instagram/proxy", response_model=ChannelOut)
+async def set_own_proxy(channel_id: int, body: ProxyIn, user: CurrentUser, db: DB):
+    """Set or change the seller's own proxy. The new config is checked first; if it fails, the old setting stays."""
+    ch = await _ig_channel(db, user, channel_id)
+    if (ch.config or {}).get("mode") != "private":
+        raise HTTPException(422, "پروکسی اختصاصی فقط برای حسابی است که با نام کاربری و رمز وصل شده.")
+    old_cfg = dict(ch.config or {})
+    row = (await db.execute(select(ProxyNode).where(ProxyNode.channel_id == ch.id))).scalar_one_or_none()
+    old_row = (row.protocol, row.address, row.link_encrypted, dict(row.health or {})) if row else None
+    try:
+        await _own_proxy(db, ch, body.link.strip())
+    except HTTPException:
+        row = (await db.execute(select(ProxyNode).where(ProxyNode.channel_id == ch.id))).scalar_one_or_none()
+        if old_row and row:
+            row.protocol, row.address, row.link_encrypted, row.health = old_row
+        elif row:
+            await db.delete(row)
+        ch.config = old_cfg
+        await db.commit()
+        await pool.reload()
+        raise
+    ch.config = {k: v for k, v in ch.config.items() if k != "bad_nodes"}
+    await db.commit()
+    await db.refresh(ch)
+    return ch
+
+
+@router.post("/channels/{channel_id}/instagram/proxy/test")
+async def test_own_proxy(channel_id: int, user: CurrentUser, db: DB):
+    """Check the account's proxy against Instagram now: the seller's own one, or the shared one it is pinned to."""
+    ch = await _ig_channel(db, user, channel_id)
+    cfg = ch.config or {}
+    node_id = cfg.get("proxy_node_id")
+    if not node_id or node_id not in pool.nodes:
+        if cfg.get("own_proxy"):
+            res = {"ok": False, "latency_ms": None, "error": "پروکسی اختصاصی بارگذاری نشد؛ کانفیگ را دوباره ثبت کن.",
+                   "checked_at": utcnow().isoformat()}
+        else:
+            raise HTTPException(422, "این حساب هنوز به پروکسی‌ای وصل نشده.")
+    else:
+        res = await pool.check(node_id, "instagram")
+        await pool.persist()
+    _proxy_health(ch, res)
+    await db.commit()
+    return {**res, "own": bool(cfg.get("own_proxy")), "address": cfg.get("proxy_address", "") if cfg.get("own_proxy") else ""}
 
 
 @router.delete("/channels/{channel_id}/instagram/proxy", response_model=ChannelOut)
@@ -159,7 +225,7 @@ async def remove_own_proxy(channel_id: int, user: CurrentUser, db: DB):
     await get_store_for(db, user, ch.store_id)
     for row in (await db.execute(select(ProxyNode).where(ProxyNode.channel_id == ch.id))).scalars():
         await db.delete(row)
-    ch.config = {k: v for k, v in (ch.config or {}).items() if k not in ("own_proxy", "proxy_node_id", "proxy_address")}
+    ch.config = {k: v for k, v in (ch.config or {}).items() if k not in ("own_proxy", "proxy_node_id", "proxy_address", "proxy_health")}
     await db.commit()
     await pool.reload()
     await db.refresh(ch)

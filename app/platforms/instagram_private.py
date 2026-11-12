@@ -186,8 +186,9 @@ async def _route(ctx, channel: Channel) -> str:
             load[c["proxy_node_id"]] = load.get(c["proxy_node_id"], 0) + 1
     route = proxy_pool.pool.sticky("instagram", cfg.get("proxy_node_id"), load, tuple(cfg.get("bad_nodes") or ()),
                                    channel_id=channel.id)
-    if route is None and cfg.get("own_proxy"):
-        raise PlatformError("پروکسی اختصاصی این حساب (IP ثابت خودت) کار نمی‌کند؛ کانفیگ را بررسی کن یا با کانفیگ جدید دوباره وصل شو.",
+    if cfg.get("own_proxy") and (route is None or route[0] != cfg.get("proxy_node_id")):
+        # the seller's own proxy only: never fall back to the shared ones
+        raise PlatformError("پروکسی اختصاصی این حساب (IP ثابت خودت) کار نمی‌کند؛ در صفحهٔ کانال‌ها «تست پروکسی» یا «تغییر پروکسی» را بزن.",
                             "own_proxy_down", RECONNECT)
     if route is None:
         raise PlatformError("هیچ پروکسی سالمی برای اینستاگرام در پنل ادمین › پروکسی‌ها نیست؛ ادمین باید پروکسی اضافه کند.",
