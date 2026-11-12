@@ -100,6 +100,8 @@ class Product(TimestampMixin, Base):
     is_golden_sample: Mapped[bool] = mapped_column(Boolean, default=False)
     # Ready-to-post text written by AI; channels use it instead of title + description.
     post_caption: Mapped[str] = mapped_column(Text, default="")
+    # The product's video (/media URL), used for Instagram reels and video stories. Nullable for older databases.
+    video_url: Mapped[str | None] = mapped_column(String(1000), default="", nullable=True)
 
     images: Mapped[list["ProductImage"]] = relationship(
         back_populates="product", order_by="ProductImage.position", cascade="all, delete-orphan"
@@ -130,6 +132,8 @@ class ChannelListing(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(16), default="not_published")
     remote_id: Mapped[str] = mapped_column(String(200), default="")
     remote_url: Mapped[str] = mapped_column(String(1000), default="")
+    # What the listing is on the channel: post | reel (Instagram); stories are short-lived and keep no listing.
+    format: Mapped[str | None] = mapped_column(String(10), default="post", nullable=True)
     published_by: Mapped[str] = mapped_column(String(12), default="")  # user | ai
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -170,6 +174,8 @@ class Operation(TimestampMixin, Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     seen: Mapped[bool] = mapped_column(Boolean, default=False)
+    # A queued operation is not claimed before this time (paced Instagram publishes). Null = right away.
+    run_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     steps: Mapped[list["OperationStep"]] = relationship(order_by="OperationStep.order", cascade="all, delete-orphan")
 

@@ -1,4 +1,6 @@
-"""Instagram through the official "Instagram API with Instagram Login" (graph.instagram.com).
+"""Instagram. Channels connected with username + password (config.mode == "private") go through
+instagram_private (Instagram's app API: posts, albums, stories, reels). The rest of this file is the official
+"Instagram API with Instagram Login" (graph.instagram.com), kept for a reviewed Meta app.
 
 Requirements (Meta docs, content-publishing): a Professional (Business or Creator) account, a Meta app
 with instagram_business_basic + instagram_business_content_publish (Advanced access needs App Review),
@@ -18,6 +20,7 @@ from app.core.config import settings
 from app.core.security import decrypt_credentials, encrypt_credentials
 from app.models import Channel, Product, Store
 from app.platforms.base import EDIT_PRODUCT, RECONNECT, CrawledItem, PlatformError, PublishResult
+from app.platforms.instagram_private import FORMATS, private
 from app.services import proxy_pool
 from app.services.images import public_jpeg
 from app.services.integrations import INSTAGRAM_SCOPES, instagram_app
@@ -119,8 +122,19 @@ class InstagramAdapter:
 
     # ---------- adapter ----------
 
+    @staticmethod
+    def is_private(channel: Channel) -> bool:
+        return (channel.config or {}).get("mode") == "private"
+
+    @staticmethod
+    def format_of(ctx) -> str:
+        fmt = ((getattr(getattr(ctx, "op", None), "payload", None) or {}).get("format")) or "post"
+        return fmt if fmt in FORMATS else "post"
+
     async def connect(self, ctx, channel: Channel, data: dict[str, Any]) -> dict[str, Any]:
         app = await self._app(ctx)
+        if data.get("username"):
+            return await private.connect(ctx, channel, data)
         now = time.time()
         if data.get("code"):
             if not app["oauth_ready"]:
@@ -151,10 +165,19 @@ class InstagramAdapter:
 
     async def health(self, ctx, channel: Channel) -> None:
         app = await self._app(ctx)
+        if self.is_private(channel):
+            return await private.health(ctx, channel)
         token = await self._token(ctx, app, channel)
         async with ctx.step("quota", "بررسی دسترسی و سهمیهٔ انتشار") as s:
             s.response = await self._graph(app, "GET", f"{channel.config['ig_user_id']}/content_publishing_limit", token,
                                            {"fields": "quota_usage,config"})
+
+    def validate_publish(self, channel: Channel, product: Product, fmt: str) -> list[str]:
+        if self.is_private(channel):
+            return private.validate(product, fmt)
+        if fmt != "post":
+            return ["استوری و ریلز فقط برای حساب‌هایی است که با نام کاربری و رمز وصل شده‌اند."]
+        return self.validate(product)
 
     def validate(self, product: Product) -> list[str]:
         errors = []
@@ -179,6 +202,8 @@ class InstagramAdapter:
     async def publish(self, ctx, channel: Channel, product: Product, store: Store,
                       existing_remote_id: str = "") -> PublishResult:
         app = await self._app(ctx)
+        if self.is_private(channel):
+            return await private.publish(ctx, channel, product, store, self.format_of(ctx))
         token = await self._token(ctx, app, channel)
         ig = channel.config["ig_user_id"]
         caption = caption_for(product, store.settings or {}, show_price=(getattr(getattr(ctx, "op", None), "payload", None) or {}).get("show_price"))[:CAPTION_LIMIT]
@@ -224,6 +249,8 @@ class InstagramAdapter:
 
     async def fetch_items(self, ctx, channel: Channel, limit: int = 50) -> list[CrawledItem]:
         app = await self._app(ctx)
+        if self.is_private(channel):
+            return await private.fetch_items(ctx, channel, limit)
         token = await self._token(ctx, app, channel)
         async with ctx.step("media", "دریافت پست‌های حساب") as s:
             data = await self._graph(app, "GET", f"{channel.config['ig_user_id']}/media", token,

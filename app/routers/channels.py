@@ -13,6 +13,7 @@ from app.models import Channel, Operation
 from app.platforms.base import PlatformError
 from app.platforms.digikala import digikala
 from app.platforms.instagram import authorize_url
+from app.platforms.instagram_private import submit_code
 from app.platforms.registry import PLATFORM_INFO
 from app.schemas import ChannelOut, OperationOut
 from app.services.integrations import instagram_app, instagram_crawler
@@ -32,7 +33,9 @@ async def platforms(db: DB):
     for k, v in PLATFORM_INFO.items():
         row = {"platform": k, **v, "enabled": not v.get("flag") or ig["enabled"]}
         if k == "instagram":
-            row["oauth"] = ig["oauth_ready"]
+            row["login"] = ig["method"] == "login"  # username + password (Instagram app API): posts, stories, reels
+            row["oauth"] = ig["method"] == "oauth" and ig["oauth_ready"]
+            row["formats"] = ["post", "story", "reel"] if row["login"] else ["post"]
             row["publish_ready"] = ig["enabled"]
             row["crawl_ready"] = crawl_ready
             row["crawl_only"] = crawl_ready and not ig["enabled"]
@@ -140,6 +143,22 @@ async def health(channel_id: int, user: CurrentUser, db: DB):
                        title_fa=f"بررسی سلامت {ch.display_name or ch.platform}")
     await db.commit()
     return op
+
+
+class CodeIn(BaseModel):
+    code: str
+
+
+@router.post("/channels/{channel_id}/instagram/code")
+async def instagram_code(channel_id: int, body: CodeIn, user: CurrentUser, db: DB):
+    """The code Instagram sent (2FA or a login check) while a username + password connect is waiting for it."""
+    ch = await db.get(Channel, channel_id)
+    if not ch or ch.platform != "instagram":
+        raise HTTPException(404, "کانال پیدا نشد.")
+    await get_store_for(db, user, ch.store_id)
+    if not submit_code(ch.id, body.code):
+        raise HTTPException(409, "ورود منتظر کد نیست یا زمانش تمام شده؛ دوباره وصل شو.")
+    return {"ok": True}
 
 
 class ChannelPatch(BaseModel):

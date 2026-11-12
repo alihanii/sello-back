@@ -1,5 +1,6 @@
 import csv
 import io
+import uuid
 
 import httpx
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
@@ -11,13 +12,14 @@ from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import selectinload
 
 from app.deps import DB, CurrentUser, get_store_for
+from app.platforms.base import PlatformError
 from app.models import Channel, ChannelListing, Operation, Product, ProductImage, Store
 from app.schemas import OperationOut, ProductIn, ProductOut, ProductPatch
 from app.services.ops import queue_publish
-from app.services.media import ALLOWED, save_bytes
+from app.services.media import ALLOWED, VIDEO_TYPES, put, save_bytes
 from app.services.ops import record_event
 from app.services.text import normalize_fa
-from app.services import categories, product_code, product_import
+from app.services import categories, product_code, product_import, video
 from app.services.plans import check_limit, limits_for
 
 router = APIRouter(tags=["products"])
@@ -100,6 +102,7 @@ async def list_categories(store_id: int, user: CurrentUser, db: DB):
 async def create_product(store_id: int, body: ProductIn, user: CurrentUser, db: DB):
     await get_store_for(db, user, store_id)
     await check_limit(db, user, "products")
+    _check_video(store_id, body.video_url)
     data = body.model_dump(exclude={"images"})
     data["category"] = categories.clean(data.get("category"))
     p = Product(store_id=store_id, source="manual", created_by="user", **data)
@@ -123,6 +126,9 @@ async def update_product(product_id: int, body: ProductPatch, user: CurrentUser,
     p = await _get(db, user, product_id)
     data = body.model_dump(exclude_unset=True)
     images = data.pop("images", None)
+    if "video_url" in data:
+        _check_video(p.store_id, data["video_url"])
+        data["video_url"] = data["video_url"] or ""
     if "category" in data:
         data["category"] = categories.clean(data["category"])
     for k, v in data.items():
@@ -177,9 +183,40 @@ async def upload_images(store_id: int, user: CurrentUser, db: DB, files: list[Up
     return {"urls": urls}
 
 
+@router.post("/stores/{store_id}/uploads/video")
+async def upload_video(store_id: int, user: CurrentUser, db: DB, file: UploadFile = File(...)):
+    """One product video (for Instagram reels and video stories); checked with ffprobe, stored as is."""
+    await get_store_for(db, user, store_id)
+    ext = VIDEO_TYPES.get(file.content_type or "")
+    if not ext:
+        raise HTTPException(422, "فقط ویدیوی MP4، MOV یا WEBM مجاز است.")
+    data = await file.read()
+    if len(data) > video.MAX_VIDEO_BYTES:
+        raise HTTPException(422, "حجم ویدیو حداکثر ۵۰ مگابایت است.")
+    try:
+        info = await video.probe_bytes(data, ext)
+    except PlatformError as exc:
+        raise HTTPException(422, exc.message_fa)
+    if info.duration > video.MAX_SECONDS:
+        raise HTTPException(422, "ویدیو حداکثر ۳ دقیقه می‌تواند باشد.")
+    url = put(f"{store_id}/{uuid.uuid4().hex}{ext}", data, file.content_type or "")
+    return {"url": url, "duration": round(info.duration, 1), "width": info.width, "height": info.height}
+
+
+def _check_video(store_id: int, url: str | None) -> None:
+    if url and not url.startswith(f"/media/{store_id}/"):
+        raise HTTPException(422, "ویدیو باید از همین فروشگاه آپلود شده باشد.")
+
+
 class PublishIn(BaseModel):
     channel_ids: list[int]
     show_price: bool | None = None  # write the price in the post; None = the store setting
+    format: Literal["post", "story", "reel"] = "post"  # story and reel: Instagram only
+
+
+def _check_format(ch: Channel, fmt: str) -> None:
+    if fmt != "post" and ch.platform != "instagram":
+        raise HTTPException(422, "استوری و ریلز فقط برای اینستاگرام است.")
 
 
 @router.post("/products/{product_id}/publish", response_model=list[OperationOut], status_code=202)
@@ -190,7 +227,9 @@ async def publish(product_id: int, body: PublishIn, user: CurrentUser, db: DB):
         ch = await db.get(Channel, cid)
         if not ch or ch.store_id != p.store_id:
             raise HTTPException(404, "کانال پیدا نشد.")
-        op_id = await queue_publish(db, p, ch, trigger="user", actor="user", show_price=body.show_price)
+        _check_format(ch, body.format)
+        op_id = await queue_publish(db, p, ch, trigger="user", actor="user", show_price=body.show_price,
+                                    format=body.format)
         if op_id:
             op_ids.append(op_id)
     await db.commit()
@@ -230,6 +269,7 @@ class BulkIn(BaseModel):
     tag: str = ""
     status: str = ""
     show_price: bool | None = None
+    format: Literal["post", "story", "reel"] = "post"
     edit: BulkEdit | None = None
 
 
@@ -286,14 +326,20 @@ async def bulk(store_id: int, body: BulkIn, user: CurrentUser, db: DB):
     total = await db.scalar(select(func.count()).select_from(stmt.subquery()))
     if total > BULK_MAX:
         raise HTTPException(422, f"در هر بار حداکثر {BULK_MAX} محصول را می‌شود تغییر داد؛ با فیلتر محدودترش کن.")
+    channels: list[Channel] = []
+    if body.action == "publish":
+        for cid in body.channel_ids:
+            ch = await db.get(Channel, cid)
+            if ch and ch.store_id == store_id:
+                _check_format(ch, body.format)
+                channels.append(ch)
     products = (await db.execute(stmt.options(selectinload(Product.images), selectinload(Product.listings)))).scalars().all()
     queued = changed = 0
     for p in products:
         if body.action == "publish":
-            for cid in body.channel_ids:
-                ch = await db.get(Channel, cid)
-                if ch and ch.store_id == store_id and await queue_publish(db, p, ch, trigger="user", actor="user",
-                                                                        show_price=body.show_price):
+            for ch in channels:
+                if await queue_publish(db, p, ch, trigger="user", actor="user", show_price=body.show_price,
+                                       format=body.format):
                     queued += 1
         elif body.action == "tag" and body.tag:
             p.tags = sorted(set(p.tags or []) | {body.tag})

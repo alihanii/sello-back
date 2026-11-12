@@ -10,6 +10,10 @@ from app.models import AppSetting
 
 INSTAGRAM = "instagram"
 INSTAGRAM_SCOPES = "instagram_business_basic,instagram_business_content_publish"
+# How sellers connect: "login" = username + password through Instagram's app API (instagrapi), "oauth" = Meta's
+# official Instagram Login (needs a reviewed Meta app). Pacing applies to "login" accounts, to keep them safe.
+IG_METHODS = ("login", "oauth")
+IG_PACING = {"daily_limit": 8, "gap_min_minutes": 20, "gap_max_minutes": 45}
 
 
 async def instagram_app(db: AsyncSession) -> dict[str, Any]:
@@ -23,18 +27,23 @@ async def instagram_app(db: AsyncSession) -> dict[str, Any]:
         "app_id": app_id,
         "app_secret": app_secret,
         "proxy": value.get("proxy", settings.instagram_proxy),
+        "method": value.get("method") if value.get("method") in IG_METHODS else "login",
+        **{k: int(value.get(k) or v) for k, v in IG_PACING.items()},
         "oauth_ready": bool(app_id and app_secret),
         "redirect_uri": settings.frontend_base_url.rstrip("/") + "/app/oauth/instagram",
     }
 
 
 async def save_instagram_app(db: AsyncSession, *, enabled: bool, app_id: str, proxy: str,
-                             app_secret: str | None) -> None:
+                             app_secret: str | None, method: str = "", pacing: dict[str, int] | None = None) -> None:
     row = await db.get(AppSetting, INSTAGRAM)
     if not row:
         row = AppSetting(key=INSTAGRAM, value={})
         db.add(row)
-    row.value = {"enabled": enabled, "app_id": app_id.strip(), "proxy": proxy.strip()}
+    old = row.value or {}
+    row.value = {"enabled": enabled, "app_id": app_id.strip(), "proxy": proxy.strip(),
+                 "method": method if method in IG_METHODS else old.get("method", "login"),
+                 **{k: int((pacing or {}).get(k) or old.get(k) or v) for k, v in IG_PACING.items()}}
     if app_secret is not None:
         row.secret_encrypted = encrypt_credentials({"app_secret": app_secret.strip()}) if app_secret.strip() else None
 

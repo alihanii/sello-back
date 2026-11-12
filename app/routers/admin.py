@@ -1,9 +1,9 @@
 from datetime import datetime, time, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import selectinload
 
@@ -377,20 +377,30 @@ class InstagramAppIn(BaseModel):
     app_id: str = ""
     app_secret: str | None = None  # None keeps the stored secret
     proxy: str = ""
+    method: Literal["login", "oauth"] = "login"
+    daily_limit: int = Field(8, ge=1, le=50)
+    gap_min_minutes: int = Field(20, ge=1, le=720)
+    gap_max_minutes: int = Field(45, ge=1, le=1440)
 
 
 @router.get("/integrations/instagram")
 async def get_instagram(admin: AdminUser, db: DB):
     app = await instagram_app(db)
-    return {**{k: app[k] for k in ("enabled", "app_id", "proxy", "oauth_ready", "redirect_uri")},
+    return {**{k: app[k] for k in ("enabled", "app_id", "proxy", "oauth_ready", "redirect_uri", "method", "daily_limit",
+                                   "gap_min_minutes", "gap_max_minutes")},
             "has_secret": bool(app["app_secret"]), "scopes": INSTAGRAM_SCOPES}
 
 
 @router.put("/integrations/instagram")
 async def put_instagram(body: InstagramAppIn, admin: AdminUser, db: DB):
-    await save_instagram_app(db, enabled=body.enabled, app_id=body.app_id, proxy=body.proxy, app_secret=body.app_secret)
+    if body.gap_max_minutes < body.gap_min_minutes:
+        raise HTTPException(422, "حداکثر فاصله نمی‌تواند از حداقل کمتر باشد.")
+    pacing = {"daily_limit": body.daily_limit, "gap_min_minutes": body.gap_min_minutes, "gap_max_minutes": body.gap_max_minutes}
+    await save_instagram_app(db, enabled=body.enabled, app_id=body.app_id, proxy=body.proxy, app_secret=body.app_secret,
+                             method=body.method, pacing=pacing)
     audit(db, admin, "update_integration", "instagram", None,
-          {"enabled": body.enabled, "app_id": body.app_id, "proxy": bool(body.proxy), "secret_changed": body.app_secret is not None})
+          {"enabled": body.enabled, "app_id": body.app_id, "proxy": bool(body.proxy), "method": body.method, **pacing,
+           "secret_changed": body.app_secret is not None})
     await db.commit()
     return await get_instagram(admin, db)
 
