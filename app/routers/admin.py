@@ -19,8 +19,8 @@ from app.services.bank import BANKS
 from app.services.text import to_en_digits
 from app.services.features import FEATURES, MODES, allowed, feature_access, save_feature_access
 from app.services.integrations import (
-    INSTAGRAM_SCOPES, instagram_app, instagram_crawler, payment_config, save_instagram_app, save_instagram_crawler,
-    save_payment_config,
+    INSTAGRAM_SCOPES, instagram_app, instagram_crawler, linkedin_app, payment_config, save_instagram_app,
+    save_instagram_crawler, save_linkedin_app, save_payment_config,
 )
 from app.services.plans import (
     DURATIONS, FLAG_KEYS, LIMIT_KEYS, all_tiers, chat_used, create_subscription, credits_used, free_limits, limits_for, plan_status,
@@ -403,6 +403,33 @@ async def put_instagram(body: InstagramAppIn, admin: AdminUser, db: DB):
            "secret_changed": body.app_secret is not None})
     await db.commit()
     return await get_instagram(admin, db)
+
+
+class LinkedInAppIn(BaseModel):
+    enabled: bool = False
+    daily_limit: int = Field(3, ge=1, le=20)
+    gap_min_minutes: int = Field(90, ge=10, le=1440)
+    gap_max_minutes: int = Field(180, ge=10, le=2880)
+    query_ids: dict[str, str] | None = None  # None keeps the stored ones
+
+
+@router.get("/integrations/linkedin")
+async def get_linkedin(admin: AdminUser, db: DB):
+    from app.platforms.linkedin import QUERY_IDS
+
+    app = await linkedin_app(db)
+    return {**app, "default_query_ids": QUERY_IDS}
+
+
+@router.put("/integrations/linkedin")
+async def put_linkedin(body: LinkedInAppIn, admin: AdminUser, db: DB):
+    if body.gap_max_minutes < body.gap_min_minutes:
+        raise HTTPException(422, "حداکثر فاصله نمی‌تواند از حداقل کمتر باشد.")
+    pacing = {"daily_limit": body.daily_limit, "gap_min_minutes": body.gap_min_minutes, "gap_max_minutes": body.gap_max_minutes}
+    await save_linkedin_app(db, enabled=body.enabled, pacing=pacing, query_ids=body.query_ids)
+    audit(db, admin, "update_integration", "linkedin", None, {"enabled": body.enabled, **pacing})
+    await db.commit()
+    return await get_linkedin(admin, db)
 
 
 class InstagramCrawlerIn(BaseModel):

@@ -1,7 +1,7 @@
 """Chat on social channels: which connected channels the chat assistant can answer in, and the on/off switches.
 
 Telegram and Bale chat use their own bots (ChatBot rows made on the chat page). Social networks answer through the
-channel the seller already connected for publishing (Instagram today); each platform registers a ChatSupport here and
+channel the seller already connected for publishing (Instagram, LinkedIn); each platform registers a ChatSupport here and
 the chat page lists those channels with one switch per feature (DMs, comments). Adding a platform = one register()
 call with its own configure / state functions; the API and the page stay the same."""
 
@@ -67,6 +67,21 @@ def _load() -> None:
                               "comment_text": (ch.config or {}).get("comment_text", "")},
             configure=ig_chat.configure,
             default_comment_text=ig_chat.DEFAULT_COMMENT_REPLY,
+        ))
+
+
+    if "linkedin" not in _REGISTRY:
+        from app.services import li_chat
+
+        register(ChatSupport(
+            platform="linkedin",
+            features=[Feature("dm", "جواب خودکار پیام‌ها", "به پیام‌های خصوصی لینکدین جواب می‌دهد."),
+                      Feature("comments", "جواب خودکار کامنت",
+                              "زیر کامنت‌های پست‌ها جواب می‌دهد (لینکدین پیام به غیرمخاطب را اجازه نمی‌دهد).")],
+            unavailable=lambda ch: "",
+            state=lambda ch: {"dm": bool((ch.config or {}).get("dm_reply")),
+                              "comments": bool((ch.config or {}).get("comment_reply")), "comment_text": ""},
+            configure=li_chat.configure,
         ))
 
 

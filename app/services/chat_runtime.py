@@ -289,6 +289,15 @@ async def deliver(db: AsyncSession, bot: ChatBot | None, conv: ChatConversation,
             bot.last_error = exc.message_fa
             log.warning("instagram send failed: %s", exc.message_fa)
         return
+    if bot.platform == "linkedin":
+        from app.services import li_chat
+
+        try:
+            await li_chat.deliver(db, bot, conv, replies, saved)
+        except PlatformError as exc:
+            bot.last_error = exc.message_fa
+            log.warning("linkedin send failed: %s", exc.message_fa)
+        return
     biz = conv.business_connection_id if conv.mode == "business" else ""
     last = len(replies) - 1
     for n, (reply, row) in enumerate(zip(replies, saved)):
@@ -342,6 +351,11 @@ async def seller_send(db: AsyncSession, conv: ChatConversation, text: str) -> Ch
             from app.services import ig_chat
 
             row.external_id = await ig_chat.send_text(db, bot, conv, text)
+            return row
+        if bot.platform == "linkedin":
+            from app.services import li_chat
+
+            row.external_id = await li_chat.send_text(db, bot, conv, text)
             return row
         biz = conv.business_connection_id if conv.mode == "business" else ""
         row.external_id = await tg.send_text(bot, conv.external_chat_id, text, biz)

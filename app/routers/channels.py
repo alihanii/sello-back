@@ -17,8 +17,8 @@ from app.platforms.instagram import authorize_url
 from app.platforms.instagram_private import submit_code
 from app.platforms.registry import PLATFORM_INFO
 from app.schemas import ChannelOut, OperationOut
-from app.services import ig_chat
-from app.services.integrations import instagram_app, instagram_crawler
+from app.services import ig_chat, li_chat
+from app.services.integrations import instagram_app, instagram_crawler, linkedin_app
 from app.services.ops import OpContext, enqueue, fail_operation
 from app.services.proxy_links import LinkError, parse_link
 from app.services.proxy_pool import pool
@@ -33,6 +33,7 @@ async def platforms(db: DB):
     (publish off) when just the admin's crawl key is set."""
     ig = await instagram_app(db)
     crawl_ready = bool((await instagram_crawler(db))["token"])
+    li = await linkedin_app(db)
     out = []
     for k, v in PLATFORM_INFO.items():
         row = {"platform": k, **v, "enabled": not v.get("flag") or ig["enabled"]}
@@ -44,6 +45,9 @@ async def platforms(db: DB):
             row["crawl_ready"] = crawl_ready
             row["crawl_only"] = crawl_ready and not ig["enabled"]
             row["enabled"] = ig["enabled"] or crawl_ready
+        if k == "linkedin":
+            row["enabled"] = row["publish_ready"] = li["enabled"]
+            row["formats"] = ["post"]
         out.append(row)
     return out
 
@@ -305,6 +309,24 @@ async def instagram_inbox(channel_id: int, body: InboxIn, user: CurrentUser, db:
     return ch
 
 
+class LinkedInInboxIn(BaseModel):
+    dm: bool = False
+    comments: bool = False
+
+
+@router.put("/channels/{channel_id}/linkedin/inbox", response_model=ChannelOut)
+async def linkedin_inbox(channel_id: int, body: LinkedInInboxIn, user: CurrentUser, db: DB):
+    """The chat assistant answers this LinkedIn account's messages and/or the comments under its posts."""
+    ch = await db.get(Channel, channel_id)
+    if not ch or ch.platform != "linkedin":
+        raise HTTPException(404, "کانال پیدا نشد.")
+    await get_store_for(db, user, ch.store_id)
+    await li_chat.configure(db, ch, dm=body.dm, comments=body.comments)
+    await db.commit()
+    await db.refresh(ch)
+    return ch
+
+
 class ChannelPatch(BaseModel):
     display_name: str | None = None
 
@@ -330,6 +352,8 @@ async def disconnect(channel_id: int, user: CurrentUser, db: DB):
     await get_store_for(db, user, ch.store_id)
     ch.status, ch.credentials_encrypted = "disconnected", None
     if ch.platform == "instagram" and (bot := await ig_chat.bot_for(db, ch)):
+        bot.status = "disconnected"
+    if ch.platform == "linkedin" and (bot := await li_chat.bot_for(db, ch)):
         bot.status = "disconnected"
     await db.commit()
     return {"ok": True}
