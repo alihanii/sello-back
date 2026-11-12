@@ -490,3 +490,21 @@ async def test_chat_page_lists_social_channels_with_switches(client):
     assert not r.json()["active"]
     async with SessionLocal() as db:
         assert (await db.get(ChatBot, bot.id)).status == "disconnected"
+
+
+def test_error_mapping_uses_only_names_the_pinned_instagrapi_has():
+    """A name instagrapi does not have turns every login error into an AttributeError (seen live)."""
+    import re
+    from pathlib import Path
+
+    import requests
+    from instagrapi import exceptions as e
+
+    src = Path(igp.__file__).read_text(encoding="utf-8")
+    missing = [n for n in sorted(set(re.findall(r"\be\.([A-Z]\w+)", src))) if not hasattr(e, n)]
+    assert missing == []
+    for name in set(re.findall(r"from instagrapi\.exceptions import (\w+)", src)):
+        assert hasattr(e, name), name
+    assert igp._humanize(requests.exceptions.ProxyError("socks down")).code == "network"
+    assert igp._humanize(e.BadPassword("bad")).code == "bad_password"
+    assert igp._humanize(ValueError("x")).code == "platform_error"
