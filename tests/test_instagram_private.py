@@ -70,9 +70,13 @@ class FakeClient:
         return self._media("album", *a, **k)
 
     def photo_upload_to_story(self, *a, **k):
+        self.story_size = Image.open(a[0]).size
         return self._media("photo_story", *a, **k)
 
     def video_upload_to_story(self, *a, **k):
+        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+                              "-of", "csv=p=0", str(a[0])], capture_output=True, text=True).stdout.strip()
+        self.story_size = tuple(int(x) for x in out.split(","))
         return self._media("video_story", *a, **k)
 
     def clip_upload(self, *a, **k):
@@ -155,6 +159,7 @@ async def test_post_album_story_and_validation(fake, media):
 
     out = await ig.instagram.publish(Ctx({"format": "story"}), channel, _product(), SimpleNamespace(settings={}))
     assert fake.calls[-1][0] == "photo_story" and out.remote_url.startswith("https://www.instagram.com/stories/myshop/")
+    assert fake.story_size == (1080, 1920)  # 9:16 whatever the photo's shape
 
     assert ig.instagram.validate_publish(channel, _product(), "reel")  # no video
     assert ig.instagram.validate_publish(channel, _product(images=[]), "post")
@@ -175,7 +180,7 @@ async def test_reel_from_the_product_video(fake, media):
     assert out.remote_url == "https://www.instagram.com/reel/Cabc/"
     await ig.instagram.publish(Ctx({"format": "story"}), channel, _product(video_url="/media/v.mov"),
                                SimpleNamespace(settings={}))
-    assert fake.calls[-1][0] == "video_story"
+    assert fake.calls[-1][0] == "video_story" and fake.story_size == (1080, 1920)
 
 
 async def test_feedback_required_pauses_the_account(fake, media):
@@ -520,3 +525,65 @@ def test_error_mapping_uses_only_names_the_pinned_instagrapi_has():
     assert igp._humanize(requests.exceptions.ProxyError("socks down")).code == "network"
     assert igp._humanize(e.BadPassword("bad")).code == "bad_password"
     assert igp._humanize(ValueError("x")).code == "platform_error"
+
+
+async def test_schedule_a_publish_and_cancel_it(client, monkeypatch):
+    """A picked time keeps the anti-ban gap from the other publishes on the account; a queued publish can be cancelled."""
+    from app.core.db import SessionLocal
+    from app.models import Channel, ChannelListing, Operation
+    from tests.conftest import login
+
+    async def app(db):
+        return {**APP, "gap_min_minutes": 20, "gap_max_minutes": 40, "daily_limit": 2}
+
+    monkeypatch.setattr("app.services.integrations.instagram_app", app)
+    h = await login(client, "09128880457")
+    sid = (await client.post("/stores", json={"name": "زمان‌بندی"}, headers=h)).json()["id"]
+    ps = [(await client.post(f"/stores/{sid}/products", headers=h, json={"title": f"کالا {i}", "price": 1000,
+                                                                       "images": ["/media/a.png"]})).json() for i in range(5)]
+    async with SessionLocal() as db:
+        ch = Channel(store_id=sid, platform="instagram", status="connected", display_name="@s",
+                     credentials_encrypted=encrypt_credentials({"username": "s", "password": "p", "settings": {"a": 1}}),
+                     config={"mode": "private", "ig_user_id": "1", "username": "s"})
+        tg = Channel(store_id=sid, platform="telegram", status="connected", config={})
+        db.add_all([ch, tg])
+        await db.commit()
+        cid, tid = ch.id, tg.id
+
+    def iso(dt):
+        return dt.isoformat()
+
+    from datetime import datetime, timezone
+
+    tomorrow = (utcnow() + timedelta(hours=3, minutes=30)).date() + timedelta(days=1)
+    t = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 8, 30, tzinfo=timezone.utc)  # 12:00 in Tehran
+    a = (await client.post(f"/products/{ps[0]['id']}/publish", headers=h, json={"channel_ids": [cid], "at": iso(t)})).json()[0]
+    assert a["run_after"].startswith(t.replace(tzinfo=None).isoformat()) and a["current_step"].startswith("زمان‌بندی‌شده برای")
+    # 10 minutes later is too close: it moves to a full gap after the first one, and says so.
+    b = (await client.post(f"/products/{ps[1]['id']}/publish", headers=h,
+                           json={"channel_ids": [cid], "at": iso(t + timedelta(minutes=10))})).json()[0]
+    assert b["run_after"].startswith((t + timedelta(minutes=20)).replace(tzinfo=None).isoformat()) and "جابه‌جا" in b["current_step"]
+    # Now (no time picked) still goes now: nothing scheduled is near.
+    c = (await client.post(f"/products/{ps[2]['id']}/publish", headers=h, json={"channel_ids": [cid]})).json()[0]
+    assert c["run_after"] is None
+    # The daily cap (2) is reached on that day: the next one goes to the next day.
+    d = (await client.post(f"/products/{ps[3]['id']}/publish", headers=h,
+                           json={"channel_ids": [cid], "at": iso(t + timedelta(minutes=50))})).json()[0]
+    assert d["run_after"].startswith((t + timedelta(hours=12, minutes=30)).replace(tzinfo=None).isoformat())  # 00:30 next day
+    # Other channels just wait for the time.
+    e = (await client.post(f"/products/{ps[4]['id']}/publish", headers=h, json={"channel_ids": [tid], "at": iso(t)})).json()[0]
+    assert e["run_after"].startswith(t.replace(tzinfo=None).isoformat())
+    assert (await client.post(f"/products/{ps[4]['id']}/publish", headers=h,
+                              json={"channel_ids": [tid], "at": iso(utcnow() - timedelta(hours=1))})).status_code == 422
+    cal = (await client.get(f"/stores/{sid}/calendar", headers=h, params={"start": "2026-01-01", "end": "2026-01-02"})).json()
+    assert {u["operation_id"] for u in cal["upcoming"] if u["type"] == "publish"} >= {a["id"], b["id"], e["id"]}
+
+    r = await client.post(f"/operations/{a['id']}/cancel", headers=h)
+    assert r.status_code == 200 and r.json()["status"] == "cancelled"
+    async with SessionLocal() as db:
+        op = await db.get(Operation, a["id"])
+        assert (await db.get(ChannelListing, op.ref_id)).status == "not_published"
+    assert (await client.post(f"/operations/{a['id']}/cancel", headers=h)).status_code == 409
+    # Cancelled, the product can be published there again.
+    again = (await client.post(f"/products/{ps[0]['id']}/publish", headers=h, json={"channel_ids": [cid]})).json()
+    assert len(again) == 1

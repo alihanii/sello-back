@@ -117,41 +117,89 @@ async def _pacing_app(db: AsyncSession, channel: Channel) -> dict[str, Any] | No
     return None
 
 
-async def estimate_turn(db: AsyncSession, channel: Channel, op: Operation) -> datetime | None:
-    """For accounts that publish on a pace (Instagram login, LinkedIn): when this new publish will roughly run,
-    behind the ones already waiting on the same account. Sets the operation's run_after (a lower bound; the worker
-    still checks the pace when it runs) and its step text, so the seller sees the turn right away. None = now."""
+def _aware(dt: datetime | None) -> datetime | None:
+    from datetime import timezone
+
+    return dt.replace(tzinfo=timezone.utc) if dt and not dt.tzinfo else dt
+
+
+def scheduled_text(local: datetime, today, shifted: bool) -> str:
+    text = f"زمان‌بندی‌شده برای {local:%H:%M}" + (f" ({local:%m/%d})" if local.date() != today else "")
+    return (text + ("؛ برای فاصلهٔ ضدبن با انتشار دیگر جابه‌جا شد" if shifted else ""))[:80]
+
+
+async def estimate_turn(db: AsyncSession, channel: Channel, op: Operation, at: datetime | None = None) -> datetime | None:
+    """When this new publish runs, set on the operation (run_after and its step text) so the seller sees it at once.
+
+    `at` is the time the seller picked (None = as soon as possible). Accounts that publish on a pace (Instagram login,
+    LinkedIn) get the first time at or after it that keeps the anti-ban gap from every other publish waiting on the
+    same account (scheduled or not) and stays within the daily cap; so a picked time moves a little when it falls
+    too close to another one, and an unscheduled publish can go in between scheduled ones. run_after is a lower
+    bound: the worker still checks the pace when it runs. Returns the time, or None for "now"."""
+    now = utcnow()
+    at = _aware(at)
+    if at and at <= now + timedelta(seconds=60):
+        at = None
+    local_today = (now + timedelta(hours=3, minutes=30)).date()
     app = await _pacing_app(db, channel)
     if not app:
-        return None
+        if at:
+            op.run_after = at
+            op.current_step = scheduled_text(at + timedelta(hours=3, minutes=30), local_today, False)
+        return at
     from app.platforms import instagram_private as igp
 
-    now = utcnow()
     cfg = channel.config or {}
-    ahead = int(await db.scalar(select(func.count()).select_from(Operation).where(
+    rows = (await db.execute(select(Operation.run_after).where(
         Operation.type == "publish", Operation.channel_id == channel.id, Operation.status.in_(("queued", "running")),
-        Operation.id != op.id)) or 0)
-    when = igp.next_slot(channel, app, now) or now
-    count = int(cfg.get("count") or 0) if cfg.get("day") == igp._day(when) else 0
+        Operation.id != op.id))).scalars().all()
+    others = sorted(max(_aware(r) or now, now) for r in rows)
     gap = timedelta(minutes=int(app["gap_min_minutes"]))
-    for _ in range(ahead):
-        count += 1
-        when = when + gap
-        if count >= int(app["daily_limit"]):  # the cap is reached: the next one goes the next (Tehran) day
-            day = datetime.fromisoformat(igp._day(when)) + timedelta(days=1)
-            when = max(when, (day - timedelta(hours=3, minutes=30)).replace(tzinfo=now.tzinfo) + timedelta(minutes=30))
-            count = 0
+    limit = int(app["daily_limit"])
+    want = at or now
+    when = max(want, igp.next_slot(channel, app, now) or now)
+    for _ in range(500):
+        clash = [o for o in others if abs(o - when) < gap]
+        if clash:
+            when = max(clash) + gap
+            continue
+        day = igp._day(when)
+        used = sum(1 for o in others if igp._day(o) == day) + (int(cfg.get("count") or 0) if cfg.get("day") == day else 0)
+        if used >= limit:  # that (Tehran) day is full: the next day, half an hour after midnight
+            nxt = datetime.fromisoformat(day) + timedelta(days=1)
+            when = (nxt - timedelta(hours=3, minutes=30)).replace(tzinfo=now.tzinfo) + timedelta(minutes=30)
+            continue
+        break
     if when <= now + timedelta(seconds=60):
         return None
-    local, today = when + timedelta(hours=3, minutes=30), (now + timedelta(hours=3, minutes=30)).date()
+    local = when + timedelta(hours=3, minutes=30)
     op.run_after = when
-    paused = igp._parse(cfg.get("paused_until"))
-    op.current_step = turn_text(local, today, app, bool(paused and paused > now))
+    if at:
+        op.current_step = scheduled_text(local, local_today, when - at > timedelta(minutes=1))
+    else:
+        paused = igp._parse(cfg.get("paused_until"))
+        op.current_step = turn_text(local, local_today, app, bool(paused and paused > now))
     return when
 
 
+async def cancel_operation(db: AsyncSession, op: Operation) -> bool:
+    """Cancel an operation that has not started. False when the worker already took it."""
+    from sqlalchemy import update
+
+    res = await db.execute(update(Operation).where(Operation.id == op.id, Operation.status == "queued")
+                           .values(status="cancelled", finished_at=utcnow(), current_step="لغو شد"))
+    if not res.rowcount:
+        return False
+    if op.type == "publish" and op.ref_type == "listing" and op.ref_id:
+        listing = await db.get(ChannelListing, op.ref_id)
+        if listing and listing.status == "queued":
+            listing.status = "published" if listing.remote_id else "not_published"
+    await db.flush()
+    return True
+
+
 async def queue_publish(db: AsyncSession, product: Product, channel: Channel, *, trigger: str, actor: str,
-                        show_price: bool | None = None, format: str = "post") -> int | None:
+                        show_price: bool | None = None, format: str = "post", at: datetime | None = None) -> int | None:
     """Queue one publish. `format` is post | story | reel (story and reel: Instagram only). A post or reel is the
     product's listing on the channel; a story lasts a day, so it keeps no listing and may be posted again."""
     payload: dict[str, Any] = {"show_price": show_price} if show_price is not None else {}
@@ -167,7 +215,7 @@ async def queue_publish(db: AsyncSession, product: Product, channel: Channel, *,
         op = await enqueue(db, store_id=product.store_id, type="publish", channel_id=channel.id, product_id=product.id,
                            ref_type="story", trigger=trigger, actor=actor, payload=payload,
                            title_fa=f"استوری «{product.title[:60]}» در {name}")
-        await estimate_turn(db, channel, op)
+        await estimate_turn(db, channel, op, at)
         return op.id
     listing = (await db.execute(select(ChannelListing).where(
         ChannelListing.product_id == product.id, ChannelListing.channel_id == channel.id))).scalar_one_or_none()
@@ -181,5 +229,5 @@ async def queue_publish(db: AsyncSession, product: Product, channel: Channel, *,
     op = await enqueue(db, store_id=product.store_id, type="publish", channel_id=channel.id, product_id=product.id,
                        ref_type="listing", ref_id=listing.id, trigger=trigger, actor=actor, payload=payload or None,
                        title_fa=f"انتشار {FORMAT_FA.get(format, '')}«{product.title[:60]}» در {name}")
-    await estimate_turn(db, channel, op)
+    await estimate_turn(db, channel, op, at)
     return op.id

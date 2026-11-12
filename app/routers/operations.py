@@ -11,6 +11,7 @@ from app.core.security import decode_token
 from app.deps import DB, CurrentUser, get_store_for
 from app.models import ChannelListing, CrawlItem, Operation, Store, User
 from app.schemas import OperationDetail, OperationOut
+from app.services.ops import cancel_operation
 
 router = APIRouter(tags=["operations"])
 
@@ -71,6 +72,20 @@ async def crawl_items(op_id: int, user: CurrentUser, db: DB):
     rows = (await db.execute(select(CrawlItem).where(CrawlItem.operation_id == op_id).order_by(CrawlItem.id))).scalars()
     return [{"id": r.id, "external_id": r.external_id, "raw": r.raw, "extracted": r.extracted, "product_id": r.product_id,
              "result": r.result, "error_fa": r.error_fa} for r in rows]
+
+
+@router.post("/operations/{op_id}/cancel", response_model=OperationOut)
+async def cancel(op_id: int, user: CurrentUser, db: DB):
+    """Cancel an operation that is still waiting in the queue (e.g. a paced or scheduled publish)."""
+    op = await db.get(Operation, op_id)
+    if not op:
+        raise HTTPException(404, "عملیات پیدا نشد.")
+    await get_store_for(db, user, op.store_id)
+    if op.status != "queued" or not await cancel_operation(db, op):
+        raise HTTPException(409, "این عملیات شروع شده یا تمام شده و دیگر لغو نمی‌شود.")
+    await db.commit()
+    await db.refresh(op)
+    return op
 
 
 @router.post("/operations/{op_id}/retry", response_model=OperationOut, status_code=202)

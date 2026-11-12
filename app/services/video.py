@@ -60,13 +60,23 @@ async def probe_bytes(data: bytes, suffix: str) -> VideoInfo:
         return await probe(path)
 
 
-async def for_instagram(src: Path, folder: Path, max_seconds: float) -> tuple[Path, Path]:
-    """(mp4, thumbnail jpg) in `folder`: H.264 + AAC, at most 1080 px wide, cut to `max_seconds`."""
+# A story frame is 1080x1920 (9:16): the video shown whole in the middle over a blurred copy of itself.
+VERTICAL = ("[0:v]split=2[bg][fg];"
+            "[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:2,eq=brightness=-0.15[b];"
+            "[fg]scale=1080:1920:force_original_aspect_ratio=decrease[f];"
+            "[b][f]overlay=(W-w)/2:(H-h)/2,fps=30,setsar=1[v]")
+
+
+async def for_instagram(src: Path, folder: Path, max_seconds: float, vertical: bool = False) -> tuple[Path, Path]:
+    """(mp4, thumbnail jpg) in `folder`: H.264 + AAC, at most 1080 px wide, cut to `max_seconds`; `vertical` makes
+    it a 1080x1920 story frame."""
     info = await probe(src)
     out, thumb = folder / "video.mp4", folder / "thumb.jpg"
+    picture = (["-filter_complex", VERTICAL, "-map", "[v]", "-map", "0:a?"] if vertical
+               else ["-vf", "scale='min(1080,iw)':-2,fps=30"])
     code, _, err = await _run(
         "ffmpeg", "-y", "-v", "error", "-i", str(src), "-t", str(max_seconds),
-        "-vf", "scale='min(1080,iw)':-2,fps=30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        *picture, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
         "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
         "-movflags", "+faststart", str(out))
     if code != 0 or not out.is_file():

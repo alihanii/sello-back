@@ -114,6 +114,11 @@ async def calendar(store_id: int, user: CurrentUser, db: DB, start: date, end: d
     for s in sources:
         if s.next_run_at:
             upcoming.append({"type": "crawl", "title_fa": f"کرال «{s.name}»", "at": s.next_run_at, "schedule": s.schedule})
+    waiting = (await db.execute(select(Operation).where(
+        Operation.store_id == store_id, Operation.type == "publish", Operation.status == "queued",
+        Operation.run_after.is_not(None)).order_by(Operation.run_after).limit(100))).scalars().all()
+    for op in waiting:  # scheduled and paced publishes
+        upcoming.append({"type": "publish", "title_fa": op.title_fa, "at": op.run_after, "operation_id": op.id})
     # 7-day average of incoming data for "today vs average".
     week = await _daily(db, store_id, today - timedelta(days=7), today - timedelta(days=1))
     avg_items = sum(v.get("crawl_item", 0) for v in week.values()) / 7

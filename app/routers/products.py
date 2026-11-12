@@ -1,6 +1,7 @@
 import csv
 import io
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
@@ -11,6 +12,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import selectinload
 
+from app.core.db import utcnow
 from app.deps import DB, CurrentUser, get_store_for
 from app.platforms.base import PlatformError
 from app.models import Channel, ChannelListing, Operation, Product, ProductImage, Store
@@ -212,6 +214,20 @@ class PublishIn(BaseModel):
     channel_ids: list[int]
     show_price: bool | None = None  # write the price in the post; None = the store setting
     format: Literal["post", "story", "reel"] = "post"  # story and reel: Instagram only
+    at: datetime | None = None  # publish at this time (None = now); paced accounts keep their gap from other publishes
+
+
+def _check_at(at: datetime | None) -> datetime | None:
+    if at is None:
+        return None
+    if not at.tzinfo:
+        at = at.replace(tzinfo=timezone.utc)
+    now = utcnow()
+    if at < now - timedelta(minutes=5):
+        raise HTTPException(422, "زمان انتشار گذشته است؛ یک زمان در آینده انتخاب کن.")
+    if at > now + timedelta(days=60):
+        raise HTTPException(422, "زمان انتشار حداکثر تا ۶۰ روز آینده است.")
+    return at
 
 
 def _check_format(ch: Channel, fmt: str) -> None:
@@ -222,6 +238,7 @@ def _check_format(ch: Channel, fmt: str) -> None:
 @router.post("/products/{product_id}/publish", response_model=list[OperationOut], status_code=202)
 async def publish(product_id: int, body: PublishIn, user: CurrentUser, db: DB):
     p = await _get(db, user, product_id)
+    at = _check_at(body.at)
     op_ids = []
     for cid in body.channel_ids:
         ch = await db.get(Channel, cid)
@@ -229,7 +246,7 @@ async def publish(product_id: int, body: PublishIn, user: CurrentUser, db: DB):
             raise HTTPException(404, "کانال پیدا نشد.")
         _check_format(ch, body.format)
         op_id = await queue_publish(db, p, ch, trigger="user", actor="user", show_price=body.show_price,
-                                    format=body.format)
+                                    format=body.format, at=at)
         if op_id:
             op_ids.append(op_id)
     await db.commit()
@@ -270,6 +287,7 @@ class BulkIn(BaseModel):
     status: str = ""
     show_price: bool | None = None
     format: Literal["post", "story", "reel"] = "post"
+    at: datetime | None = None
     edit: BulkEdit | None = None
 
 
@@ -327,6 +345,7 @@ async def bulk(store_id: int, body: BulkIn, user: CurrentUser, db: DB):
     if total > BULK_MAX:
         raise HTTPException(422, f"در هر بار حداکثر {BULK_MAX} محصول را می‌شود تغییر داد؛ با فیلتر محدودترش کن.")
     channels: list[Channel] = []
+    at = _check_at(body.at) if body.action == "publish" else None
     if body.action == "publish":
         for cid in body.channel_ids:
             ch = await db.get(Channel, cid)
@@ -340,7 +359,7 @@ async def bulk(store_id: int, body: BulkIn, user: CurrentUser, db: DB):
         if body.action == "publish":
             for ch in channels:
                 if op_id := await queue_publish(db, p, ch, trigger="user", actor="user", show_price=body.show_price,
-                                                format=body.format):
+                                                format=body.format, at=at):
                     queued += 1
                     op_ids.append(op_id)
         elif body.action == "tag" and body.tag:
