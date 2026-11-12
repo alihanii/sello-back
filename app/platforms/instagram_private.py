@@ -29,7 +29,7 @@ from app.core.security import decrypt_credentials, encrypt_credentials
 from app.models import Channel, Product, Store
 from app.platforms.base import EDIT_PRODUCT, RECONNECT, PlatformError, PublishResult
 from app.services import proxy_pool, video
-from app.services.images import load_bytes, to_jpeg
+from app.services.images import load_bytes, story_frame, to_jpeg
 from app.services.text import caption_for, to_en_digits
 
 log = logging.getLogger("sello.instagram")
@@ -242,8 +242,9 @@ class PrivateInstagram:
 
         def ask(kind: str) -> str:
             """Runs in the login thread: tell the seller a code is needed, then wait for it."""
+            wait.event.clear()  # before asking: a code typed right after the ask must not be wiped
+            wait.code = ""
             asyncio.run_coroutine_threadsafe(self._need_code(ctx, kind), loop).result(30)
-            wait.event.clear()
             if not wait.event.wait(CODE_WAIT_SECONDS):
                 return ""
             return wait.code
@@ -357,7 +358,8 @@ class PrivateInstagram:
                 async with ctx.step("video", "آماده‌سازی ویدیو (MP4)") as s:
                     src = folder / ("src" + Path(product.video_url.split("?")[0]).suffix)
                     src.write_bytes(await load_bytes(product.video_url, max_bytes=video.MAX_VIDEO_BYTES))
-                    mp4, thumb = await video.for_instagram(src, folder, video.STORY_SECONDS if fmt == "story" else video.MAX_SECONDS)
+                    mp4, thumb = await video.for_instagram(src, folder, video.STORY_SECONDS if fmt == "story" else video.MAX_SECONDS,
+                                                           vertical=fmt == "story")
                     s.response = {"bytes": mp4.stat().st_size}
                 label = "انتشار ریلز" if fmt == "reel" else "انتشار استوری ویدیویی"
                 async with ctx.step("publish", label) as s:
@@ -371,7 +373,8 @@ class PrivateInstagram:
                     paths = []
                     for i, img in enumerate(product.images[:1 if fmt == "story" else MAX_ALBUM]):
                         p = folder / f"{i}.jpg"
-                        p.write_bytes(to_jpeg(await load_bytes(img.url), max_side=1440))
+                        raw = await load_bytes(img.url)
+                        p.write_bytes(story_frame(raw) if fmt == "story" else to_jpeg(raw, max_side=1440))
                         paths.append(p)
                     s.response = {"images": len(paths)}
                 label = {"story": "انتشار استوری", "post": "انتشار پست" if len(paths) == 1 else f"انتشار آلبوم {len(paths)} عکسی"}[fmt]

@@ -48,6 +48,34 @@ def to_jpeg(data: bytes, max_side: int = 0) -> bytes:
         raise PlatformError("یکی از عکس‌ها قابل تبدیل به JPEG نبود.", "bad_image", EDIT_PRODUCT, str(exc)) from exc
 
 
+STORY_SIZE = (1080, 1920)  # 9:16, Instagram's story frame
+
+
+def story_frame(data: bytes) -> bytes:
+    """A 1080x1920 (9:16) JPEG for a story: a photo that is already about 9:16 fills the frame; any other shape is
+    shown whole in the middle over a blurred, darkened copy of itself, so nothing is cut and there are no bars."""
+    try:
+        from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+
+        img = Image.open(io.BytesIO(to_jpeg(data)))
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        w, h = STORY_SIZE
+        if abs(img.width / img.height - w / h) < 0.03:
+            frame = ImageOps.fit(img, STORY_SIZE, Image.LANCZOS)
+        else:
+            frame = ImageOps.fit(img, (w // 6, h // 6), Image.LANCZOS).filter(ImageFilter.GaussianBlur(6))
+            frame = ImageEnhance.Brightness(frame.resize(STORY_SIZE, Image.LANCZOS)).enhance(0.55)
+            fg = ImageOps.contain(img, (w, int(h * 0.82)), Image.LANCZOS)
+            frame.paste(fg, ((w - fg.width) // 2, (h - fg.height) // 2))
+        out = io.BytesIO()
+        frame.save(out, "JPEG", quality=92)
+        return out.getvalue()
+    except PlatformError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise PlatformError("عکس استوری آماده نشد.", "bad_image", EDIT_PRODUCT, str(exc)) from exc
+
+
 async def jpeg_bytes(url: str) -> tuple[bytes, str]:
     name = (url.rsplit("/", 1)[-1].split("?")[0].rsplit(".", 1)[0] or "photo") + ".jpg"
     return to_jpeg(await load_bytes(url)), name
