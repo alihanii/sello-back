@@ -335,12 +335,14 @@ async def bulk(store_id: int, body: BulkIn, user: CurrentUser, db: DB):
                 channels.append(ch)
     products = (await db.execute(stmt.options(selectinload(Product.images), selectinload(Product.listings)))).scalars().all()
     queued = changed = 0
+    op_ids: list[int] = []
     for p in products:
         if body.action == "publish":
             for ch in channels:
-                if await queue_publish(db, p, ch, trigger="user", actor="user", show_price=body.show_price,
-                                       format=body.format):
+                if op_id := await queue_publish(db, p, ch, trigger="user", actor="user", show_price=body.show_price,
+                                                format=body.format):
                     queued += 1
+                    op_ids.append(op_id)
         elif body.action == "tag" and body.tag:
             p.tags = sorted(set(p.tags or []) | {body.tag})
         elif body.action == "untag":
@@ -355,7 +357,15 @@ async def bulk(store_id: int, body: BulkIn, user: CurrentUser, db: DB):
                 if l.status == "published":
                     l.status = "out_of_sync"
     await db.commit()
-    return {"ok": True, "affected": len(products), "queued": queued, "changed": changed}
+    paced = []  # accounts that publish on a pace: when their last queued publish should go out
+    for ch in channels:
+        last = await db.scalar(select(func.max(Operation.run_after)).where(Operation.id.in_(op_ids or [0]),
+                                                                           Operation.channel_id == ch.id))
+        if last:
+            n = await db.scalar(select(func.count()).select_from(Operation).where(Operation.id.in_(op_ids),
+                                                                                Operation.channel_id == ch.id))
+            paced.append({"channel_id": ch.id, "name": ch.display_name or ch.platform, "count": n, "last_at": last})
+    return {"ok": True, "affected": len(products), "queued": queued, "changed": changed, "paced": paced}
 
 
 @router.get("/stores/{store_id}/products.csv")

@@ -97,7 +97,8 @@ async def _paced(ctx: OpContext, channel: Channel) -> bool:
     local = when + timedelta(hours=3, minutes=30)
     reason = (channel.config or {}).get("pause_reason") if (channel.config or {}).get("paused_until") else ""
     op.current_step = (f"در صف؛ نوبت انتشار حدود {local:%H:%M}" + (f" ({local:%m/%d})" if local.date() != (now + timedelta(hours=3, minutes=30)).date() else "")
-                       + ("، چون حساب موقتاً استراحت می‌کند" if reason else ""))
+                       + ("، چون حساب موقتاً استراحت می‌کند" if reason
+                          else f"، چون برای جلوگیری از بن، بین انتشارهای هر حساب {app['gap_min_minutes']} تا {app['gap_max_minutes']} دقیقه فاصله است"))
     await db.commit()
     return True
 
