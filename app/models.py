@@ -633,6 +633,9 @@ class ProxyNode(TimestampMixin, Base):
     purposes: Mapped[list[str]] = mapped_column(JSON, default=list)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     health: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # Set for a seller's own proxy (their fixed IP) for one Instagram account: only that channel uses it, and it is
+    # not in the admin's list. Null = the admin's shared pool.
+    channel_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
 
 # ---------- invoices & orders the seller makes ----------

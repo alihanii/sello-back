@@ -9,7 +9,8 @@ from sqlalchemy import select
 from app.core.config import settings
 from app.core.db import utcnow
 from app.deps import DB, CurrentUser, get_store_for
-from app.models import Channel, Operation
+from app.core.security import encrypt_credentials
+from app.models import Channel, Operation, ProxyNode
 from app.platforms.base import PlatformError
 from app.platforms.digikala import digikala
 from app.platforms.instagram import authorize_url
@@ -19,6 +20,8 @@ from app.schemas import ChannelOut, OperationOut
 from app.services import ig_chat
 from app.services.integrations import instagram_app, instagram_crawler
 from app.services.ops import OpContext, enqueue, fail_operation
+from app.services.proxy_links import LinkError, parse_link
+from app.services.proxy_pool import pool
 from app.services.plans import check_limit
 
 router = APIRouter(tags=["channels"])
@@ -123,10 +126,63 @@ async def digikala_send_code(store_id: int, body: ConnectIn, user: CurrentUser, 
     return {"channel_id": ch.id, "operation_id": op.id}
 
 
+async def _own_proxy(db, ch: Channel, link: str) -> None:
+    """The seller's own proxy (their fixed IP) for this Instagram account: checked against Instagram now, then the
+    account uses only it. A v2ray link runs through the same Xray core as the admin's proxies."""
+    try:
+        parsed = parse_link(link)
+    except LinkError as exc:
+        raise HTTPException(422, f"کانفیگ پروکسی قابل استفاده نیست: {exc}")
+    row = (await db.execute(select(ProxyNode).where(ProxyNode.channel_id == ch.id))).scalar_one_or_none()
+    if not row:
+        row = ProxyNode(channel_id=ch.id, purposes=["instagram"], enabled=True, health={}, link_encrypted="")
+        db.add(row)
+    row.name = f"اختصاصی کانال {ch.id}"
+    row.protocol, row.address = parsed.protocol, parsed.address[:255]
+    row.link_encrypted, row.health = encrypt_credentials({"link": link}), {}
+    await db.flush()
+    ch.config = {**(ch.config or {}), "own_proxy": True, "proxy_node_id": row.id, "proxy_address": parsed.address}
+    await db.commit()
+    await pool.reload()
+    res = await pool.check(row.id, "instagram")
+    if not res.get("ok"):
+        raise HTTPException(422, "با این کانفیگ به اینستاگرام وصل نشد" + (f": {res.get('error')}" if res.get("error") else "")
+                            + ". کانفیگ را بررسی کن یا خالی بگذار تا از پروکسی‌های فروشگاه استفاده شود.")
+
+
+@router.delete("/channels/{channel_id}/instagram/proxy", response_model=ChannelOut)
+async def remove_own_proxy(channel_id: int, user: CurrentUser, db: DB):
+    """Back to the admin's shared proxies."""
+    ch = await db.get(Channel, channel_id)
+    if not ch or ch.platform != "instagram":
+        raise HTTPException(404, "کانال پیدا نشد.")
+    await get_store_for(db, user, ch.store_id)
+    for row in (await db.execute(select(ProxyNode).where(ProxyNode.channel_id == ch.id))).scalars():
+        await db.delete(row)
+    ch.config = {k: v for k, v in (ch.config or {}).items() if k not in ("own_proxy", "proxy_node_id", "proxy_address")}
+    await db.commit()
+    await pool.reload()
+    await db.refresh(ch)
+    return ch
+
+
 @router.post("/stores/{store_id}/channels/connect", response_model=OperationOut, status_code=202)
 async def connect(store_id: int, body: ConnectIn, user: CurrentUser, db: DB):
     await get_store_for(db, user, store_id)
     ch = await _channel(db, user, store_id, body)
+    if body.platform == "instagram" and body.data.get("username"):
+        link = (body.data.pop("proxy", "") or "").strip()
+        if link:
+            try:
+                await _own_proxy(db, ch, link)
+            except HTTPException:
+                if not body.channel_id:  # a new channel that never connected: don't leave it behind
+                    for row in (await db.execute(select(ProxyNode).where(ProxyNode.channel_id == ch.id))).scalars():
+                        await db.delete(row)
+                    await db.delete(ch)
+                    await db.commit()
+                    await pool.reload()
+                raise
     label = PLATFORM_INFO[body.platform]["label"]
     op = await enqueue(db, store_id=store_id, type="connect", channel_id=ch.id, payload={"data": body.data},
                        title_fa=f"اتصال {label}")

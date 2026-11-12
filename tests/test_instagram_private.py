@@ -361,3 +361,59 @@ async def test_dms_and_comments_reach_the_assistant(client, fake, monkeypatch):
         conv = (await db.execute(select(ChatConversation).where(
             ChatConversation.external_chat_id == "340282366841710300949128000000000001"))).scalar_one()
         assert conv.status == "human"
+
+
+async def test_seller_own_proxy_is_the_only_route(client, monkeypatch):
+    from sqlalchemy import select
+
+    from app.core.db import SessionLocal
+    from app.models import Channel, ProxyNode
+    from app.services import proxy_pool
+    from tests.conftest import login
+
+    async def app(db):
+        return APP
+
+    monkeypatch.setattr("app.routers.channels.instagram_app", app)
+    health = {"ok": False, "error": "ConnectTimeout"}
+
+    async def check(node_id, purpose):
+        return health
+
+    async def reload():
+        async with SessionLocal() as db:
+            rows = (await db.execute(select(ProxyNode))).scalars().all()
+        proxy_pool.pool.nodes = {r.id: proxy_pool._Node(r.id, r.name, r.protocol, list(r.purposes), channel_id=r.channel_id,
+                                                         proxy_url="socks5://1.2.3.4:1080") for r in rows}
+
+    monkeypatch.setattr(proxy_pool.pool, "check", check)
+    monkeypatch.setattr(proxy_pool.pool, "reload", reload)
+    h = await login(client, "09128880454")
+    sid = (await client.post("/stores", json={"name": "آی‌پی ثابت"}, headers=h)).json()["id"]
+    body = {"platform": "instagram", "data": {"username": "shop", "password": "pw", "proxy": "socks5://1.2.3.4:1080"}}
+    r = await client.post(f"/stores/{sid}/channels/connect", headers=h, json=body)
+    assert r.status_code == 422 and "وصل نشد" in r.text
+    async with SessionLocal() as db:  # nothing left behind
+        assert not (await db.execute(select(Channel).where(Channel.store_id == sid))).scalars().all()
+    assert (await client.post(f"/stores/{sid}/channels/connect", headers=h,
+                              json={**body, "data": {**body["data"], "proxy": "nonsense"}})).status_code == 422
+
+    health = {"ok": True}
+    r = await client.post(f"/stores/{sid}/channels/connect", headers=h, json=body)
+    assert r.status_code == 202, r.text
+    assert "proxy" not in (r.json().get("payload") or {}).get("data", {})
+    async with SessionLocal() as db:
+        row = (await db.execute(select(Channel).where(Channel.store_id == sid))).scalar_one()
+        ch = {"id": row.id, "config": row.config}
+    assert ch["config"]["own_proxy"] is True and ch["config"]["proxy_address"] == "1.2.3.4:1080"
+    # No other account may use it, and the shared pool never offers it.
+    assert proxy_pool.pool.candidates("instagram") == []
+    own = ch["config"]["proxy_node_id"]
+    assert proxy_pool.pool.sticky("instagram", None, channel_id=ch["id"]) == (own, "socks5://1.2.3.4:1080")
+    assert proxy_pool.pool.sticky("instagram", own, channel_id=ch["id"] + 999) is None  # not shared
+
+    r = await client.delete(f"/channels/{ch['id']}/instagram/proxy", headers=h)
+    assert r.status_code == 200 and "own_proxy" not in r.json()["config"]
+    async with SessionLocal() as db:
+        assert not (await db.execute(select(ProxyNode).where(ProxyNode.channel_id == ch["id"]))).scalars().all()
+    proxy_pool.pool.nodes = {}

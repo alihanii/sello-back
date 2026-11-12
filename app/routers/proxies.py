@@ -29,7 +29,7 @@ def _purposes(values: list[str]) -> list[str]:
 
 
 async def _state(db) -> dict:
-    rows = (await db.execute(select(ProxyNode).order_by(ProxyNode.id))).scalars().all()
+    rows = (await db.execute(select(ProxyNode).where(ProxyNode.channel_id.is_(None)).order_by(ProxyNode.id))).scalars().all()
     active = {p: pool.active(p) for p in PURPOSES}
     nodes = []
     for r in rows:
@@ -146,7 +146,7 @@ async def delete_proxy(node_id: int, admin: AdminUser, db: DB):
 async def delete_failed(admin: AdminUser, db: DB):
     """Remove every node that failed its last check for all of its services."""
     removed = 0
-    for row in (await db.execute(select(ProxyNode))).scalars().all():
+    for row in (await db.execute(select(ProxyNode).where(ProxyNode.channel_id.is_(None)))).scalars().all():
         live = pool.nodes.get(row.id)
         health = {**(row.health or {}), **(live.health if live else {})}
         checks = [health.get(p) for p in row.purposes or []]
