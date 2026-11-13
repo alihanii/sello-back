@@ -465,6 +465,64 @@ async def test_instagram_crawler(admin: AdminUser, db: DB):
     return {"ok": ok, "message": message}
 
 
+class SmsConfigIn(BaseModel):
+    enabled: bool = False
+    template: str = Field("", max_length=100)
+    sender: str = Field("", max_length=30)
+    api_key: str | None = Field(None, max_length=200)  # None keeps the stored key
+
+
+class SmsTestIn(BaseModel):
+    phone: str = ""
+
+
+def _sms_out(cfg: dict[str, Any]) -> dict[str, Any]:
+    key = cfg["api_key"]
+    return {"enabled": cfg["enabled"], "provider": "kavenegar", "template": cfg["template"], "sender": cfg["sender"],
+            "has_key": bool(key), "key_hint": f"…{key[-4:]}" if len(key) > 8 else "", "ready": cfg["ready"],
+            "dev_mode": settings.otp_dev_mode}
+
+
+@router.get("/integrations/sms")
+async def get_sms(admin: AdminUser, db: DB):
+    from app.services.sms import sms_config
+
+    return _sms_out(await sms_config(db))
+
+
+@router.put("/integrations/sms")
+async def put_sms(body: SmsConfigIn, admin: AdminUser, db: DB):
+    from app.services.sms import save_sms_config, sms_config
+
+    await save_sms_config(db, enabled=body.enabled, template=body.template, sender=body.sender, api_key=body.api_key)
+    cfg = await sms_config(db)
+    if body.enabled and not cfg["ready"]:
+        raise HTTPException(422, "برای روشن کردن، کلید API و نام الگو (یا خط ارسال) لازم است.")
+    audit(db, admin, "update_integration", "sms", None,
+          {"enabled": body.enabled, "template": body.template, "sender": body.sender, "key_changed": body.api_key is not None})
+    await db.commit()
+    return _sms_out(cfg)
+
+
+@router.post("/integrations/sms/test")
+async def test_sms(body: SmsTestIn, admin: AdminUser, db: DB):
+    """Checks the key (credit) and, with a phone, sends a sample code through the template."""
+    from app.routers.auth import normalize_phone
+    from app.services.sms import SmsError, account_info, send_code, sms_config
+
+    cfg = await sms_config(db)
+    try:
+        info = await account_info(cfg)
+        if body.phone.strip():
+            await send_code(cfg, normalize_phone(body.phone), "123456")
+    except SmsError as e:
+        return {"ok": False, "message": str(e)}
+    credit = info.get("remaining_credit")
+    msg = "کلید معتبر است" + (f"؛ اعتبار: {int(credit):,} ریال" if isinstance(credit, (int, float)) else "")
+    return {"ok": True, "message": msg + ("؛ پیامک آزمایشی (کد 123456) فرستاده شد." if body.phone.strip() else "."),
+            **info}
+
+
 class PaymentConfigIn(BaseModel):
     enabled: bool = False
     bank: str = "ZARINPAL"

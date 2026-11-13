@@ -9,7 +9,13 @@ class Settings(BaseSettings):
     env: str = "dev"
     database_url: str = "sqlite+aiosqlite:///./sello.db"
     jwt_secret: str = "dev-secret-change-me"
-    jwt_access_minutes: int = 60 * 24
+    # Short-lived access token (kept in the browser's memory only) + a long-lived refresh token in an httpOnly cookie.
+    jwt_access_minutes: int = 15
+    refresh_idle_days: int = 30  # a device unused this long must sign in again
+    refresh_absolute_days: int = 90  # and every device signs in again after this long, however active
+    refresh_cookie_name: str = "sello_rt"
+    # Per-IP limits on sign-in endpoints (SMS costs money; passwords get guessed). Off only in tests.
+    ratelimit_enabled: bool = True
     # Fernet key for platform credentials; generated per-process in dev if empty.
     credentials_key: str = ""
     cors_origins: list[str] = ["http://localhost:3000"]
@@ -38,8 +44,11 @@ class Settings(BaseSettings):
     otp_dev_mode: bool = True
     otp_ttl_seconds: int = 120
     otp_max_sends_per_10min: int = 3
-    sms_provider: str = ""  # kavenegar | smsir
+    # SMS for login codes. The admin panel (یکپارچه‌سازی‌ها › پیامک) overrides these; env values are fallbacks.
+    sms_provider: str = ""  # kavenegar
     sms_api_key: str = ""
+    kavenegar_template: str = ""  # Verify Lookup template name, approved in console.kavenegar.com
+    kavenegar_sender: str = ""  # only for the plain sms/send fallback when no template is set
 
     # Phones listed here get the admin role on first login.
     admin_phones: list[str] = ["09120000000"]

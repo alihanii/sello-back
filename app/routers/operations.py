@@ -7,8 +7,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.orm import selectinload
 
 from app.core.db import SessionLocal
-from app.core.security import decode_token
-from app.deps import DB, CurrentUser, get_store_for
+from app.deps import DB, CurrentUser, get_store_for, user_for_token
 from app.models import ChannelListing, CrawlItem, Operation, Store, User
 from app.schemas import OperationDetail, OperationOut
 from app.services.ops import cancel_operation
@@ -115,14 +114,11 @@ async def retry(op_id: int, user: CurrentUser, db: DB):
 async def stream(store_id: int, request: Request, token: str):
     """SSE: pushes operations that changed since the last tick. EventSource can't send headers,
     so the JWT comes as a query param."""
-    try:
-        uid = int(decode_token(token)["sub"])
-    except Exception:
-        raise HTTPException(401, "نشست نامعتبر.")
     async with SessionLocal() as db:
-        user = await db.get(User, uid)
+        user, _ = await user_for_token(db, token)
+        uid = user.id
         store = await db.get(Store, store_id)
-        if not user or not store or (store.owner_id != uid and user.role != "admin"):
+        if not store or (store.owner_id != uid and user.role != "admin"):
             raise HTTPException(404, "فروشگاه پیدا نشد.")
 
     async def events():

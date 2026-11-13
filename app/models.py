@@ -20,6 +20,12 @@ class User(TimestampMixin, Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     onboarded: Mapped[bool] = mapped_column(Boolean, default=False)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Password login (optional; OTP always works). scrypt hash, see app/core/passwords.py.
+    password_hash: Mapped[str | None] = mapped_column(String(255))
+    password_set_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Wrong passwords in a row; at the limit the account's password login pauses until locked_until.
+    failed_logins: Mapped[int | None] = mapped_column(Integer, default=0)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     stores: Mapped[list["Store"]] = relationship(back_populates="owner")
 
@@ -32,6 +38,27 @@ class OtpCode(TimestampMixin, Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     used: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class AuthSession(TimestampMixin, Base):
+    """One signed-in device. The refresh token itself is never stored, only its SHA-256; every refresh replaces it
+    (rotation). A token that was already replaced coming back means it leaked: the whole session is revoked."""
+
+    __tablename__ = "auth_sessions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    # The token just replaced, kept for a few seconds so two tabs refreshing at once don't sign the user out.
+    prev_token_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    rotated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    method: Mapped[str] = mapped_column(String(20), default="otp")  # otp | password | upgrade
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))  # idle expiry, moves on every refresh
+    absolute_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoke_reason: Mapped[str | None] = mapped_column(String(40))
+    user_agent: Mapped[str | None] = mapped_column(String(300))
+    ip: Mapped[str | None] = mapped_column(String(64))
 
 
 # ---------- stores & channels ----------
