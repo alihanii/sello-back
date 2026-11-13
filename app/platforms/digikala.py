@@ -138,9 +138,10 @@ def _coerce(field: dict, value: Any) -> Any:
 DK_MIN_SIDE, DK_TARGET, DK_MAX_SIDE, DK_MAX_BYTES = 600, 1200, 2500, 3 * 1024 * 1024
 
 
-def digikala_jpeg(data: bytes) -> bytes:
+def digikala_jpeg(data: bytes, fill: float = 0.94) -> bytes:
     """Square white-background JPEG within Digikala's size limits: the photo is fitted whole (no crop) and padded
-    with white; small photos are scaled up to 1200x1200, large ones down to 2000 at most."""
+    with white; small photos are scaled up to 1200x1200, large ones down to 2000 at most. `fill` is how much of the
+    square the product takes."""
     from PIL import Image, ImageOps
 
     try:
@@ -153,7 +154,7 @@ def digikala_jpeg(data: bytes) -> bytes:
             img = bg
         side = max(img.size)
         side = DK_TARGET if side < DK_TARGET else min(side, 2000)
-        fitted = ImageOps.contain(img, (int(side * 0.94), int(side * 0.94)), Image.LANCZOS)
+        fitted = ImageOps.contain(img, (int(side * fill), int(side * fill)), Image.LANCZOS)
         canvas = Image.new("RGB", (side, side), (255, 255, 255))
         canvas.paste(fitted, ((side - fitted.width) // 2, (side - fitted.height) // 2))
         for quality in (90, 84, 76, 68):
@@ -503,10 +504,15 @@ class DigikalaAdapter:
         main = await self._main_image(ctx, product, desc)
         if main:
             urls = [main] + urls[1:]
-        async with ctx.step("images", f"آپلود {len(urls)} عکس با استاندارد دیجی‌کالا") as s:
+        # Digikala wants at least two pictures: with one, a second copy of it goes, framed a little wider so it
+        # isn't the same file twice.
+        shots = [(u, 0.94) for u in urls]
+        if len(shots) == 1:
+            shots.append((shots[0][0], 0.8))
+        async with ctx.step("images", f"آپلود {len(shots)} عکس با استاندارد دیجی‌کالا") as s:
             ids, sizes = [], []
-            for i, url in enumerate(urls):
-                data = digikala_jpeg(await load_bytes(url))
+            for i, (url, fill) in enumerate(shots):
+                data = digikala_jpeg(await load_bytes(url), fill)
                 sizes.append(len(data))
                 up = await self._request("POST", "/api/v2/product-creation/temp_images", token=token, referer=ref,
                                          files={"file": (f"product_{draft_id}_{i}.jpg", data, "image/jpeg")},
@@ -524,7 +530,7 @@ class DigikalaAdapter:
                 if i == 0:
                     await self._request("PATCH", f"/api/v2/product-creation/temp_images/{image_id}/main",
                                         token=token, body=None, referer=ref)
-            s.response = {"image_ids": ids, "bytes": sizes, "ai_main": bool(main)}
+            s.response = {"image_ids": ids, "bytes": sizes, "ai_main": bool(main), "copied_first": len(urls) == 1}
 
         async with ctx.step("save", "ثبت نهایی محصول") as s:
             saved = await self._request("POST", "/api/v2/product-creation/save", token=token, referer=ref,
