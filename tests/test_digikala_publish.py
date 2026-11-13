@@ -30,6 +30,7 @@ def png_url(tmp_path, monkeypatch):
 
 async def test_digikala_publish_runs_whole_wizard(tmp_path, monkeypatch):
     calls = []
+    uploads = []
 
     async def fake_request(self, method, path, *, token=None, body=None, referer=None, files=None, data=None):
         calls.append((method, path.split("?")[0], body, files))
@@ -50,9 +51,11 @@ async def test_digikala_publish_runs_whole_wizard(tmp_path, monkeypatch):
             assert files["file"][1][:2] == b"\xff\xd8"  # re-encoded to JPEG
             img = Image.open(io.BytesIO(files["file"][1]))
             assert img.size == (1200, 1200) and img.getpixel((2, 2)) == (255, 255, 255)  # square, white, Digikala size
+            uploads.append(files["file"][1])
             return {"status": "ok", "data": {}}  # an answer without the id: the draft's own list is read instead
         if "/temp_images/draft_product/" in path:
-            return {"data": {"items": [{"id": 55, "url": "https://x/55.jpg", "is_main": False}]}}
+            return {"data": {"items": [{"id": 55 + n, "url": f"https://x/{55 + n}.jpg", "is_main": False}
+                                       for n in range(len(uploads))]}}
         if path.endswith("/save") and "auto-title" not in path:
             return {"data": {"product_id": 123456}}
         return {"data": {}}
@@ -76,6 +79,8 @@ async def test_digikala_publish_runs_whole_wizard(tmp_path, monkeypatch):
     assert draft["brand_id"] == 719 and draft["division_id"] == 5 and draft["general_mefa_id"] == 9
     assert ctx.steps[-3:] == ["images", "save", "submit"]
     assert ("PATCH", "/api/v2/product-creation/temp_images/55/main", None, None) in calls
+    # One photo: Digikala needs two, so a wider-framed copy of the first goes too (not the same file twice).
+    assert len(uploads) == 2 and uploads[0] != uploads[1]
 
 
 async def test_main_image_made_once_with_the_smart_product_pipeline(monkeypatch):
