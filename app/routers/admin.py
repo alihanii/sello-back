@@ -480,7 +480,7 @@ def _sms_out(cfg: dict[str, Any]) -> dict[str, Any]:
     key = cfg["api_key"]
     return {"enabled": cfg["enabled"], "provider": "kavenegar", "template": cfg["template"], "sender": cfg["sender"],
             "has_key": bool(key), "key_hint": f"…{key[-4:]}" if len(key) > 8 else "", "ready": cfg["ready"],
-            "dev_mode": settings.otp_dev_mode}
+            "shows_code": not cfg["enabled"]}
 
 
 @router.get("/integrations/sms")
