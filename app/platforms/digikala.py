@@ -2,6 +2,7 @@
 (digikala.api/app/services/digikala_seller_client.py and digikala_seller_products.py).
 These are the seller PWA's internal endpoints, not a public API, so they can change."""
 
+import io
 import json
 import re
 import secrets
@@ -15,7 +16,7 @@ from app.core.security import decrypt_credentials
 from app.models import Channel, Product, Store
 from app.platforms.base import EDIT_PRODUCT, RECONNECT, CrawledItem, PlatformError, PublishResult
 from app.services import ai
-from app.services.images import jpeg_bytes
+from app.services.images import load_bytes
 
 BASE_URL = "https://seller.digikala.com"
 DEFAULT_HEADERS = {
@@ -129,6 +130,73 @@ def _coerce(field: dict, value: Any) -> Any:
         m = re.search(r"\d+(?:\.\d+)?", str(value).translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")))
         return (float(m.group()) if "." in m.group() else int(m.group())) if m else None
     return str(value)[:255]
+
+
+# ---------- pictures: Digikala's image rules ----------
+# Digikala seller academy: JPG, square, product centred on a pure white background, at least 600x600 and at most
+# 2500x2500 pixels, under 5 MB (we keep well under), no text, logos, watermarks or frames.
+DK_MIN_SIDE, DK_TARGET, DK_MAX_SIDE, DK_MAX_BYTES = 600, 1200, 2500, 3 * 1024 * 1024
+
+
+def digikala_jpeg(data: bytes) -> bytes:
+    """Square white-background JPEG within Digikala's size limits: the photo is fitted whole (no crop) and padded
+    with white; small photos are scaled up to 1200x1200, large ones down to 2000 at most."""
+    from PIL import Image, ImageOps
+
+    try:
+        img = Image.open(io.BytesIO(data))
+        img = ImageOps.exif_transpose(img)
+        if img.mode != "RGB":
+            rgba = img.convert("RGBA")
+            bg = Image.new("RGB", rgba.size, (255, 255, 255))
+            bg.paste(rgba, mask=rgba.split()[-1])
+            img = bg
+        side = max(img.size)
+        side = DK_TARGET if side < DK_TARGET else min(side, 2000)
+        fitted = ImageOps.contain(img, (int(side * 0.94), int(side * 0.94)), Image.LANCZOS)
+        canvas = Image.new("RGB", (side, side), (255, 255, 255))
+        canvas.paste(fitted, ((side - fitted.width) // 2, (side - fitted.height) // 2))
+        for quality in (90, 84, 76, 68):
+            out = io.BytesIO()
+            canvas.save(out, "JPEG", quality=quality, optimize=True)
+            if out.tell() <= DK_MAX_BYTES:
+                break
+        return out.getvalue()
+    except Exception as exc:  # noqa: BLE001
+        raise PlatformError("یکی از عکس‌ها برای دیجی‌کالا قابل تبدیل نبود.", "bad_image", EDIT_PRODUCT, str(exc)) from exc
+
+
+def _image_ids(payload: Any) -> list:
+    """Every image id in a temp_images answer, whatever its shape ({data: {id}}, {data: {data: {id}}}, items...)."""
+    out: list = []
+
+    def walk(v: Any, depth: int = 0) -> None:
+        if depth > 5:
+            return
+        if isinstance(v, dict):
+            if v.get("id") is not None and any(k in v for k in ("url", "src", "image", "urls", "is_main", "main",
+                                                                     "reference", "reference_id", "path", "name")):
+                out.append(v["id"])
+            for k, x in v.items():
+                if isinstance(x, (dict, list)):
+                    walk(x, depth + 1)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x, depth + 1)
+
+    walk(payload)
+    return out
+
+
+def _image_id(payload: Any) -> Any:
+    data = payload.get("data") if isinstance(payload, dict) else None
+    for d in (data, (data or {}).get("data") if isinstance(data, dict) else None,
+              (data or {}).get("image") if isinstance(data, dict) else None,
+              (data or {}).get("temp_image") if isinstance(data, dict) else None):
+        if isinstance(d, dict) and d.get("id") is not None:
+            return d["id"]
+    ids = _image_ids(payload)
+    return ids[0] if ids else None
 
 
 # ---------- after publishing: review state, variant (price + stock), orders ----------
@@ -431,21 +499,32 @@ class DigikalaAdapter:
                           "save": await self._request("POST", "/api/v2/product-creation/auto-title/save",
                                                       token=token, body=body, referer=ref)}
 
-        async with ctx.step("images", f"آپلود {min(len(product.images), 8)} عکس") as s:
-            ids = []
-            for i, img in enumerate(product.images[:8]):
-                data, name = await jpeg_bytes(img.url)
+        urls = [img.url for img in product.images[:8]]
+        main = await self._main_image(ctx, product, desc)
+        if main:
+            urls = [main] + urls[1:]
+        async with ctx.step("images", f"آپلود {len(urls)} عکس با استاندارد دیجی‌کالا") as s:
+            ids, sizes = [], []
+            for i, url in enumerate(urls):
+                data = digikala_jpeg(await load_bytes(url))
+                sizes.append(len(data))
                 up = await self._request("POST", "/api/v2/product-creation/temp_images", token=token, referer=ref,
-                                         files={"file": (name, data, "image/jpeg")},
+                                         files={"file": (f"product_{draft_id}_{i}.jpg", data, "image/jpeg")},
                                          data={"reference": "draft_product", "reference_id": str(draft_id)})
-                image_id = (up.get("data") or {}).get("id") or ((up.get("data") or {}).get("image") or {}).get("id")
+                image_id = _image_id(up)
+                if not image_id:  # the upload answer's shape changes; the draft's own list is the source of truth
+                    listed = await self._request("GET", f"/api/v2/product-creation/temp_images/draft_product/{draft_id}",
+                                                 token=token, referer=ref)
+                    known = [x for x in (_image_ids(listed)) if x not in ids]
+                    image_id = known[-1] if known else None
                 if not image_id:
-                    raise PlatformError("دیجی‌کالا عکس را نپذیرفت.", "image_rejected", EDIT_PRODUCT, up)
+                    raise PlatformError("دیجی‌کالا عکس را نپذیرفت: " + (self._message(up) or "پاسخ بدون شناسهٔ عکس"),
+                                        "image_rejected", EDIT_PRODUCT, up)
                 ids.append(image_id)
                 if i == 0:
                     await self._request("PATCH", f"/api/v2/product-creation/temp_images/{image_id}/main",
-                                        token=token, body={}, referer=ref)
-            s.response = {"image_ids": ids}
+                                        token=token, body=None, referer=ref)
+            s.response = {"image_ids": ids, "bytes": sizes, "ai_main": bool(main)}
 
         async with ctx.step("save", "ثبت نهایی محصول") as s:
             saved = await self._request("POST", "/api/v2/product-creation/save", token=token, referer=ref,
@@ -469,6 +548,41 @@ class DigikalaAdapter:
             f"DKP-{product_id}", f"https://www.digikala.com/product/dkp-{product_id}/",
             {"draft_product_id": draft_id, "category_id": cat_id, "category": category.get("title"),
              "note": "محصول در صف بررسی دیجی‌کالاست؛ پس از تأیید، قیمت و موجودی را در پنل دیجی‌کالا ثبت کنید."})
+
+    @staticmethod
+    def _message(payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        return str(payload.get("message") or payload.get("error") or "")[:200]
+
+    async def _main_image(self, ctx, product: Product, desc: str) -> str:
+        """The main picture made the way «ساخت محصول هوشمند» makes it (Digikala's main-image rules: the product alone,
+        centred, white background, no text), from the seller's first photo. Kept in source_ref so a retry reuses it.
+        Empty when AI pictures are off for this store/plan or the model gives none: the seller's photo goes instead."""
+        if not product.images:
+            return ""
+        first = product.images[0]
+        ref = dict(getattr(product, "source_ref", None) or {})
+        cached = ref.get("digikala_main_image")
+        if cached and cached.get("from") == first.url:
+            return cached["url"]
+        if getattr(first, "origin_url", ""):  # already cleaned by smart product creation
+            return ""
+        if not await ai.ai_available("image_edit"):
+            return ""
+        from app.services.product_images import make_photo
+
+        try:
+            url = await make_photo(ctx, store_id=product.store_id, title=product.title,
+                                   note=(product.description or desc or "")[:400],
+                                   category="general", image_url=first.url)
+        except Exception as exc:  # noqa: BLE001 - plan without AI pictures, model refused...: the seller's photo goes
+            async with ctx.step("image_ai_skipped", "عکس AI ساخته نشد؛ عکس خود محصول استفاده می‌شود") as s:
+                s.response = {"reason": getattr(exc, "message_fa", None) or str(exc)[:300]}
+            return ""
+        ref["digikala_main_image"] = {"from": first.url, "url": url}
+        product.source_ref = ref
+        return url
 
     async def _ai_copy(self, ctx, product: Product, desc: str) -> dict[str, Any]:
         """Description (Digikala wants 150+ characters), English title, advantages and disadvantages, written by AI from
