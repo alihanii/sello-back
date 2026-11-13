@@ -161,10 +161,49 @@ async def test_codes_go_by_kavenegar_when_configured(fresh, monkeypatch):
     assert r.status_code == 200
 
 
-async def test_no_sms_and_no_dev_mode_refuses(fresh, monkeypatch):
-    monkeypatch.setattr(settings, "otp_dev_mode", False)
-    r = await fresh.post("/auth/otp/send", json={"phone": "09130000009"})
-    assert r.status_code == 503
+async def test_the_sms_switch_decides_whether_the_code_is_shown(fresh, client, monkeypatch):
+    from app.routers import auth
+
+    sent = []
+
+    async def fake_send(cfg, phone, code):
+        sent.append(code)
+
+    monkeypatch.setattr(auth, "send_code", fake_send)
+    state = {"enabled": False, "ready": False}
+
+    async def cfg(db):
+        return {"enabled": state["enabled"], "provider": "kavenegar", "api_key": "k" * 20, "template": "t",
+                "sender": "", "ready": state["ready"]}
+
+    monkeypatch.setattr(auth, "sms_config", cfg)
+    # Off: the code comes back for the login screen and nothing is sent.
+    r = await fresh.post("/auth/otp/send", json={"phone": "09130000020"})
+    assert r.status_code == 200 and r.json()["dev_code"] and not sent
+    # On: sent by SMS and never returned.
+    state.update(enabled=True, ready=True)
+    r = await fresh.post("/auth/otp/send", json={"phone": "09130000021"})
+    assert r.status_code == 200 and "dev_code" not in r.json() and len(sent) == 1
+    # On but incomplete: refuses instead of showing the code.
+    state.update(ready=False)
+    r = await fresh.post("/auth/otp/send", json={"phone": "09130000022"})
+    assert r.status_code == 503 and "dev_code" not in r.text
+
+
+async def test_admin_sms_switch_roundtrip(client):
+    from tests.conftest import login
+
+    admin = await login(client, "09120000000")
+    r = await client.get("/admin/integrations/sms", headers=admin)
+    assert r.status_code == 200 and r.json()["shows_code"] is True
+    # Can't switch on without a key and template.
+    r = await client.put("/admin/integrations/sms", headers=admin, json={"enabled": True, "template": "", "sender": ""})
+    assert r.status_code == 422
+    r = await client.put("/admin/integrations/sms", headers=admin,
+                         json={"enabled": True, "template": "foroshify-login", "sender": "", "api_key": "K" * 24})
+    assert r.status_code == 200 and r.json()["ready"] is True and r.json()["shows_code"] is False
+    r = await client.put("/admin/integrations/sms", headers=admin, json={"enabled": False, "template": "foroshify-login", "sender": ""})
+    assert r.json()["shows_code"] is True and r.json()["has_key"] is True
 
 
 async def test_kavenegar_request_shape(monkeypatch):

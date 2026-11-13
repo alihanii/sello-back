@@ -226,9 +226,11 @@ async def send_otp(body: PhoneIn, request: Request, db: DB):
     if throttle and throttle.locked_until and aware(throttle.locked_until) > utcnow():
         left = (aware(throttle.locked_until) - utcnow()).total_seconds()
         raise _wait(_lock_message(left), left)
+    # The admin's switch (admin › integrations › پیامک ورود) decides: on = a real SMS and the code is never shown;
+    # off = the code is shown on the login screen, until Kavenegar is ready.
     cfg = await sms_config(db)
-    if not cfg["ready"] and not settings.otp_dev_mode:
-        raise HTTPException(503, "ارسال پیامک هنوز راه‌اندازی نشده است.")
+    if cfg["enabled"] and not cfg["ready"]:
+        raise HTTPException(503, "ارسال پیامک ناقص تنظیم شده است؛ ادمین کلید و نام الگو را کامل کند.")
     code = f"{random.SystemRandom().randint(0, 999999):06d}"
     otp = OtpCode(phone=phone, code_hash=hash_code(phone, code),
                   expires_at=utcnow() + timedelta(seconds=settings.otp_ttl_seconds))
