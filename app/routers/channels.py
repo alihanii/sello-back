@@ -18,13 +18,14 @@ from app.platforms.instagram_private import submit_code
 from app.platforms.registry import PLATFORM_INFO
 from app.schemas import ChannelOut, OperationOut
 from app.services import ig_chat, li_chat
-from app.services.integrations import instagram_app, instagram_crawler, linkedin_app
+from app.services.integrations import digikala_app, instagram_app, instagram_crawler, linkedin_app
 from app.services.ops import OpContext, enqueue, fail_operation
 from app.services.proxy_links import LinkError, parse_link
 from app.services.proxy_pool import pool
 from app.services.plans import check_limit
 
 router = APIRouter(tags=["channels"])
+DK_OFF = "اتصال دیجی‌کالا فعلاً توسط ادمین سایت خاموش شده است."
 
 
 @router.get("/platforms")
@@ -34,6 +35,7 @@ async def platforms(db: DB):
     ig = await instagram_app(db)
     crawl_ready = bool((await instagram_crawler(db))["token"])
     li = await linkedin_app(db)
+    dk = await digikala_app(db)
     out = []
     for k, v in PLATFORM_INFO.items():
         row = {"platform": k, **v, "enabled": not v.get("flag") or ig["enabled"]}
@@ -45,6 +47,10 @@ async def platforms(db: DB):
             row["crawl_ready"] = crawl_ready
             row["crawl_only"] = crawl_ready and not ig["enabled"]
             row["enabled"] = ig["enabled"] or crawl_ready
+        if k == "digikala":
+            row["enabled"] = row["publish_ready"] = dk["enabled"]
+            if not dk["enabled"]:
+                row["reason"] = DK_OFF
         if k == "linkedin":
             row["enabled"] = row["publish_ready"] = li["enabled"]
             row["formats"] = ["post"]
@@ -113,6 +119,8 @@ async def digikala_send_code(store_id: int, body: ConnectIn, user: CurrentUser, 
     """Step 1 of Digikala OTP; runs inline because the seller is waiting for the SMS."""
     await get_store_for(db, user, store_id)
     body.platform = "digikala"
+    if not (await digikala_app(db))["enabled"]:
+        raise HTTPException(400, DK_OFF)
     ch = await _channel(db, user, store_id, body)
     op = await enqueue(db, store_id=store_id, type="connect", channel_id=ch.id, title_fa="ارسال کد تأیید دیجی‌کالا")
     op.status = "running"
@@ -239,6 +247,8 @@ async def remove_own_proxy(channel_id: int, user: CurrentUser, db: DB):
 @router.post("/stores/{store_id}/channels/connect", response_model=OperationOut, status_code=202)
 async def connect(store_id: int, body: ConnectIn, user: CurrentUser, db: DB):
     await get_store_for(db, user, store_id)
+    if body.platform == "digikala" and not (await digikala_app(db))["enabled"]:
+        raise HTTPException(400, DK_OFF)
     ch = await _channel(db, user, store_id, body)
     if body.platform == "instagram" and body.data.get("username"):
         link = (body.data.pop("proxy", "") or "").strip()
@@ -357,3 +367,22 @@ async def disconnect(channel_id: int, user: CurrentUser, db: DB):
         bot.status = "disconnected"
     await db.commit()
     return {"ok": True}
+
+
+@router.post("/channels/{channel_id}/digikala/sync")
+async def digikala_sync(channel_id: int, user: CurrentUser, db: DB):
+    """Read review states, set price + stock on approved products and pull orders now, instead of waiting for the timer."""
+    from app.services.dk_sync import sync_one
+
+    ch = await db.get(Channel, channel_id)
+    if not ch or ch.platform != "digikala":
+        raise HTTPException(404, "کانال پیدا نشد.")
+    await get_store_for(db, user, ch.store_id)
+    if not (await digikala_app(db))["enabled"]:
+        raise HTTPException(400, DK_OFF)
+    if ch.status != "connected":
+        raise HTTPException(400, "اول حساب دیجی‌کالا را دوباره وصل کن.")
+    res = await sync_one(ch.id)
+    if res.get("errors") and not (res.get("orders") or res.get("listings")):
+        raise HTTPException(400, "؛ ".join(res["errors"]))
+    return res

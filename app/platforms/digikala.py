@@ -131,6 +131,144 @@ def _coerce(field: dict, value: Any) -> Any:
     return str(value)[:255]
 
 
+# ---------- after publishing: review state, variant (price + stock), orders ----------
+
+def review_state(code: str) -> str:
+    """Digikala's moderation code ("waiting_for_confirm", "rejected"...) -> in_review | needs_edit | rejected | approved."""
+    c = (code or "").lower()
+    if not c:
+        return ""
+    if "reject" in c or "denied" in c or "decline" in c:
+        return "rejected"
+    if "edit" in c or "correct" in c or "revis" in c or "need" in c:
+        return "needs_edit"
+    if "wait" in c or "pending" in c or "review" in c or "draft" in c or "check" in c or "new" == c:
+        return "in_review"
+    if "approv" in c or "confirm" in c or "accept" in c or "active" in c or "publish" in c:
+        return "approved"
+    return "in_review"
+
+
+REVIEW_FA = {"in_review": "در انتظار تأیید دیجی‌کالا", "needs_edit": "نیاز به اصلاح", "rejected": "رد شده",
+             "approved": "تأیید شده", "live": "فعال در دیجی‌کالا (قیمت و موجودی ثبت شد)"}
+
+# Our order statuses for Digikala's: an order on Digikala is already paid by the customer, so anything that isn't
+# cancelled or returned counts as confirmed; Digikala's own label is kept beside it.
+ORDER_FA = {"new": "سفارش جدید", "pending": "در انتظار پردازش", "processing": "در حال پردازش",
+            "ready_to_ship": "آمادهٔ ارسال", "shipped": "ارسال شده", "delivered": "تحویل شده",
+            "cancelled": "لغو شده", "canceled": "لغو شده", "returned": "مرجوع شده", "failed_delivery": "تحویل ناموفق"}
+
+
+def order_status(code: str) -> str:
+    c = (code or "").lower()
+    return "cancelled" if any(w in c for w in ("cancel", "return", "reject", "refund")) else "confirmed"
+
+
+def _first(d: dict, *keys: str) -> Any:
+    for k in keys:
+        cur: Any = d
+        for part in k.split("."):
+            cur = cur.get(part) if isinstance(cur, dict) else None
+        if cur not in (None, "", [], {}):
+            return cur
+    return None
+
+
+def _text(v: Any) -> str:
+    if isinstance(v, dict):
+        v = _first(v, "title", "text", "label", "name", "fa", "translate", "value")
+    return str(v).strip() if v not in (None, "") else ""
+
+
+def _rows(data: Any) -> list[dict]:
+    """The list of rows in a panel response, wherever it sits (data.items, data.orders, data.data...)."""
+    if isinstance(data, list):
+        return [r for r in data if isinstance(r, dict)]
+    if not isinstance(data, dict):
+        return []
+    for k in ("items", "orders", "shipments", "results", "rows", "list", "data"):
+        v = data.get(k)
+        if isinstance(v, list):
+            return [r for r in v if isinstance(r, dict)]
+        if isinstance(v, dict):
+            inner = _rows(v)
+            if inner:
+                return inner
+    return []
+
+
+def _toman(v: Any) -> int:
+    """Digikala's panel speaks rial; Sello stores toman."""
+    try:
+        return int(float(str(v).replace(",", ""))) // 10
+    except (TypeError, ValueError):
+        return 0
+
+
+def normalize_order(row: dict) -> dict[str, Any] | None:
+    oid = _first(row, "order_item_id", "shipment_id", "id", "order_id", "order.id")
+    if oid is None:
+        return None
+    status = _first(row, "status.code", "status.value", "status", "order_status", "shipment_status", "state")
+    status_code = status if isinstance(status, str) else _text(_first(row, "status.code", "status.name")) or str(status or "")
+    label = _text(_first(row, "status.title", "status.text", "status.label", "status_label", "status_title",
+                         "status_fa", "status_translate")) or ORDER_FA.get(status_code.lower(), status_code)
+    raw_items = _first(row, "items", "order_items", "variants", "products") or [row]
+    items = []
+    for it in raw_items if isinstance(raw_items, list) else [raw_items]:
+        if not isinstance(it, dict):
+            continue
+        pid = _first(it, "product_id", "product.id", "variant.product_id")
+        price = _first(it, "selling_price", "price", "unit_price", "variant.price.selling_price", "price.selling_price")
+        items.append({"remote_product_id": int(pid) if str(pid or "").isdigit() else None,
+                      "variant_id": _first(it, "variant_id", "variant.id", "dkpc"),
+                      "title": _text(_first(it, "product_title", "title_fa", "title", "product.title_fa", "variant.title_fa",
+                                            "product.title")) or "کالای دیجی‌کالا",
+                      "qty": int(_first(it, "quantity", "qty", "count") or 1),
+                      "unit_price": _toman(price),
+                      "image_url": _text(_first(it, "image_src", "image", "product.image_src", "variant.image_src"))})
+    created = _first(row, "created_at", "order_created_at", "order.created_at", "date", "created_date")
+    customer = _first(row, "customer", "customer_info", "receiver", "address") or {}
+    return {"id": str(oid), "code": str(_first(row, "order_code", "code", "order_id", "order.code") or oid),
+            "status_code": status_code[:40], "status_fa": label[:120], "status": order_status(status_code),
+            "created_at": str(created) if created else "",
+            "customer_name": _text(_first(customer if isinstance(customer, dict) else {}, "full_name", "name")
+                                   or _first(row, "customer_name", "receiver_name")),
+            "city": _text(_first(customer if isinstance(customer, dict) else {}, "city", "city_name")
+                          or _first(row, "city", "city_name", "destination_city")),
+            "items": items, "raw": row}
+
+
+def variant_body(form: dict, product: Product, dk_product_id: int) -> dict[str, Any]:
+    """The variant form's defaults (first warranty, first theme value such as the color) plus our price and stock."""
+    form = form if isinstance(form, dict) else {}
+
+    def first_id(*keys: str) -> Any:
+        for k in keys:
+            v = form.get(k)
+            items = list(v.values()) if isinstance(v, dict) else v if isinstance(v, list) else []
+            for it in items:
+                if isinstance(it, dict) and it.get("id", it.get("value")) is not None:
+                    return it.get("id", it.get("value"))
+        return None
+
+    price = int(product.price) * 10
+    body: dict[str, Any] = {
+        "product_id": dk_product_id,
+        "price": price, "selling_price": price, "price_list": max(price, int(product.compare_at_price or 0) * 10),
+        "seller_stock": max(int(product.stock_qty or 0), 0), "stock": max(int(product.stock_qty or 0), 0),
+        "lead_time": int(form.get("default_lead_time") or 2), "maximum_per_order": int(form.get("maximum_per_order") or 5),
+        "shipping_type": form.get("default_shipping_type") or "digikala",
+        "warranty_id": first_id("warranties", "warranty"),
+        "theme_value_id": first_id("theme_values", "colors", "sizes", "themes"),
+        "seller_code": (product.sku or f"SL-{product.id}")[:40],
+    }
+    return {k: v for k, v in body.items() if v is not None}
+
+
+ORDER_PATHS = ("/api/v2/ship-by-seller-orders", "/api/v2/orders/")
+
+
 class DigikalaAdapter:
     platform = "digikala"
     label_fa = "دیجی‌کالا"
@@ -247,8 +385,16 @@ class DigikalaAdapter:
     # Ported from platform-wrappers digikala_seller_product_worker: category → draft → attributes →
     # title → images → save → submit for review. AI decisions go through our admin-routed providers.
 
+    @staticmethod
+    async def ensure_enabled(db) -> None:
+        from app.services.integrations import digikala_app
+
+        if db is not None and not (await digikala_app(db))["enabled"]:
+            raise PlatformError("دیجی‌کالا فعلاً توسط ادمین سایت خاموش شده است.", "platform_off")
+
     async def publish(self, ctx, channel: Channel, product: Product, store: Store,
                       existing_remote_id: str = "") -> PublishResult:
+        await self.ensure_enabled(ctx.db)
         if existing_remote_id:
             raise PlatformError("این محصول قبلاً در دیجی‌کالا ثبت شده؛ ویرایش آن فعلاً از پنل دیجی‌کالا انجام می‌شود.",
                                 "already_published", {"type": "info", "label": "ویرایش در پنل دیجی‌کالا"})
@@ -264,10 +410,13 @@ class DigikalaAdapter:
         ref = f"{ref}&draftProductId={draft_id}"
         await self._fill_attributes(ctx, token, product, cat_id, draft_id, package, ref)
 
+        copy = await self._ai_copy(ctx, product, desc)
         async with ctx.step("title", "ثبت عنوان و توضیح", request={"title_fa": title}) as s:
             auto = await self._request("GET", f"/api/v2/product-creation/{draft_id}/auto-title", token=token, referer=ref)
-            body = {"draft_product_id": draft_id, "title_fa": title[:255], "title_en": "",
-                    "description": desc if len(desc) >= 150 else None, "advantages": [], "disadvantages": []}
+            text = desc if len(desc) >= 150 else copy.get("description") or ""
+            body = {"draft_product_id": draft_id, "title_fa": title[:255], "title_en": copy.get("title_en", "")[:255],
+                    "description": text if len(text) >= 150 else None,
+                    "advantages": copy.get("advantages", []), "disadvantages": copy.get("disadvantages", [])}
             s.response = {"auto_title": (auto.get("data") or {}).get("title_fa"),
                           "save": await self._request("POST", "/api/v2/product-creation/auto-title/save",
                                                       token=token, body=body, referer=ref)}
@@ -310,6 +459,33 @@ class DigikalaAdapter:
             f"DKP-{product_id}", f"https://www.digikala.com/product/dkp-{product_id}/",
             {"draft_product_id": draft_id, "category_id": cat_id, "category": category.get("title"),
              "note": "محصول در صف بررسی دیجی‌کالاست؛ پس از تأیید، قیمت و موجودی را در پنل دیجی‌کالا ثبت کنید."})
+
+    async def _ai_copy(self, ctx, product: Product, desc: str) -> dict[str, Any]:
+        """Description (Digikala wants 150+ characters), English title, advantages and disadvantages, written by AI from
+        the product's own text. Empty when AI is off; the listing then goes without them."""
+        if not await ai.ai_available("field_fill"):
+            return {}
+        try:
+            async with ctx.step("copy_ai", "نوشتن توضیح، عنوان انگلیسی و نقاط قوت با هوش مصنوعی") as s:
+                res = await ai.generate_json(
+                    task="field_fill", store_id=product.store_id,
+                    system=("You write a Digikala product listing in Persian from the seller's text. Use only facts in the "
+                            "text; no prices, phone numbers, links, emojis or claims like 'best'. Reply JSON {"
+                            "\"description\": 2-4 Persian sentences, 180-700 characters, "
+                            "\"title_en\": short English product title, "
+                            "\"advantages\": up to 3 short Persian points, \"disadvantages\": up to 1 short honest point or []}."),
+                    prompt=json.dumps({"title": product.title, "description": desc[:1500], "brand": product.brand,
+                                       "category": product.category_hint, "attributes": product.attributes},
+                                      ensure_ascii=False))
+                res = res if isinstance(res, dict) else {}
+                out = {"description": str(res.get("description") or "").strip()[:2000],
+                       "title_en": re.sub(r"[^\x20-\x7E]", "", str(res.get("title_en") or "")).strip(),
+                       "advantages": [str(a).strip()[:100] for a in (res.get("advantages") or []) if str(a).strip()][:3],
+                       "disadvantages": [str(a).strip()[:100] for a in (res.get("disadvantages") or []) if str(a).strip()][:1]}
+                s.response = out
+                return out
+        except Exception:  # noqa: BLE001 - copy is optional; the listing still goes with the seller's own text
+            return {}
 
     async def _pick_category(self, ctx, token: str, product: Product) -> tuple[dict, dict]:
         keywords = [k for k in (product.category_hint, " ".join(product.title.split()[:2]), product.title.split()[0]) if k]
@@ -410,20 +586,30 @@ class DigikalaAdapter:
             v = mine.get(_norm(f["title"]))
             if v not in (None, ""):
                 values[str(f["id"])] = v
-        missing = [f for f in fields if f["required"] and str(f["id"]) not in values]
+        # Every field still empty goes to the AI: required ones must get a value, optional ones only when the product
+        # text (or the picture's obvious facts) says so; the more fields Digikala gets, the fewer review rejections.
+        missing = [f for f in fields if str(f["id"]) not in values]
+        missing.sort(key=lambda f: not f["required"])
+        missing = missing[:60]
         if missing and await ai.ai_available("field_fill"):
-            async with ctx.step("attributes_ai", f"پر کردن {len(missing)} ویژگی اجباری با هوش مصنوعی") as s:
+            n_req = sum(f["required"] for f in missing)
+            async with ctx.step("attributes_ai", f"پر کردن {len(missing)} ویژگی ({n_req} اجباری) با هوش مصنوعی") as s:
                 res = await ai.generate_json(
                     task="field_fill", store_id=product.store_id,
                     system=("Fill Digikala product attributes from the product text. For select fields answer with one "
                             "option id, for multi_select a list of option ids, for number a number, else short Persian "
-                            "text. Never invent specs that contradict the text; choose the most neutral option. "
+                            "text. Fields with required=true must always get a value: when the text doesn't say, choose "
+                            "the most neutral/likely option. For optional fields give a value only when the product text "
+                            "makes it clear, else null. Never invent specs that contradict the text. "
                             "Reply JSON {\"<field id>\": value}."),
                     prompt=json.dumps({"product": {"title": product.title, "description": (product.description or "")[:1500],
-                                                   "brand": product.brand, "attributes": product.attributes},
-                                       "fields": [{k: f[k] for k in ("id", "title", "type", "unit", "options")} for f in missing]},
+                                                   "brand": product.brand, "category": product.category_hint,
+                                                   "attributes": product.attributes},
+                                       "fields": [{k: f[k] for k in ("id", "title", "type", "unit", "required", "options")}
+                                                  for f in missing]},
                                       ensure_ascii=False))
-                values.update({str(k): v for k, v in res.items()})
+                res = res if isinstance(res, dict) else {}
+                values.update({str(k): v for k, v in res.items() if v not in (None, "", [])})
                 s.response = res
         attrs = []
         for f in fields:
@@ -442,7 +628,99 @@ class DigikalaAdapter:
                 "length": package["package_length"], "height": package["package_height"],
                 "width": package["package_width"], "weight": package["package_weight"]})
 
+    # ---------- after publishing ----------
+
+    async def review_statuses(self, ctx, channel: Channel, product_ids: set[int], max_pages: int = 20) -> dict[int, dict]:
+        """{dkp id: {code, label, state, variants_count}} for the given products, from the seller's products list."""
+        token = self._token(channel)
+        labels: dict[str, str] = {}
+        try:
+            groups = (await self._request("GET", "/api/v2/products/filters/seller", token=token,
+                                          referer=f"{BASE_URL}/pwa/product-management")).get("data") or []
+            for group in groups if isinstance(groups, list) else []:
+                for field in group if isinstance(group, list) else [group]:
+                    if isinstance(field, dict) and field.get("name") == "moderation_status" and isinstance(field.get("data"), dict):
+                        labels = {str(k): str(v) for k, v in field["data"].items()}
+        except PlatformError as exc:
+            if exc.code == "expired":
+                raise
+        out: dict[int, dict] = {}
+        page = 1
+        while page <= max_pages and len(out) < len(product_ids):
+            async with ctx.step(f"review_{page}", f"خواندن وضعیت محصولات، صفحهٔ {page}") as st:
+                data = (await self._request("GET", f"/api/v2/products/seller?page={page}&size=50&order=desc&categoryId=",
+                                            token=token, referer=f"{BASE_URL}/pwa/product-management")).get("data") or {}
+                st.response = {"count": len(data.get("items") or [])}
+            for row in data.get("items") or []:
+                pid = row.get("product_id")
+                if pid not in product_ids:
+                    continue
+                mod = row.get("moderation_status") if isinstance(row.get("moderation_status"), dict) else {}
+                code = row.get("status_data") or mod.get("status") or mod.get("title") or ""
+                code = code if isinstance(code, str) else ""
+                state = review_state(code)
+                if state == "approved" and int(row.get("variants_count") or 0) > 0:
+                    state = "live"
+                out[pid] = {"code": code, "label": labels.get(code) or REVIEW_FA.get(state, code), "state": state,
+                            "variants_count": int(row.get("variants_count") or 0)}
+            pager = data.get("pager") or {}
+            if not data.get("items") or page >= int(pager.get("total_pages") or 1):
+                break
+            page += 1
+        return out
+
+    async def create_variant(self, ctx, channel: Channel, product_id: int, product: Product) -> dict[str, Any]:
+        """Price + stock for an approved product: the panel's variant (تنوع) wizard. Price in rial, Digikala's unit."""
+        token = self._token(channel)
+        ref = f"{BASE_URL}/pwa/variant/create?productId={product_id}"
+        if not product.price:
+            raise PlatformError("قیمت محصول ثبت نشده؛ برای فروش در دیجی‌کالا قیمت لازم است.", "no_price", EDIT_PRODUCT)
+        async with ctx.step("variant_form", "دریافت فرم تنوع دیجی‌کالا", request={"product_id": product_id}) as s:
+            form = (await self._request("GET", f"/api/v2/variant-creation/v2/{product_id}", token=token, referer=ref)).get("data") or {}
+            s.response = {k: (v if not isinstance(v, (list, dict)) else f"{len(v)} items") for k, v in form.items()} if isinstance(form, dict) else {}
+        body = variant_body(form, product, product_id)
+        async with ctx.step("variant", "ثبت قیمت و موجودی در دیجی‌کالا", request=body) as s:
+            res = (await self._request("POST", "/api/v2/variant-creation/variants/", token=token, body=body, referer=ref)).get("data") or {}
+            s.response = res
+        vid = _first(res if isinstance(res, dict) else {}, "variant_id", "id", "variant.id", "variants.0.id")
+        return {"variant_id": vid, "price_toman": product.price, "stock": product.stock_qty}
+
+    async def fetch_orders(self, ctx, channel: Channel, pages: int = 3) -> list[dict[str, Any]]:
+        """Newest orders of the seller (Digikala-warehouse and ship-by-seller), normalised; endpoints that this account
+        can't use are skipped."""
+        token = self._token(channel)
+        out: dict[str, dict] = {}
+        errors = []
+        for path in ORDER_PATHS:
+            for page in range(1, pages + 1):
+                sep = "&" if "?" in path else "?"
+                try:
+                    async with ctx.step(f"orders{path.replace('/', '_')}_{page}", f"دریافت سفارش‌ها، صفحهٔ {page}",
+                                        request={"path": path, "page": page}) as st:
+                        payload = await self._request("GET", f"{path}{sep}page={page}&size=50", token=token,
+                                                      referer=f"{BASE_URL}/pwa/orders")
+                        data = payload.get("data")
+                        st.response = {"keys": list(data)[:20] if isinstance(data, dict) else type(data).__name__}
+                except PlatformError as exc:
+                    if exc.code == "expired":
+                        raise
+                    errors.append(f"{path}: {exc.message_fa}")
+                    break
+                rows = _rows(data)
+                for row in rows:
+                    o = normalize_order(row)
+                    if o:
+                        o["kind"] = "ship_by_seller" if "ship-by-seller" in path else "digikala"
+                        out.setdefault(o["id"], o)
+                pager = (data or {}).get("pager") if isinstance(data, dict) else None
+                if not rows or page >= int((pager or {}).get("total_pages") or 1):
+                    break
+        if not out and len(errors) == len(ORDER_PATHS):
+            raise PlatformError("سفارش‌های دیجی‌کالا خوانده نشد.", "orders_failed", detail=errors)
+        return list(out.values())
+
     async def fetch_items(self, ctx, channel: Channel, limit: int = 200) -> list[CrawledItem]:
+        await self.ensure_enabled(ctx.db)
         token = self._token(channel)
         items: list[CrawledItem] = []
         page = 1

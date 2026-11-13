@@ -20,7 +20,7 @@ from app.services.text import to_en_digits
 from app.services.features import FEATURES, MODES, allowed, feature_access, save_feature_access
 from app.services.integrations import (
     INSTAGRAM_SCOPES, instagram_app, instagram_crawler, linkedin_app, payment_config, save_instagram_app,
-    save_instagram_crawler, save_linkedin_app, save_payment_config,
+    save_instagram_crawler, save_linkedin_app, save_payment_config, digikala_app, save_digikala_app,
 )
 from app.services.plans import (
     DURATIONS, FLAG_KEYS, LIMIT_KEYS, all_tiers, chat_used, create_subscription, credits_used, free_limits, limits_for, plan_status,
@@ -446,6 +446,26 @@ async def put_linkedin(body: LinkedInAppIn, admin: AdminUser, db: DB):
     audit(db, admin, "update_integration", "linkedin", None, {"enabled": body.enabled, **pacing})
     await db.commit()
     return await get_linkedin(admin, db)
+
+
+class DigikalaAppIn(BaseModel):
+    enabled: bool = True
+    sync_minutes: int = Field(15, ge=5, le=720)
+
+
+@router.get("/integrations/digikala")
+async def get_digikala(admin: AdminUser, db: DB):
+    connected = int(await db.scalar(select(func.count()).select_from(Channel).where(
+        Channel.platform == "digikala", Channel.status == "connected")) or 0)
+    return {**await digikala_app(db), "connected_channels": connected}
+
+
+@router.put("/integrations/digikala")
+async def put_digikala(body: DigikalaAppIn, admin: AdminUser, db: DB):
+    await save_digikala_app(db, enabled=body.enabled, sync_minutes=body.sync_minutes)
+    audit(db, admin, "update_integration", "digikala", None, {"enabled": body.enabled, "sync_minutes": body.sync_minutes})
+    await db.commit()
+    return await get_digikala(admin, db)
 
 
 class InstagramCrawlerIn(BaseModel):
