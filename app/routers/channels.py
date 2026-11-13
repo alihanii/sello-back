@@ -1,3 +1,4 @@
+import logging
 from datetime import timedelta
 from typing import Any
 
@@ -132,6 +133,12 @@ async def digikala_send_code(store_id: int, body: ConnectIn, user: CurrentUser, 
         fail_operation(op, exc)
         await db.commit()
         raise HTTPException(400, {"message": exc.message_fa, "operation_id": op.id})
+    except Exception as exc:  # noqa: BLE001 - the seller sees a message, the step log keeps the error
+        logging.getLogger(__name__).exception("digikala send-code failed")
+        fail_operation(op, exc)
+        await db.commit()
+        raise HTTPException(400, {"message": "ارسال کد دیجی‌کالا با خطای داخلی روبه‌رو شد؛ جزئیات در «فعالیت‌ها» ثبت شد.",
+                                  "operation_id": op.id})
     ch.config = {**ch.config, "pending": pending}
     op.status = "succeeded"
     await db.commit()

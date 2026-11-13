@@ -284,20 +284,30 @@ class DigikalaAdapter:
         if token:
             headers["Authorization"] = f"Bearer {token}"
         try:
-            async with httpx.AsyncClient(timeout=60, follow_redirects=True, headers=headers) as client:
+            # Shorter than nginx's 60 s, so a slow or silent Digikala answers the seller with a clear message.
+            async with httpx.AsyncClient(timeout=httpx.Timeout(25, connect=10), follow_redirects=True,
+                                         headers=headers) as client:
                 if files:
                     resp = await client.request(method, f"{BASE_URL}{path}", files=files, data=data)
                 else:
                     resp = await client.request(method, f"{BASE_URL}{path}", json=body)
+        except httpx.TimeoutException as exc:
+            raise PlatformError("پنل فروشندگان دیجی‌کالا جواب نداد (زمان انتظار تمام شد)؛ احتمالاً دیجی‌کالا IP سرور را "
+                                "مسدود کرده یا کند است. چند دقیقه بعد دوباره امتحان کن.", "timeout",
+                                detail=f"{type(exc).__name__}: {exc}") from exc
         except httpx.HTTPError as exc:
-            raise PlatformError("ارتباط با پنل فروشندگان دیجی‌کالا برقرار نشد.", "network", detail=str(exc)) from exc
+            raise PlatformError("ارتباط با پنل فروشندگان دیجی‌کالا برقرار نشد.", "network",
+                                detail=f"{type(exc).__name__}: {exc}") from exc
         if resp.status_code == 401:
             raise PlatformError("نشست دیجی‌کالا منقضی شده؛ دوباره با کد تأیید وارد شوید.", "expired", RECONNECT,
                                 resp.text[:500])
         if resp.status_code >= 400:
             msg = self._extract_message(resp)
-            raise PlatformError(f"دیجی‌کالا خطا داد: {msg}" if msg else "دیجی‌کالا درخواست را رد کرد.",
-                                f"http_{resp.status_code}", detail=resp.text[:1000])
+            blocked = resp.status_code in (403, 429) and "json" not in resp.headers.get("content-type", "")
+            text = (f"دیجی‌کالا خطا داد: {msg}" if msg else
+                    f"دیجی‌کالا درخواست سرور را مسدود کرد (کد {resp.status_code})؛ احتمالاً به‌خاطر IP سرور یا کپچا." if blocked else
+                    f"دیجی‌کالا درخواست را رد کرد (کد {resp.status_code}).")
+            raise PlatformError(text, f"http_{resp.status_code}", detail=resp.text[:1000])
         try:
             return resp.json()
         except ValueError:
