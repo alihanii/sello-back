@@ -1,0 +1,25 @@
+# Temporary: run scripts/dk_probe.py inside the server's backend container (Digikala opens only from Iran).
+# Read-only: no login, no SMS, nothing changes on the server.
+name: dk-probe
+on:
+  push:
+    branches: [claude/project-thread-ti9acq]
+    paths: [scripts/dk_probe.py, .github/workflows/dk-probe.yml]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe from the server
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" -o ConnectTimeout=30 "$SSH_USER@$SSH_HOST" \
+            "cd /opt/sello && timeout 600 docker compose exec -T backend python -" < scripts/dk_probe.py
