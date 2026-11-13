@@ -37,9 +37,9 @@ def _wait(message: str, seconds: int, status: int = 429) -> HTTPException:
     return HTTPException(status, {"message": message, "retry_after": max(1, int(seconds))})
 
 
-def _lock_message(seconds: float) -> str:
-    return f"به‌خاطر چند بار وارد کردن کد اشتباه، ورود با کد پیامکی تا {max(1, round(seconds / 60))} دقیقهٔ دیگر بسته است."
-
+def _lock_message(_seconds: float = 0) -> str:
+    # The wait itself travels as `retry_after` (seconds); the page counts it down next to this text.
+    return "به‌خاطر چند بار وارد کردن کد اشتباه، ورود با کد پیامکی موقتاً بسته است."
 
 def normalize_phone(phone: str) -> str:
     d = re.sub(r"\D", "", to_en_digits(phone))
@@ -257,7 +257,7 @@ async def verify_otp(body: VerifyIn, request: Request, response: Response, db: D
         raise _wait(_lock_message(left), left)
     if throttle and throttle.next_try_at and aware(throttle.next_try_at) > now:
         left = (aware(throttle.next_try_at) - now).total_seconds()
-        raise _wait(f"کد را اشتباه وارد کردی؛ {int(left) + 1} ثانیهٔ دیگر دوباره امتحان کن.", left)
+        raise _wait("کد وارد شده اشتباه است.", left)
     otp = (await db.execute(select(OtpCode).where(OtpCode.phone == phone, ~OtpCode.used)
                             .order_by(OtpCode.id.desc()).limit(1))).scalar_one_or_none()
     if not otp or aware(otp.expires_at) < utcnow():
@@ -302,8 +302,8 @@ async def password_login(body: PasswordLoginIn, request: Request, response: Resp
     user = await db.scalar(select(User).where(User.phone == phone))
     now = utcnow()
     if user and user.locked_until and aware(user.locked_until) > now:
-        minutes = max(1, int((aware(user.locked_until) - now).total_seconds() // 60) + 1)
-        raise HTTPException(429, f"به‌خاطر تلاش‌های ناموفق، ورود با رمز تا {minutes} دقیقه بسته است؛ با کد پیامکی وارد شوید.")
+        raise _wait("به‌خاطر چند بار رمز اشتباه، ورود با رمز موقتاً بسته است؛ با کد پیامکی وارد شو.",
+                    (aware(user.locked_until) - now).total_seconds())
     if not verify_password(body.password, user.password_hash if user else None):
         if user and user.password_hash:
             user.failed_logins = (user.failed_logins or 0) + 1
