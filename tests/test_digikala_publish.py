@@ -48,7 +48,11 @@ async def test_digikala_publish_runs_whole_wizard(tmp_path, monkeypatch):
                 "2": {"id": 2, "title": "وزن", "type": "number", "required": False}}}}}}
         if path.endswith("/temp_images"):
             assert files["file"][1][:2] == b"\xff\xd8"  # re-encoded to JPEG
-            return {"data": {"id": 55}}
+            img = Image.open(io.BytesIO(files["file"][1]))
+            assert img.size == (1200, 1200) and img.getpixel((2, 2)) == (255, 255, 255)  # square, white, Digikala size
+            return {"status": "ok", "data": {}}  # an answer without the id: the draft's own list is read instead
+        if "/temp_images/draft_product/" in path:
+            return {"data": {"items": [{"id": 55, "url": "https://x/55.jpg", "is_main": False}]}}
         if path.endswith("/save") and "auto-title" not in path:
             return {"data": {"product_id": 123456}}
         return {"data": {}}
@@ -71,3 +75,28 @@ async def test_digikala_publish_runs_whole_wizard(tmp_path, monkeypatch):
     draft = next(b for m, p, b, f in calls if p.endswith("/detail/validation"))
     assert draft["brand_id"] == 719 and draft["division_id"] == 5 and draft["general_mefa_id"] == 9
     assert ctx.steps[-3:] == ["images", "save", "submit"]
+    assert ("PATCH", "/api/v2/product-creation/temp_images/55/main", None, None) in calls
+
+
+async def test_main_image_made_once_with_the_smart_product_pipeline(monkeypatch):
+    made = []
+
+    async def fake_make_photo(ctx, **kw):
+        made.append(kw)
+        return "/media/1/clean.png"
+
+    async def yes(task="x"):
+        return True
+
+    import app.services.product_images as pi
+    monkeypatch.setattr(pi, "make_photo", fake_make_photo)
+    monkeypatch.setattr(dk.ai, "ai_available", yes)
+    product = SimpleNamespace(title="هودی", description="هودی مشکی", store_id=1, source_ref={},
+                              images=[SimpleNamespace(url="/media/1/raw.jpg", origin_url="")])
+    ctx = Ctx()
+    assert await dk.digikala._main_image(ctx, product, "") == "/media/1/clean.png"
+    assert await dk.digikala._main_image(ctx, product, "") == "/media/1/clean.png"  # reused on a retry
+    assert len(made) == 1 and made[0]["image_url"] == "/media/1/raw.jpg"
+    product.images[0].origin_url = "/media/1/orig.jpg"  # already cleaned by smart product creation
+    product.source_ref = {}
+    assert await dk.digikala._main_image(ctx, product, "") == ""
