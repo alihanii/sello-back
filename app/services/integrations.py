@@ -115,3 +115,25 @@ async def save_linkedin_app(db: AsyncSession, *, enabled: bool, pacing: dict[str
     row.value = {"enabled": enabled, **{k: int(pacing.get(k) or old.get(k) or v) for k, v in LI_PACING.items()},
                  "query_ids": {k: v.strip() for k, v in (query_ids if query_ids is not None else old.get("query_ids") or {}).items()
                                if v and v.strip()}}
+
+
+DIGIKALA = "digikala"
+# Orders are read from the seller panel on a timer (Digikala has no webhooks for sellers).
+DK_SYNC_MINUTES = 15
+
+
+async def digikala_app(db: AsyncSession) -> dict[str, Any]:
+    """{enabled, sync_minutes}. Off: sellers can't connect, publish or sync orders; connected channels stay as they are."""
+    row = await db.get(AppSetting, DIGIKALA)
+    value = row.value if row else {}
+    return {"enabled": bool(value.get("enabled", True)),
+            "sync_minutes": max(5, int(value.get("sync_minutes") or DK_SYNC_MINUTES))}
+
+
+async def save_digikala_app(db: AsyncSession, *, enabled: bool, sync_minutes: int | None = None) -> None:
+    row = await db.get(AppSetting, DIGIKALA)
+    if not row:
+        row = AppSetting(key=DIGIKALA, value={})
+        db.add(row)
+    old = row.value or {}
+    row.value = {**old, "enabled": enabled, "sync_minutes": int(sync_minutes or old.get("sync_minutes") or DK_SYNC_MINUTES)}

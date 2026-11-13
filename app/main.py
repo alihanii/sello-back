@@ -19,6 +19,7 @@ from app.seed import seed
 from app.services.chat_runtime import poller_loop
 from app.services.ig_chat import poller_loop as ig_poller_loop
 from app.services.li_chat import poller_loop as li_poller_loop
+from app.services.dk_sync import poller_loop as dk_poller_loop
 from app.services.media import public_url, use_s3
 from app.services.proxy_pool import pool, pool_loop
 from app.services.worker import worker_loop
@@ -38,9 +39,11 @@ async def lifespan(_: FastAPI):
     # Instagram has no webhooks for app-API accounts: their DMs and comments are read on a slow timer.
     ig_inbox = asyncio.create_task(ig_poller_loop(stop)) if settings.worker_enabled else None
     li_inbox = asyncio.create_task(li_poller_loop(stop)) if settings.worker_enabled else None  # LinkedIn: same, slower
+    # Digikala: review state, price + stock after approval, and orders, on the admin's interval.
+    dk_sync = asyncio.create_task(dk_poller_loop(stop)) if settings.worker_enabled else None
     yield
     stop.set()
-    for t in (task, chat, proxies, ig_inbox, li_inbox):
+    for t in (task, chat, proxies, ig_inbox, li_inbox, dk_sync):
         if t:
             await t
     await pool.shutdown()

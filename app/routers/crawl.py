@@ -35,6 +35,9 @@ def _out(s: CrawlSource) -> dict:
             "include_reels": bool((s.options or {}).get("include_reels"))}
 
 
+# Digikala's panel only lists the seller's own products (title, brand, one picture: no price or description), so it
+# isn't a useful crawl source; products go the other way (Sello -> Digikala) and orders come back on their own.
+DK_NO_CRAWL = "کرال از دیجی‌کالا پشتیبانی نمی‌شود؛ محصول‌ها از سلو به دیجی‌کالا منتشر می‌شوند و سفارش‌های دیجی‌کالا خودکار به صفحهٔ سفارش‌ها می‌آیند."
 IG_LOCKED = "کرال اینستاگرام هنوز فعال نشده است؛ ادمین سایت باید آن را در پنل ادمین فعال کند."
 
 
@@ -64,10 +67,14 @@ async def create_source(store_id: int, body: SourceIn, user: CurrentUser, db: DB
         raise HTTPException(422, "زمان‌بندی نامعتبر است.")
     if body.extraction_mode not in MODES:
         raise HTTPException(422, "روش استخراج نامعتبر است.")
-    if body.type in ("channel_posts", "marketplace_listing"):
+    if body.type == "marketplace_listing":
+        raise HTTPException(422, DK_NO_CRAWL)
+    if body.type == "channel_posts":
         ch = await db.get(Channel, body.channel_id or 0)
         if not ch or ch.store_id != store_id:
             raise HTTPException(422, "کانال منبع را انتخاب کنید.")
+        if ch.platform == "digikala":
+            raise HTTPException(422, DK_NO_CRAWL)
         if body.type == "channel_posts" and ch.platform == "instagram":
             raise HTTPException(422, "برای کرال اینستاگرام، منبع «پیج اینستاگرام» را با آیدی پیج بساز.")
         name = body.name or f"{ch.display_name or ch.platform}"
@@ -148,6 +155,8 @@ async def run_now(source_id: int, user: CurrentUser, db: DB):
     await get_store_for(db, user, s.store_id)
     if s.type == "instagram_profile" and not await _instagram_ready(db):
         raise HTTPException(422, IG_LOCKED)
+    if s.type == "marketplace_listing":
+        raise HTTPException(422, DK_NO_CRAWL)
     op = await enqueue(db, store_id=s.store_id, type="crawl", ref_type="crawl_source", ref_id=s.id,
                        channel_id=s.channel_id, title_fa=f"کرال «{s.name}»")
     await db.commit()

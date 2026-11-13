@@ -147,6 +147,9 @@ async def run_publish(ctx: OpContext) -> None:
         listing.published_at = listing.published_at or utcnow()
         listing.last_synced_at = utcnow()
         listing.last_error_fa = ""
+        if channel.platform == "digikala":  # Digikala reviews it first; the sync follows it to «live»
+            listing.remote_status, listing.remote_status_fa = "in_review", "در انتظار تأیید دیجی‌کالا"
+            listing.remote_meta = {k: v for k, v in (getattr(result, "extra", None) or {}).items() if k != "note"}
     op.result = {"remote_id": result.remote_id, "remote_url": result.remote_url, "format": fmt}
     await record_event(db, op.store_id, "publish_ok", operation_id=op.id, channel_id=channel.id)
 

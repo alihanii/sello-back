@@ -30,9 +30,10 @@ router = APIRouter(tags=["orders"])
 
 STATUSES = ("awaiting_payment", "payment_submitted", "confirmed", "rejected", "cancelled")
 PLATFORMS = ("instagram", "telegram", "bale", "whatsapp", "rubika", "eitaa", "divar", "phone", "in_person", "site", "link", "other")
-SOURCE_EVENT = {"invoice": "sale_invoice_toman", "chat": "sale_chat_toman", "site": "sale_site_toman"}
+SOURCE_EVENT = {"invoice": "sale_invoice_toman", "chat": "sale_chat_toman", "site": "sale_site_toman",
+                "digikala": "sale_digikala_toman"}
 # Sources stored as Invoices: the seller's invoice links, chat orders logged by hand, and orders from the store's website.
-INVOICE_SOURCES = ("invoice", "chat", "site")
+INVOICE_SOURCES = ("invoice", "chat", "site", "digikala")  # digikala: read from the seller panel (dk_sync)
 
 # ---------- settings ----------
 
@@ -184,7 +185,8 @@ def invoice_out(inv: Invoice) -> dict[str, Any]:
             "expired": _expired(inv), "receipt_url": inv.receipt_url, "payment_ref": inv.payment_ref,
             "payer_note": inv.payer_note, "expires_at": inv.expires_at, "viewed_at": inv.viewed_at,
             "submitted_at": inv.submitted_at, "paid_at": inv.paid_at, "created_at": inv.created_at,
-            "updated_at": inv.updated_at}
+            "updated_at": inv.updated_at, "external_id": inv.external_id or "",
+            "external_status": inv.external_status or "", "external_status_fa": inv.external_status_fa or ""}
 
 
 async def _priced(db, store_id: int, lines: list[LineIn]) -> list[dict[str, Any]]:
@@ -327,6 +329,8 @@ async def update_invoice(invoice_id: int, body: InvoicePatch, user: CurrentUser,
             inv.shipping_toman = body.shipping_toman
         _totals(inv)
     if body.status and body.status != inv.status:
+        if inv.source == "digikala":
+            raise HTTPException(409, "وضعیت سفارش دیجی‌کالا از خود دیجی‌کالا می‌آید؛ آن را در پنل فروشندگان دیجی‌کالا تغییر بده.")
         if body.status not in STATUSES:
             raise HTTPException(422, "وضعیت نامعتبر است.")
         if inv.status == "confirmed":
@@ -438,7 +442,7 @@ def _ai_item(o: AiOrder) -> dict[str, Any]:
 
 def _inv_item(i: Invoice) -> dict[str, Any]:
     d = invoice_out(i)
-    return {**d, "key": f"inv-{i.id}", "kind": i.source, "ref": "", "conversation_id": None, "customer_username": "",
+    return {**d, "key": f"inv-{i.id}", "kind": i.source, "ref": i.payment_ref if i.source == "digikala" else "", "conversation_id": None, "customer_username": "",
             "extras": {}, "receipt_text": i.payer_note, "is_test": False, "tracking_code": "",
             "due_toman": i.total_toman if i.status in ("awaiting_payment", "payment_submitted") else 0}
 
@@ -485,6 +489,7 @@ async def unified_orders(store_id: int, user: CurrentUser, db: DB, source: str =
             st = st.where(Invoice.submitted_at >= lo, Invoice.submitted_at < lo + timedelta(days=1))
         if q:
             st = st.where(or_(Invoice.customer_name.ilike(f"%{q}%"), Invoice.customer_phone.ilike(f"%{num}%"),
+                              Invoice.external_id == num, Invoice.payment_ref.ilike(f"%{q}%") & (Invoice.source == "digikala"),
                               *([Invoice.number == int(num)] if num.isdigit() else [])))
         sub = st.subquery()
         for src, n in (await db.execute(select(sub.c.source, func.count()).group_by(sub.c.source))).all():
@@ -510,7 +515,7 @@ async def unified_orders(store_id: int, user: CurrentUser, db: DB, source: str =
 
 # ---------- money: income by source, per day ----------
 
-SOURCES = ("ai", "chat", "invoice", "site")
+SOURCES = ("ai", "chat", "invoice", "site", "digikala")
 
 
 async def finance_series(db, store_id: int, start: date, end: date) -> dict[str, dict[str, int]]:
@@ -524,9 +529,10 @@ async def finance_series(db, store_id: int, start: date, end: date) -> dict[str,
             .group_by(ActivityEvent.day, ActivityEvent.type))).all():
         row = days.setdefault(d.isoformat(), dict(blank))
         row[{"sale_toman": "all", "sale_invoice_toman": "invoice", "sale_chat_toman": "chat",
-             "sale_site_toman": "site"}[typ] + "_toman"] = int(n)
+             "sale_site_toman": "site", "sale_digikala_toman": "digikala"}[typ] + "_toman"] = int(n)
     for row in days.values():  # the assistant's share is the rest of the day's income
-        row["ai_toman"] = max(0, row.pop("all_toman", 0) - row["invoice_toman"] - row["chat_toman"] - row["site_toman"])
+        row["ai_toman"] = max(0, row.pop("all_toman", 0) - row["invoice_toman"] - row["chat_toman"] - row["site_toman"]
+                              - row["digikala_toman"])
     lo = datetime.combine(start, time.min, tzinfo=timezone.utc)
     hi = datetime.combine(end + timedelta(days=1), time.min, tzinfo=timezone.utc)
     oday = func.date(AiOrder.created_at)

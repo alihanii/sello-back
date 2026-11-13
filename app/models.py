@@ -176,6 +176,11 @@ class ChannelListing(TimestampMixin, Base):
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error_fa: Mapped[str] = mapped_column(Text, default="")
+    # The marketplace's own review state (Digikala): in_review | needs_edit | rejected | approved | live, its Persian
+    # label as the marketplace shows it, and what we did after approval (variant id, price, stock). Nullable: older DBs.
+    remote_status: Mapped[str | None] = mapped_column(String(20), default="", nullable=True)
+    remote_status_fa: Mapped[str | None] = mapped_column(String(120), default="", nullable=True)
+    remote_meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict, nullable=True)
 
     product: Mapped[Product] = relationship(back_populates="listings")
     channel: Mapped[Channel] = relationship()
@@ -689,7 +694,7 @@ class Invoice(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), index=True)
     number: Mapped[int] = mapped_column(Integer, default=0)  # per store, shown as «فاکتور ۱۰۲۴»
-    source: Mapped[str] = mapped_column(String(10), default="invoice", index=True)  # invoice | chat
+    source: Mapped[str] = mapped_column(String(10), default="invoice", index=True)  # invoice | chat | site | digikala
     code: Mapped[str] = mapped_column(String(24), unique=True, index=True)  # the public link: /i/<code>
     platform: Mapped[str] = mapped_column(String(20), default="")  # where the customer is: instagram, telegram, ...
     customer_name: Mapped[str] = mapped_column(String(160), default="")
@@ -713,6 +718,12 @@ class Invoice(TimestampMixin, Base):
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     stock_taken: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Orders read from a marketplace (`source="digikala"`): its order id, the channel, and its own status as it shows
+    # it ("ارسال شده"). Nullable so older databases get the columns added.
+    external_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    channel_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    external_status: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    external_status_fa: Mapped[str | None] = mapped_column(String(120), nullable=True)
 
 
 # ---------- the store's own website (storefront) ----------

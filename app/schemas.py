@@ -65,6 +65,8 @@ class ListingOut(ORM):
     published_at: datetime | None
     last_error_fa: str
     updated_at: datetime
+    remote_status: str | None = ""  # Digikala review: in_review | needs_edit | rejected | approved | live
+    remote_status_fa: str | None = ""
 
     @field_validator("format", mode="before")
     @classmethod
