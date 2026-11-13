@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM python:3.13-slim
+FROM python:3.13-slim AS deps
 WORKDIR /app
 
 # Xray core for the smart proxies (admin panel › proxies): v2ray links run through it as local SOCKS ports.
@@ -21,6 +21,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -r
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app ./app
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+# Everything above is the "deps" image (~300 MB): the deploy ships it to the server only when this file or
+# requirements.txt changes. A usual deploy ships only app/ (a few hundred KB) and lays it on top there.
+FROM deps
+COPY app ./app

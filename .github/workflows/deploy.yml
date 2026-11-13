@@ -1,5 +1,7 @@
 # test + build: on every pull request and push to main (a failure stops here).
-# deploy: on push to main only, copy the built image to the server over SSH and restart.
+# deploy: on push to main only. The dependencies image (~300 MB) goes to the server only when Dockerfile or
+# requirements.txt change; a usual deploy sends only app/ (a few hundred KB), laid on top of it there.
+# Every transfer has a timeout and is retried, so a stalled link can't hang the deploy.
 # The server doesn't build anything or pull from a registry, so it works on servers with limited internet.
 #
 # Repository secrets: SSH_HOST, SSH_USER, SSH_PRIVATE_KEY, optional SSH_PORT (default 22).
@@ -37,32 +39,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Build image
+      - name: Build image  # the whole image builds (deps + app), as the server will run it
         run: docker build -t sello-back:latest .
-
-      - name: Save image
-        if: github.event_name != 'pull_request'
-        run: docker save sello-back:latest | gzip -1 > sello-back.tar.gz
-
-      - uses: actions/upload-artifact@v4
-        if: github.event_name != 'pull_request'
-        with:
-          name: sello-back-image
-          path: sello-back.tar.gz
-          retention-days: 3
-          compression-level: 0
 
   deploy:
     needs: build
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: sello-back-image
 
       - name: SSH setup
         env:
@@ -74,9 +60,21 @@ jobs:
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
           ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
-          printf 'Host server\n  HostName %s\n  User %s\n  Port %s\n  IdentityFile ~/.ssh/id_deploy\n  ServerAliveInterval 30\n' \
+          # A link that stops moving is dropped after ~90 s (and retried below) instead of hanging for half an hour.
+          printf 'Host server\n  HostName %s\n  User %s\n  Port %s\n  IdentityFile ~/.ssh/id_deploy\n  ServerAliveInterval 15\n  ServerAliveCountMax 6\n  ConnectTimeout 30\n' \
             "$SSH_HOST" "$SSH_USER" "$SSH_PORT" > ~/.ssh/config
           ssh server "mkdir -p '$DEPLOY_PATH' && docker version --format 'docker {{.Server.Version}}'"
+          # retry N TIMEOUT CMD…: a transfer that dies or stalls is tried again, up to N times.
+          cat > ~/retry <<'SH'
+          #!/usr/bin/env bash
+          n=$1 t=$2; shift 2
+          for i in $(seq 1 "$n"); do
+            timeout "$t" "$@" && exit 0
+            echo "::warning::attempt $i of $n failed: $*"; sleep $((i * 5))
+          done
+          exit 1
+          SH
+          chmod +x ~/retry
 
       - name: Ship base images the server doesn't have yet
         run: |
@@ -84,19 +82,41 @@ jobs:
           if [ -n "$missing" ]; then
             echo "Shipping: $missing"
             for i in $missing; do docker pull "$i"; done
-            docker save $missing | gzip -1 | ssh server "gunzip | docker load"
+            docker save $missing | gzip -1 > base.tar.gz
+            ~/retry 3 1200 bash -c "ssh server 'gunzip | docker load' < base.tar.gz"
+          fi
+
+      - name: Ship the dependencies image (only when Dockerfile or requirements.txt changed)
+        run: |
+          DEPS="sello-back-deps:$(cat Dockerfile requirements.txt | sha256sum | cut -c1-12)"
+          echo "DEPS=$DEPS" >> "$GITHUB_ENV"
+          if ssh server "docker image inspect $DEPS >/dev/null 2>&1"; then
+            echo "The server already has $DEPS: nothing big to ship."
+          else
+            docker build --target deps -t "$DEPS" .
+            docker save "$DEPS" | gzip -1 > deps.tar.gz
+            ls -lh deps.tar.gz
+            ~/retry 3 1500 bash -c "ssh server 'gunzip | docker load' < deps.tar.gz"
           fi
 
       - name: Copy files and restart
         run: |
-          scp deploy/docker-compose.yml deploy/nginx-sello.conf deploy/nginx-store.conf deploy/env.example sello-back.tar.gz "server:$DEPLOY_PATH/"
-          ssh server "set -e; cd '$DEPLOY_PATH'
+          tar czf app.tar.gz --exclude=__pycache__ app
+          ls -lh app.tar.gz
+          ~/retry 4 300 scp deploy/docker-compose.yml deploy/nginx-sello.conf deploy/nginx-store.conf deploy/env.example app.tar.gz "server:$DEPLOY_PATH/"
+          timeout 600 ssh server "set -e; cd '$DEPLOY_PATH'
             test -f .env || { echo '::error::$DEPLOY_PATH/.env is missing: copy env.example to .env and fill it in'; exit 1; }
-            gunzip -c sello-back.tar.gz | docker load && rm sello-back.tar.gz
+            # The app on top of the dependencies image, on the server itself: no build, no internet needed.
+            rm -rf app-src && mkdir app-src && tar xzf app.tar.gz -C app-src && rm app.tar.gz
+            cid=\$(docker create $DEPS)
+            docker cp app-src/app \$cid:/app/app
+            docker commit \$cid sello-back:latest >/dev/null && docker rm \$cid >/dev/null && rm -rf app-src
             svcs='db backend'
             docker image inspect sello-front:latest >/dev/null 2>&1 && svcs=\"\$svcs frontend\" || echo 'sello-front not deployed yet: run its deploy workflow'
             docker image inspect sello-store:latest >/dev/null 2>&1 && svcs=\"\$svcs store\" || echo 'sello-public-store not deployed yet: run its deploy workflow'
             docker compose up -d --remove-orphans \$svcs
+            # Older dependency images are dropped once the new one runs; the current one stays for the next deploy.
+            docker images --format '{{.Repository}}:{{.Tag}}' sello-back-deps | grep -vx '$DEPS' | xargs -r docker rmi >/dev/null 2>&1 || true
             docker image prune -f >/dev/null || true  # the other repo's deploy may be pruning at the same time
             for i in \$(seq 1 30); do docker compose exec -T backend python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/api/health')\" 2>/dev/null && { echo backend healthy; exit 0; }; sleep 2; done
             docker compose logs --tail 80 backend; exit 1"
