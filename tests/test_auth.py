@@ -291,3 +291,30 @@ async def test_a_right_code_clears_the_misses(fresh):
     async with SessionLocal() as db:
         t = await db.get(OtpThrottle, phone)
         assert t.fails == 0 and t.next_try_at is None
+
+
+async def test_admin_can_add_an_admin_by_phone_and_the_cli_does_too(client, capsys):
+    from tests.conftest import login
+    from app import cli
+
+    admin = await login(client, "09120000000")
+    r = await client.post("/admin/users/admin", headers=admin, json={"phone": "۰۹۱۳۰۰۰۰۰۳۰"})
+    assert r.status_code == 200 and r.json()["created"] is True and r.json()["user"]["role"] == "admin"
+    # A seller's number is promoted; a block is lifted.
+    seller = await login(client, "09130000031")
+    me = (await client.get("/auth/me", headers=seller)).json()
+    assert me["role"] == "seller"
+    r = await client.post("/admin/users/admin", headers=admin, json={"phone": "09130000031"})
+    assert r.json()["created"] is False
+    assert (await client.get("/auth/me", headers=seller)).json()["role"] == "admin"
+    assert (await client.post("/admin/users/admin", headers=seller, json={"phone": "0913"})).status_code == 422
+    # Sellers can't.
+    other = await login(client, "09130000032")
+    assert (await client.post("/admin/users/admin", headers=other, json={"phone": "09130000033"})).status_code == 403
+    # The command line.
+    assert await cli._admin("09130000034") == 0
+    assert "admin account created" in capsys.readouterr().out
+    assert await cli._admin("09130000034") == 0
+    assert "existing account is now an admin" in capsys.readouterr().out
+    assert await cli._admin("123") == 2
+    assert cli.main([]) == 2
