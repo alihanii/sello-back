@@ -83,6 +83,22 @@ async def users(admin: AdminUser, db: DB, q: str = ""):
     return out
 
 
+class AdminPhoneIn(BaseModel):
+    phone: str
+
+
+@router.post("/users/admin")
+async def add_admin(body: AdminPhoneIn, admin: AdminUser, db: DB):
+    """Creates an admin account for a phone number, or makes an existing account an admin."""
+    from app.routers.auth import normalize_phone
+    from app.services.accounts import make_admin
+
+    user, created = await make_admin(db, normalize_phone(body.phone))
+    audit(db, admin, "make_admin", "user", user.id, {"phone": user.phone, "created": created})
+    await db.commit()
+    return {"ok": True, "created": created, "user": UserOut.model_validate(user)}
+
+
 @router.get("/users/{user_id}")
 async def user_detail(user_id: int, admin: AdminUser, db: DB):
     u = await db.get(User, user_id)
