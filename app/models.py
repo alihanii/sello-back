@@ -40,6 +40,17 @@ class OtpCode(TimestampMixin, Base):
     used: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class OtpThrottle(TimestampMixin, Base):
+    """Wrong SMS codes per phone, across codes (asking for a new code doesn't reset it): a pause after each miss,
+    a long lock after several in a row."""
+
+    __tablename__ = "otp_throttles"
+    phone: Mapped[str] = mapped_column(String(20), primary_key=True)
+    fails: Mapped[int | None] = mapped_column(Integer, default=0)
+    next_try_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class AuthSession(TimestampMixin, Base):
     """One signed-in device. The refresh token itself is never stored, only its SHA-256; every refresh replaces it
     (rotation). A token that was already replaced coming back means it leaked: the whole session is revoked."""

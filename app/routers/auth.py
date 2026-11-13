@@ -13,7 +13,7 @@ from app.core.db import utcnow
 from app.core.passwords import hash_password, password_problem, verify_password
 from app.core.security import create_access_token, decode_legacy_token, hash_code, new_refresh_token, refresh_hash
 from app.deps import DB, CurrentSession, CurrentUser
-from app.models import AuthSession, OtpCode, User
+from app.models import AuthSession, OtpCode, OtpThrottle, User
 from app.schemas import UserOut
 from app.services.features import user_features
 from app.services.sms import SmsError, send_code, sms_config
@@ -27,7 +27,19 @@ COOKIE_PATH = "/api/v1/auth"
 ROTATION_GRACE_SECONDS = 30
 MAX_PASSWORD_FAILS = 5
 LOCK_MINUTES = 15
+# Wrong SMS codes: wait before the next try, and a long lock after this many in a row.
+OTP_RETRY_WAIT_SECONDS = 40
+OTP_MAX_FAILS = 5
+OTP_LOCK_SECONDS = 3600
 
+
+def _wait(message: str, seconds: int, status: int = 429) -> HTTPException:
+    return HTTPException(status, {"message": message, "retry_after": max(1, int(seconds))})
+
+
+def _lock_message(_seconds: float = 0) -> str:
+    # The wait itself travels as `retry_after` (seconds); the page counts it down next to this text.
+    return "به‌خاطر چند بار وارد کردن کد اشتباه، ورود با کد پیامکی موقتاً بسته است."
 
 def normalize_phone(phone: str) -> str:
     d = re.sub(r"\D", "", to_en_digits(phone))
@@ -210,6 +222,10 @@ async def send_otp(body: PhoneIn, request: Request, db: DB):
         OtpCode.phone == phone, OtpCode.created_at > utcnow() - timedelta(minutes=10)))
     if recent >= settings.otp_max_sends_per_10min:
         raise HTTPException(429, "تعداد درخواست کد زیاد است؛ چند دقیقه بعد دوباره تلاش کنید.")
+    throttle = await db.get(OtpThrottle, phone)
+    if throttle and throttle.locked_until and aware(throttle.locked_until) > utcnow():
+        left = (aware(throttle.locked_until) - utcnow()).total_seconds()
+        raise _wait(_lock_message(left), left)
     cfg = await sms_config(db)
     if not cfg["ready"] and not settings.otp_dev_mode:
         raise HTTPException(503, "ارسال پیامک هنوز راه‌اندازی نشده است.")
@@ -234,6 +250,14 @@ async def send_otp(body: PhoneIn, request: Request, db: DB):
 @router.post("/otp/verify")
 async def verify_otp(body: VerifyIn, request: Request, response: Response, db: DB):
     phone = normalize_phone(body.phone)
+    now = utcnow()
+    throttle = await db.get(OtpThrottle, phone)
+    if throttle and throttle.locked_until and aware(throttle.locked_until) > now:
+        left = (aware(throttle.locked_until) - now).total_seconds()
+        raise _wait(_lock_message(left), left)
+    if throttle and throttle.next_try_at and aware(throttle.next_try_at) > now:
+        left = (aware(throttle.next_try_at) - now).total_seconds()
+        raise _wait("کد وارد شده اشتباه است.", left)
     otp = (await db.execute(select(OtpCode).where(OtpCode.phone == phone, ~OtpCode.used)
                             .order_by(OtpCode.id.desc()).limit(1))).scalar_one_or_none()
     if not otp or aware(otp.expires_at) < utcnow():
@@ -242,8 +266,20 @@ async def verify_otp(body: VerifyIn, request: Request, response: Response, db: D
         raise HTTPException(429, "تعداد تلاش زیاد بود؛ کد جدید بگیرید.")
     otp.attempts += 1
     if otp.code_hash != hash_code(phone, to_en_digits(body.code).strip()):
+        if not throttle:
+            throttle = OtpThrottle(phone=phone, fails=0)
+            db.add(throttle)
+        throttle.fails = (throttle.fails or 0) + 1
+        if throttle.fails >= OTP_MAX_FAILS:
+            throttle.fails, throttle.next_try_at = 0, None
+            throttle.locked_until = now + timedelta(seconds=OTP_LOCK_SECONDS)
+            await db.commit()
+            raise _wait(_lock_message(OTP_LOCK_SECONDS), OTP_LOCK_SECONDS)
+        throttle.next_try_at = now + timedelta(seconds=OTP_RETRY_WAIT_SECONDS)
         await db.commit()
-        raise HTTPException(400, "کد وارد شده اشتباه است.")
+        raise _wait("کد وارد شده اشتباه است.", OTP_RETRY_WAIT_SECONDS, 400)
+    if throttle:
+        throttle.fails, throttle.next_try_at, throttle.locked_until = 0, None, None
     otp.used = True
     user = (await db.execute(select(User).where(User.phone == phone))).scalar_one_or_none()
     is_new = user is None
@@ -266,8 +302,8 @@ async def password_login(body: PasswordLoginIn, request: Request, response: Resp
     user = await db.scalar(select(User).where(User.phone == phone))
     now = utcnow()
     if user and user.locked_until and aware(user.locked_until) > now:
-        minutes = max(1, int((aware(user.locked_until) - now).total_seconds() // 60) + 1)
-        raise HTTPException(429, f"به‌خاطر تلاش‌های ناموفق، ورود با رمز تا {minutes} دقیقه بسته است؛ با کد پیامکی وارد شوید.")
+        raise _wait("به‌خاطر چند بار رمز اشتباه، ورود با رمز موقتاً بسته است؛ با کد پیامکی وارد شو.",
+                    (aware(user.locked_until) - now).total_seconds())
     if not verify_password(body.password, user.password_hash if user else None):
         if user and user.password_hash:
             user.failed_logins = (user.failed_logins or 0) + 1
