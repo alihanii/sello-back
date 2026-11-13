@@ -112,3 +112,30 @@ async def test_admin_switch_and_sync(client, monkeypatch):
     r = await client.patch(f"/invoices/{listed['items'][0]['id']}", headers=h, json={"status": "cancelled"})
     assert r.status_code == 409
     assert dk_sync  # module imported for the poller
+
+
+async def test_send_code_runs_inline_and_saves_the_challenge(client, monkeypatch):
+    h = await login(client, "09128830998")
+    sid = (await client.post("/stores", json={"name": "کد"}, headers=h)).json()["id"]
+    sent = []
+
+    async def fake(self, method, path, *, token=None, body=None, referer=None, files=None, data=None):
+        sent.append((path, body))
+        return {"data": {"challenge_token": "ct"}} if path.endswith("/otp/send") else {"data": {}}
+
+    monkeypatch.setattr(dk.DigikalaAdapter, "_request", fake)
+    r = await client.post(f"/stores/{sid}/channels/digikala/send-code", headers=h,
+                          json={"platform": "digikala", "data": {"phone": "09121234567"}})
+    assert r.status_code == 200, r.text
+    assert [p for p, _ in sent] == ["/api/v2/login", "/api/v2/otp/send"] and sent[0][1]["username"] == "09121234567"
+    async with SessionLocal() as db:
+        ch = await db.get(Channel, r.json()["channel_id"])
+        assert ch.config["pending"] == {"challenge_token": "ct", "phone": "09121234567"}
+
+    async def refuse(self, method, path, **kw):
+        raise dk.PlatformError("کپچا لازم است", "http_400")
+
+    monkeypatch.setattr(dk.DigikalaAdapter, "_request", refuse)
+    r = await client.post(f"/stores/{sid}/channels/digikala/send-code", headers=h,
+                          json={"platform": "digikala", "data": {"phone": "09121234567"}})
+    assert r.status_code == 400 and r.json()["detail"]["message"] == "کپچا لازم است"

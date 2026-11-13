@@ -46,7 +46,10 @@ class OpContext:
     def __init__(self, db: AsyncSession, op: Operation):
         self.db = db
         self.op = op
-        self._order = len(op.steps) if op.steps else 0
+        # Only look at steps already loaded: a fresh operation (Digikala's send-code runs inline) has none, and a lazy
+        # load here would fail outside the async greenlet (MissingGreenlet → a bare 500 for the seller).
+        loaded = "steps" in op.__dict__
+        self._order = len(op.steps) if loaded and op.steps else 0
         self.empty_reason: str = ""  # set by a crawl adapter to explain why it found nothing
 
     @asynccontextmanager
