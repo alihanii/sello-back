@@ -198,3 +198,57 @@ async def test_ip_limit_on_code_sends(fresh, monkeypatch):
     codes = [(await fresh.post("/auth/otp/send", json={"phone": f"0913100{i:04d}"})).status_code for i in range(11)]
     assert codes[:10] == [200] * 10 and codes[10] == 429
     ratelimit.reset()
+
+
+async def test_wrong_codes_wait_40_seconds_then_lock_for_an_hour(fresh):
+    from app.models import OtpThrottle
+
+    phone = "09130000010"
+    sent = await fresh.post("/auth/otp/send", json={"phone": phone})
+    code = sent.json()["dev_code"]
+    wrong = "000000" if code != "000000" else "111111"
+
+    async def clear_wait():
+        async with SessionLocal() as db:
+            t = await db.get(OtpThrottle, phone)
+            t.next_try_at = None
+            await db.commit()
+
+    r = await fresh.post("/auth/otp/verify", json={"phone": phone, "code": wrong})
+    assert r.status_code == 400 and r.json()["detail"]["retry_after"] == 40
+    # Right away, even the right code has to wait.
+    r = await fresh.post("/auth/otp/verify", json={"phone": phone, "code": code})
+    assert r.status_code == 429 and 1 <= r.json()["detail"]["retry_after"] <= 40
+    for _ in range(3):
+        await clear_wait()
+        assert (await fresh.post("/auth/otp/verify", json={"phone": phone, "code": wrong})).status_code == 400
+    await clear_wait()
+    r = await fresh.post("/auth/otp/verify", json={"phone": phone, "code": wrong})  # the fifth in a row
+    assert r.status_code == 429 and r.json()["detail"]["retry_after"] == 3600
+    # Locked: neither the right code nor a new code helps.
+    assert (await fresh.post("/auth/otp/verify", json={"phone": phone, "code": code})).status_code == 429
+    assert (await fresh.post("/auth/otp/send", json={"phone": phone})).status_code == 429
+    async with SessionLocal() as db:
+        t = await db.get(OtpThrottle, phone)
+        t.locked_until = utcnow() - timedelta(seconds=1)
+        await db.commit()
+    r = await fresh.post("/auth/otp/send", json={"phone": phone})
+    assert r.status_code == 200
+    r = await fresh.post("/auth/otp/verify", json={"phone": phone, "code": r.json()["dev_code"]})
+    assert r.status_code == 200
+
+
+async def test_a_right_code_clears_the_misses(fresh):
+    from app.models import OtpThrottle
+
+    phone = "09130000011"
+    code = (await fresh.post("/auth/otp/send", json={"phone": phone})).json()["dev_code"]
+    await fresh.post("/auth/otp/verify", json={"phone": phone, "code": "000000" if code != "000000" else "111111"})
+    async with SessionLocal() as db:
+        t = await db.get(OtpThrottle, phone)
+        t.next_try_at = None
+        await db.commit()
+    assert (await fresh.post("/auth/otp/verify", json={"phone": phone, "code": code})).status_code == 200
+    async with SessionLocal() as db:
+        t = await db.get(OtpThrottle, phone)
+        assert t.fails == 0 and t.next_try_at is None
