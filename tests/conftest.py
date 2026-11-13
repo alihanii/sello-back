@@ -8,6 +8,7 @@ os.environ["SELLO_WORKER_ENABLED"] = "false"
 os.environ["SELLO_BANK_DB_PATH"] = f"{_tmp}/bank.db"
 os.environ["SELLO_ADMIN_PHONES"] = '["09120000000"]'
 os.environ["SELLO_OTP_MAX_SENDS_PER_10MIN"] = "100"
+os.environ["SELLO_RATELIMIT_ENABLED"] = "false"
 
 import httpx  # noqa: E402
 
