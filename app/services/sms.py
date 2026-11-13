@@ -54,8 +54,8 @@ async def sms_config(db: AsyncSession) -> dict[str, Any]:
         "enabled": enabled,
         "provider": provider or "kavenegar",
         "api_key": key or settings.sms_api_key,
-        "template": value.get("template", settings.kavenegar_template),
-        "sender": value.get("sender", settings.kavenegar_sender),
+        "template": value.get("template") or settings.kavenegar_template,
+        "sender": value.get("sender") or settings.kavenegar_sender,
     }
     cfg["ready"] = bool(cfg["enabled"] and cfg["api_key"] and (cfg["template"] or cfg["sender"]))
     return cfg
