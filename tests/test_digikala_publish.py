@@ -203,3 +203,11 @@ def test_product_id_from_any_save_answer():
     assert dk._product_id({"data": {"product_id": 5}}) == 5
     assert dk._product_id({"data": {"product": {"id": 7}}}) == 7
     assert dk._product_id({"data": {}}) is None
+
+
+def test_ai_base_url_that_isnt_a_url_uses_the_default():
+    from app.models import AiProvider
+    from app.services.ai import _base
+
+    assert _base(AiProvider(kind="avalai", base_url="09120000000")) == "https://api.avalai.ir"
+    assert _base(AiProvider(kind="avalai", base_url=" https://x.ir/ ")) == "https://x.ir"

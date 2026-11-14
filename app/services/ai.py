@@ -86,7 +86,9 @@ def _api_key(provider: AiProvider) -> str:
 
 
 def _base(provider: AiProvider) -> str:
-    base = (provider.base_url or DEFAULT_BASE_URLS[provider.kind]).strip().rstrip("/")
+    typed = (provider.base_url or "").strip()
+    # Anything that isn't a URL (e.g. a phone number the browser autofilled) means "use the default".
+    base = (typed if typed.lower().startswith(("http://", "https://")) else DEFAULT_BASE_URLS[provider.kind]).rstrip("/")
     if provider.kind == "openrouter" and not base.endswith("/api/v1"):
         base = base.removesuffix("/api") + "/api/v1"  # "https://openrouter.ai" as typed from the site
     return base

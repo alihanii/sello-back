@@ -3,7 +3,7 @@ from typing import Any, Literal
 
 import httpx
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import selectinload
 
@@ -644,10 +644,22 @@ async def audit_log(admin: AdminUser, db: DB):
 
 # ---------- AI keys, routing, monitoring ----------
 
+def _clean_base_url(v: str) -> str:
+    v = (v or "").strip()
+    if v and not v.lower().startswith(("http://", "https://")):
+        raise ValueError("آدرس پایه نامعتبر است؛ باید با https:// شروع شود یا خالی بماند تا آدرس پیش‌فرض استفاده شود.")
+    return v
+
+
 class ProviderIn(BaseModel):
     name: str
     kind: str
     base_url: str = ""
+
+    @field_validator("base_url")
+    @classmethod
+    def _base(cls, v: str) -> str:
+        return _clean_base_url(v)
     api_key: str = ""  # empty on update = keep the stored key
     proxy: str = ""  # optional http(s)/socks proxy for this key
     default_model: str = ""
