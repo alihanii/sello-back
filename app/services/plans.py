@@ -1,5 +1,6 @@
 """Plans: one or more plans (tiers), each sold for 1/3/12 months; their limits; and what a seller has used."""
 
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 
 from dateutil.relativedelta import relativedelta
@@ -162,6 +163,11 @@ async def credits_used(db: AsyncSession, owner_id: int) -> int:
         AiUsageLog.created_at >= _month_start())) or 0)
 
 
+# Set while a marketplace main picture is made for publishing (Digikala wants it on white): that one runs whenever an
+# image key is set in admin, whatever the plan's «ساخت عکس با AI» switch says.
+MARKETPLACE_MAIN_IMAGE: ContextVar[bool] = ContextVar("marketplace_main_image", default=False)
+
+
 async def credit_problem(db: AsyncSession, store_id: int, task: str) -> str:
     """Why this store's owner can't spend AI credits on `task` now, in Persian; empty when they can."""
     if task in CHAT_TASKS:
@@ -176,7 +182,7 @@ async def credit_problem(db: AsyncSession, store_id: int, task: str) -> str:
     if status == "expired":
         return "پلن شما تمام شده؛ برای استفاده از هوش مصنوعی پلن را تمدید کنید."
     limits = await limits_for(db, owner)
-    if task in IMAGE_TASKS and not limits.get("ai_images"):
+    if task in IMAGE_TASKS and not limits.get("ai_images") and not MARKETPLACE_MAIN_IMAGE.get():
         return "ساخت عکس با AI در پلن شما نیست؛ محصول با عکس‌های خودتان ساخته می‌شود."
     if task in CREDIT_TASKS:
         limit = int(limits.get("monthly_ai_credits", 0))

@@ -606,7 +606,8 @@ class DigikalaAdapter:
     async def _main_image(self, ctx, product: Product, desc: str) -> str:
         """The main picture made the way «ساخت محصول هوشمند» makes it (Digikala's main-image rules: the product alone,
         centred, white background, no text), from the seller's first photo. Kept in source_ref so a retry reuses it.
-        Empty when AI pictures are off for this store/plan or the model gives none: the seller's photo goes instead."""
+        Runs whenever an image key is set in admin (the plan's AI-pictures switch doesn't apply here); empty when there is
+        none or the model gives nothing: the seller's photo goes instead, made square on white."""
         if not product.images:
             return ""
         first = product.images[0]
@@ -618,8 +619,10 @@ class DigikalaAdapter:
             return ""
         if not await ai.ai_available("image_edit"):
             return ""
+        from app.services.plans import MARKETPLACE_MAIN_IMAGE
         from app.services.product_images import make_photo
 
+        allow = MARKETPLACE_MAIN_IMAGE.set(True)
         try:
             url = await make_photo(ctx, store_id=product.store_id, title=product.title,
                                    note=(product.description or desc or "")[:400],
@@ -628,6 +631,8 @@ class DigikalaAdapter:
             async with ctx.step("image_ai_skipped", "عکس AI ساخته نشد؛ عکس خود محصول استفاده می‌شود") as s:
                 s.response = {"reason": getattr(exc, "message_fa", None) or str(exc)[:300]}
             return ""
+        finally:
+            MARKETPLACE_MAIN_IMAGE.reset(allow)
         ref["digikala_main_image"] = {"from": first.url, "url": url}
         product.source_ref = ref
         return url
