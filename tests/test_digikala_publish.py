@@ -104,6 +104,9 @@ async def test_main_image_made_once_with_the_smart_product_pipeline(monkeypatch)
     assert await dk.digikala._main_image(ctx, product, "") == "/media/1/clean.png"
     assert await dk.digikala._main_image(ctx, product, "") == "/media/1/clean.png"  # reused on a retry
     assert len(made) == 1 and made[0]["image_url"] == "/media/1/raw.jpg"
+    product.images[0].origin_url = "https://cdn.example/raw.jpg"  # imported/crawled: still made with the image model
+    product.source_ref = {}
+    assert await dk.digikala._main_image(ctx, product, "") == "/media/1/clean.png"
     product.images[0].origin_url = "/media/1/orig.jpg"  # already cleaned by smart product creation
     product.source_ref = {}
     assert await dk.digikala._main_image(ctx, product, "") == ""

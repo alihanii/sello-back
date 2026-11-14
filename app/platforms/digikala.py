@@ -672,9 +672,12 @@ class DigikalaAdapter:
         cached = ref.get("digikala_main_image")
         if cached and cached.get("from") == first.url:
             return cached["url"]
-        if getattr(first, "origin_url", ""):  # already cleaned by smart product creation
-            return ""
+        origin = getattr(first, "origin_url", "") or ""
+        if origin.startswith("/media/") and origin != first.url:
+            return ""  # already the cleaned main picture from «ساخت محصول هوشمند» (the seller's photo is its origin)
         if not await ai.ai_available("image_edit"):
+            async with ctx.step("image_ai_skipped", "عکس اصلی با AI ساخته نشد؛ عکس خود محصول استفاده می‌شود") as s:
+                s.response = {"reason": "در ادمین برای «ساخت عکس» (image_edit) کلید و مدل تنظیم نشده."}
             return ""
         from app.services.plans import MARKETPLACE_MAIN_IMAGE
         from app.services.product_images import make_photo
