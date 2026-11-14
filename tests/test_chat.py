@@ -2700,3 +2700,42 @@ def test_named_in_reply_and_key_mash_address():
     assert chat_engine.address_ok("تهران خیابان ولیعصر کوچه ۳ پلاک ۷") and chat_engine.address_ok("۱۲۳۴۵۶۷۸۹۰")
     for t in ("hi", "ok", "thanks", "hello there", "/start"):
         assert not chat_engine.from_en_layout(t), t
+
+
+async def test_order_with_receipt_is_not_edited_admin_only_on_yes(client, monkeypatch):
+    """ali: once the order is placed and its receipt sent, the assistant must not edit it; asked to, it offers the
+    admin and hands the chat over only when the customer says yes."""
+    h, sid, llm, p1, p2 = await _setup(client, monkeypatch, "09125550982")
+    await _order_ready(client, h, sid, llm, p1)
+
+    async def say(t):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": t})).json()["messages"]
+
+    llm.answers = [{"reply": "", "intent": "order", "order_action": "confirm"}]
+    await say("بله")
+    assert (await say("کد پیگیری ۱۲۳۴۵۶۷۸"))[-1]["source"] == "receipt"
+    from app.core.db import SessionLocal
+    from app.models import AiOrder, ChatConversation
+    async with SessionLocal() as db:
+        order = (await db.execute(select(AiOrder).where(AiOrder.store_id == sid).order_by(AiOrder.id.desc()))).scalar()
+        assert order.status == "payment_submitted"
+
+    n = len(llm.calls)
+    m = (await say("میخوام سایزش رو عوض کنم XL باشه"))[-1]
+    assert "قابل ویرایش نیست" in m["text"] and m["buttons"] == [[chat_engine.EDIT_HANDOFF_YES,
+                                                                   chat_engine.EDIT_HANDOFF_NO]]
+    m = (await say("نه"))[-1]
+    assert "همون‌طور که ثبت شده" in m["text"] and len(llm.calls) == n
+
+    async def conv_status():
+        async with SessionLocal() as db:
+            return (await db.execute(select(ChatConversation.status).where(
+                ChatConversation.store_id == sid, ChatConversation.is_test).order_by(ChatConversation.id.desc()))).scalar()
+    assert await conv_status() != "needs_human"
+
+    await say("آدرسم اشتباهه، عوضش کن")
+    m = (await say(chat_engine.EDIT_HANDOFF_YES))[-1]
+    assert "ادمین" in m["text"] and await conv_status() == "needs_human" and len(llm.calls) == n
+    async with SessionLocal() as db:
+        o = await db.get(AiOrder, order.id)
+        assert o.items[0]["variant"] == "L" and o.status == "payment_submitted"  # unchanged

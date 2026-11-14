@@ -1468,6 +1468,48 @@ def from_en_layout(text: str, rows: list[Product] | None = None) -> str:
     return fa if known >= max(1, (len(said) + 1) // 2) else ""
 
 
+LOCKED_STATUSES = ("payment_submitted", "confirmed")
+_EDIT_ASK = re.compile(r"(عوض|تغییر|ویرایش|ادیت|اصلاح|حذف|کنسل|لغو|اشتباه|بجای|به\s*جای|جاش|بردار|برش\s*دار)")
+EDIT_HANDOFF_YES, EDIT_HANDOFF_NO = "✅ آره، به ادمین وصلم کن", "نه، لازم نیست"
+EDIT_LOCKED_TEXT = ("سفارش #{order} ثبت شده و فیشش هم رسیده، برای همین دیگه از اینجا قابل ویرایش نیست 🙏\n"
+                    "می‌خوای گفتگو رو به ادمین فروشگاه بدم تا تغییرش رو با خودت هماهنگ کنه؟")
+EDIT_HANDOFF_TEXT = "باشه 🌸 گفتگو رو به ادمین دادم؛ به‌زودی همین‌جا درباره‌ی تغییر سفارش #{order} بهت پیام می‌ده 🙏"
+EDIT_KEPT_TEXT = "باشه 🌸 سفارش #{order} همون‌طور که ثبت شده می‌مونه. سؤال دیگه‌ای داشتی بپرس."
+
+
+async def locked_edit(db: AsyncSession, conv: ChatConversation, state: dict[str, Any], text: str,
+                      result: TurnResult) -> list[Reply] | None:
+    """After the order is placed and its receipt sent, the assistant never edits it: asked to change it, it asks
+    whether to hand the chat to the admin, and hands it over only on a yes. None: not that ask."""
+    asked = state.get("awaiting") == "edit_handoff"
+    if asked:
+        state.pop("awaiting", None)
+        order = await db.get(AiOrder, int(state.get("edit_order") or 0)) if state.get("edit_order") else None
+        request = str(state.pop("edit_request", "") or "")
+        state.pop("edit_order", None)
+        if not order or order.conversation_id != conv.id:
+            return None
+        t = " ".join(text.split())
+        if t == EDIT_HANDOFF_YES or (plain_yes(t) and len(t.split()) <= 4):
+            conv.status = "needs_human"
+            result.notify_admin.append(f"✏️ {conv.customer_name or 'مشتری'} می‌خواد سفارش #{order.id} رو (فیشش رسیده) "
+                                       f"تغییر بده؛ گفتگو به تو سپرده شد: «{request[:200]}»")
+            return [Reply(EDIT_HANDOFF_TEXT.format(order=fa_number(order.id)), source="handoff", intent="handoff")]
+        if t == EDIT_HANDOFF_NO or re.fullmatch(r"(نه|نخیر|نمی\s*‌?خواد|لازم\s*نیست|ن)[\s!.،]*", t):
+            return [Reply(EDIT_KEPT_TEXT.format(order=fa_number(order.id)), source="order", intent="order")]
+        return None  # something else: answered as usual
+    if (state.get("order") or {}).get("items") or not _EDIT_ASK.search(text):
+        return None
+    order = await last_order(db, conv)
+    if not order or order.status not in LOCKED_STATUSES:
+        return None
+    state["awaiting"] = "edit_handoff"
+    state["edit_order"] = order.id
+    state["edit_request"] = text[:300]
+    return [Reply(EDIT_LOCKED_TEXT.format(order=fa_number(order.id)), source="order", intent="order",
+                  buttons=[[EDIT_HANDOFF_YES, EDIT_HANDOFF_NO]])]
+
+
 async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent,
                    pending: list[ChatMessage]) -> TurnResult:
     """Decides the answer to the customer's pending messages. Saves nothing that isn't on `conv`/new rows;
@@ -1545,6 +1587,11 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
                 result.notify_admin.append(f"🧾 فیش/کد پرداخت سفارش #{order.id} ({money(order.total_toman)}) از "
                                            f"{order.customer_name or conv.customer_name or 'مشتری'} رسید.")
                 return done()
+
+    # 2b. A change to an order whose receipt is in: not done by the assistant; the admin takes it if they want.
+    if text and agent.orders_enabled and (locked := await locked_edit(db, conv, state, text, result)) is not None:
+        result.replies += locked
+        return done()
 
     if text and agent.catalog_enabled:
         text = await pick_by_order(db, store, state, text)
@@ -1787,7 +1834,8 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
     bad_address_before = state.get("bad_address")
     awaiting = state.pop("awaiting", None) if state.get("awaiting") == "confirm" else None
     before = state.get("order") or {}
-    if placed and not before.get("items") and isinstance(out.get("order"), dict) and action == "update" \
+    if placed and placed.status not in LOCKED_STATUSES and not before.get("items") and isinstance(out.get("order"), dict) \
+            and action == "update" \
             and not (out["order"].get("items")):
         # A correction to the placed order's name/phone/address ("شماره‌م اشتباه بود، ۰۹۱۲…"): changed on the order.
         for k, col in (("name", "customer_name"), ("phone", "customer_phone"), ("address", "customer_address")):
