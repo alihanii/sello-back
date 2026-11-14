@@ -57,7 +57,51 @@ _CATEGORY_WORDS = {
     "تیشرت": ["تی شرت", "تی شرت و پولو شرت"], "تی‌شرت": ["تی شرت"], "پولوشرت": ["تی شرت و پولو شرت"],
     "کاپشن": ["کاپشن و پافر"], "پافر": ["کاپشن و پافر"], "شلوارک": ["شلوارک"], "اسلش": ["شلوار"],
     "جین": ["شلوار جین"], "کراپ": ["تاپ و کراپ"], "ست": ["ست لباس"],
+    "دورس": ["سویشرت و هودی", "ست لباس"], "گرمکن": ["ست لباس ورزشی", "گرمکن"], "شلوار": ["شلوار"],
 }
+
+
+_STOP = {"و", "با", "طرح", "دار", "مدل", "برند", "جدید", "اصل", "کد", "رنگ"}
+
+
+def _words(v: str) -> set[str]:
+    return {w for w in re.split(r"[\s‌\-،,/>›()]+", _norm(v)) if len(w) > 1 and w not in _STOP}
+
+
+def _overlap(product: Product, cat: dict) -> int:
+    """Whole words the product's title/category hint shares with a Digikala category (with the word map's names)."""
+    mine = _words(f"{product.title} {product.category_hint or ''}")
+    mine |= {x for w in mine for name in _CATEGORY_WORDS.get(w, []) for x in _words(name)}
+    return len(mine & (_words(cat.get("title") or "") | _words(str(cat.get("path") or ""))))
+
+
+_FA_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+
+def _from_text(field: dict, text: str) -> Any:
+    """A value for a weight, size or material field written plainly in the product's title/description, else None."""
+    t = text.translate(_FA_DIGITS)
+    name = _norm(field["title"])
+    if "وزن" in name:
+        m = re.search(r"(\d+(?:[.,]\d+)?)\s*(کیلو|kg|گرم|g\b)", t, re.I)
+        if m:
+            n = float(m.group(1).replace(",", "."))
+            grams = n * 1000 if m.group(2).lower() in ("کیلو", "kg") else n
+            return int(grams) if field["type"] == "number" else f"{int(grams)} گرم"
+    if "ابعاد" in name or "اندازه" in name:
+        m = re.search(r"\d+(?:\.\d+)?\s*[x×*]\s*\d+(?:\.\d+)?(?:\s*[x×*]\s*\d+(?:\.\d+)?)?(?:\s*(?:سانتی‌?متر|سانت|cm|میلی‌?متر|mm))?",
+                      t, re.I)
+        if m and field["type"] != "number":
+            return m.group(0)
+    if "جنس" in name and field["type"] not in ("number",):
+        m = re.search(r"جنس(?:\s*(?:پارچه|بدنه))?\s*[:：]?\s*([^\s،,.\n]+)", t)
+        if m:
+            word = m.group(1)
+            if field["options"]:
+                hit = next((o["id"] for o in field["options"] if _norm(word) in _norm(o.get("text") or "")), None)
+                return ([hit] if field["type"] == "multi_select" else hit) if hit is not None else None
+            return word
+    return None
 
 
 def _ai_skipped(exc: Exception) -> str:
@@ -694,7 +738,7 @@ class DigikalaAdapter:
         hint = (product.category_hint or "").replace("›", ">").replace("/", ">")
         keywords = [k.strip() for k in (hint.split(">")[-1], hint, title, " ".join(product.title.split()[:2]),
                                          product.title.split()[0]) if k and k.strip()]
-        keywords += [w for k in list(keywords) for w in _CATEGORY_WORDS.get(_norm(k.split()[0]), [])]
+        keywords += [w for t in _norm(product.title).split() + _norm(hint).split() for w in _CATEGORY_WORDS.get(t, [])]
         candidates: list[dict] = []
         tried: dict[str, Any] = {}
 
@@ -718,8 +762,8 @@ class DigikalaAdapter:
                                 "(مثلاً «پیراهن مردانه»).", "no_category", EDIT_PRODUCT, tried)
 
         # Without AI (off, or its key out of quota) the candidates closest to the product's own words go first.
-        words = set(_norm(f"{product.title} {product.category_hint or ''}").replace("‌", " ").split())
-        ordered = sorted(candidates[:10], key=lambda c: -len(words & set(_norm(c["title"]).replace("‌", " ").split())))
+        ordered = sorted(candidates[:10], key=lambda c: -_overlap(product, c))
+        best = None
         if len(ordered) > 1 and await ai.ai_available("field_fill"):
             async with ctx.step("category_ai", "انتخاب دسته با هوش مصنوعی") as s:
                 try:
@@ -736,7 +780,15 @@ class DigikalaAdapter:
                 if best:
                     ordered = [best] + [c for c in ordered if c is not best]
                 s.response = {"picked": best or ordered[0], "by": "ai" if best else "words"}
-
+        if not best:
+            # No AI pick: only categories sharing a word with the product (e.g. «ست» must not land in «استند و پایه
+            # خنک‌کننده»); a guess would publish the product in the wrong place.
+            sure = [c for c in ordered if _overlap(product, c)]
+            if not sure:
+                raise PlatformError("دستهٔ دیجی‌کالا بدون هوش مصنوعی مطمئن پیدا نشد؛ «دسته» را در مشخصات محصول با اسم "
+                                    "دیجی‌کالایی بنویسید (مثلاً «ست لباس مردانه») یا اعتبار کلید AI را شارژ کنید. نزدیک‌ترین‌ها: "
+                                    + "، ".join(c["title"] for c in ordered[:4]), "no_category", EDIT_PRODUCT)
+            ordered = sure
         restricted = []
         for cat in ordered[:4]:
             async with ctx.step(f"category_{cat['id']}", f"بررسی مجوز فروش در «{cat['title']}»") as s:
@@ -799,8 +851,11 @@ class DigikalaAdapter:
             s.response = {"fields": len(fields), "required": sum(f["required"] for f in fields)}
         values: dict[str, Any] = {}
         mine = {_norm(k): v for k, v in (product.attributes or {}).items()}
+        text = f"{product.title}\n{product.description or ''}"
         for f in fields:
             v = mine.get(_norm(f["title"]))
+            if v in (None, ""):
+                v = _from_text(f, text)  # «وزن ۴۵۰ گرم», «ابعاد ۳۰×۲۰», «جنس: پنبه» in the seller's own text
             if v not in (None, ""):
                 values[str(f["id"])] = v
         # Every field still empty goes to the AI: required ones must get a value, optional ones only when the product

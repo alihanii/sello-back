@@ -284,6 +284,19 @@ def _provider_message(resp: httpx.Response) -> str:
     return " ".join(str(msg).split())[:300]
 
 
+def _provider_name(resp: httpx.Response) -> str:
+    """Which service answered, from the request's host (AvalAI, Google, OpenRouter, OpenAI...)."""
+    try:
+        host = resp.request.url.host.lower()
+    except RuntimeError:
+        return "سرویس‌دهندهٔ هوش مصنوعی"
+    for key, name in (("avalai", "AvalAI"), ("googleapis", "گوگل (Gemini)"), ("openrouter", "OpenRouter"),
+                      ("openai", "OpenAI"), ("anthropic", "Anthropic"), ("metis", "متیس"), ("gapgpt", "GapGPT")):
+        if key in host:
+            return name
+    return f"سرویس‌دهندهٔ هوش مصنوعی ({host})"
+
+
 def _raise_for(resp: httpx.Response) -> None:
     low = resp.text[:2000].lower()
     said = _provider_message(resp)
@@ -315,9 +328,14 @@ def _raise_for(resp: httpx.Response) -> None:
                       "فعال کنی یا کلید دیگری (پولی یا متیس) برای این کار بگذاری.", code="ai_free_tier", detail=resp.text[:500])
     if resp.status_code == 429:
         # The provider's own quota/rate limit on this key (HTTP 429), not a Foroshify rule: plan limits live in admin.
-        raise AIError("سرویس‌دهندهٔ هوش مصنوعی (گوگل/OpenRouter/OpenAI) گفت سهمیهٔ این کلید پر شده (خطای ۴۲۹)؛ این محدودیت "
-                      "از خود سرویس‌دهنده است، نه از پلن‌های فروشیفای. سهمیهٔ کلید را در پنل همان سرویس ببین یا کلید دیگری "
-                      "در ادمین اضافه کن." + (f" ({said})" if said else ""), code="ai_rate_limited", detail=resp.text[:500])
+        who = _provider_name(resp)
+        if any(k in low for k in ("credit has been exhausted", "insufficient", "top up", "balance")):
+            raise AIError(f"اعتبار حساب {who} برای این کلید تمام شده (خطای ۴۲۹)؛ حساب را در پنل {who} شارژ کن یا کلید دیگری "
+                          "در ادمین بگذار. این محدودیت از فروشیفای نیست." + (f" ({said})" if said else ""),
+                          code="ai_rate_limited", detail=resp.text[:500])
+        raise AIError(f"{who} گفت سهمیهٔ این کلید پر شده (خطای ۴۲۹)؛ این محدودیت از خود {who} است، نه از پلن‌های "
+                      f"فروشیفای. چند دقیقه بعد دوباره امتحان کن یا سهمیه را در پنل {who} ببین."
+                      + (f" ({said})" if said else ""), code="ai_rate_limited", detail=resp.text[:500])
     if resp.status_code in (500, 502, 503, 504):
         raise AIError("سرویس هوش مصنوعی الان شلوغ است (خطای سمت گوگل/سرویس‌دهنده)؛ چند دقیقه بعد دوباره امتحان کن.",
                       code=f"ai_http_{resp.status_code}", detail=resp.text[:500])
