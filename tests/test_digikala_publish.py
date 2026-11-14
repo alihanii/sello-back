@@ -165,3 +165,31 @@ async def test_plan_without_ai_pictures_still_makes_the_marketplace_main_picture
             assert await credit_problem(db, sid, "image_edit") == ""
         finally:
             MARKETPLACE_MAIN_IMAGE.reset(token)
+
+
+def test_attribute_values_from_the_sellers_text():
+    f = lambda title, kind="text", options=(): {"id": 1, "title": title, "type": kind, "options": list(options)}  # noqa: E731
+    text = "ست دورس\nوزن ۴۵۰ گرم، ابعاد ۳۰×۲۰ سانتی‌متر. جنس: پنبه"
+    assert dk._from_text(f("وزن", "number"), text) == 450
+    assert dk._from_text(f("ابعاد"), text).startswith("30×20")
+    assert dk._from_text(f("جنس", "select", [{"id": 31, "text": "پنبه"}]), text) == 31
+    assert dk._from_text(f("وزن", "number"), "بدون عدد") is None
+
+
+def test_no_ai_and_no_word_in_common_is_not_a_category():
+    p = SimpleNamespace(title="ست دورس و شلوار پاییزه ترک طرح دار کرمی", category_hint="")
+    assert dk._overlap(p, {"title": "استند و پایه خنک کننده"}) == 0
+    assert dk._overlap(p, {"title": "ست لباس مردانه"}) > 0
+
+
+def test_ai_429_names_the_provider_and_says_credit_is_out():
+    import httpx
+
+    from app.services.ai import AIError, _raise_for
+
+    r = httpx.Response(429, json={"error": {"message": "Your account credit has been exhausted."}},
+                       request=httpx.Request("POST", "https://api.avalai.ir/v1/chat/completions"))
+    try:
+        _raise_for(r)
+    except AIError as exc:
+        assert "AvalAI" in exc.message_fa and "اعتبار" in exc.message_fa and exc.code == "ai_rate_limited"
