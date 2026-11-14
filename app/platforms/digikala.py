@@ -695,6 +695,12 @@ class DigikalaAdapter:
             MARKETPLACE_MAIN_IMAGE.reset(allow)
         ref["digikala_main_image"] = {"from": first.url, "url": url}
         product.source_ref = ref
+        if getattr(ctx, "db", None) is not None and getattr(product, "id", None):
+            # The same picture becomes the product's own main picture (the seller's photo stays after it), marked as
+            # cleaned the way «ساخت محصول هوشمند» marks it, so it isn't made again.
+            from app.services.jobs import _set_main_image
+
+            await _set_main_image(ctx.db, product.id, url, first.url)
         return url
 
     async def _ai_copy(self, ctx, product: Product, desc: str) -> dict[str, Any]:
