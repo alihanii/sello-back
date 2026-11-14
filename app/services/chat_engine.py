@@ -341,6 +341,7 @@ ORDER STATUS: asks for the status of an order already placed ("سفارشم چی
 tell me, what now, "هاع؟") -> intent "order_status" and answer that question yourself, short, from MY ORDERS; never
 repeat the details already sent, never invent a reason, date or promise. Payment not confirmed -> the admin checks it
 and messages them; they want the reason now or are upset -> handoff, reason "asked_human".
+PRODUCTS YOU NAME: every PRODUCTS item your reply names, offers or asks them to choose between -> its id in "products".
 PHOTOS: asks to see a product, or says yes to your "عکسش رو بفرستم؟" -> its id in "images" (only products with "عکس"),
 short reply. Never put ids in "images" otherwise.
 REFS: asks for a reference (e.g. size chart) or says yes to your offer of it -> its id in "refs"; otherwise none.
@@ -669,6 +670,10 @@ def _named(rows: list[Product], q: set[str]) -> tuple[list[Product], set[str], s
         named = _rank(rows, specific or q, lambda p: p.description or "", strict=bool(specific))
     if named and generic and specific:
         named = [p for p in named if _overlap(generic, words(f"{p.title} {p.category or ''} {p.category_hint}"))] or named
+    elif named and generic and not specific:
+        # "هودی‌ها رو نشون بده": the products called a hoodie come first; a knit or an autumn set filed under the
+        # hoodie category only shows when no title says it.
+        named = [p for p in named if _overlap(generic, words(p.title))] or named
     return named, specific, generic
 
 
@@ -854,8 +859,12 @@ async def _merge_order(db: AsyncSession, store_id: int, agent: ChatAgent, state:
     talked = set((state.get("recent_products") or [])[-2:])
     if not isinstance(update, dict):
         return order
-    if isinstance(update.get("items"), list) and update["items"] == [] and action == "update" and order.get("items"):
-        order.pop("items")  # "none of them": every item removed, the contact details stay
+    listed_out = bool(set(state.get("listed") or []) - old_ids)
+    if (isinstance(update.get("items"), list) and update["items"] == [] and action == "update" and order.get("items")
+            and not (listed_out and _THIS_ONE.search(now))):
+        # "none of them": every item removed, the contact details stay. «نه اینو نمیخوام» about a product just shown
+        # that isn't in the cart leaves the cart alone.
+        order.pop("items")
     if isinstance(update.get("items"), list) and update["items"]:
         items, removed = [], set()
         for it in update["items"][:10]:
@@ -906,9 +915,10 @@ async def _merge_order(db: AsyncSession, store_id: int, agent: ChatAgent, state:
         # A line never drops off without a «remove»/«cancel»: the model re-listing the cart with one hoodie when it
         # had two (ali: «یه هودی دیگه هم با این طرح» lost the first one) keeps the other one.
         # A product left out is kept too when the model only edited the cart's own lines; one left out while a new
-        # product came in is a swap («نه، ماگ بذار»), unless they said «also».
+        # product came in is a swap only when they said so («نه، ماگ بذار»), never for «این» to another product
+        # (ali: the jeans went when he picked a hoodie).
         sent_ids = {it.get("product_id") for it in items}
-        swap = bool(sent_ids - {o.get("product_id") for o in old_lines})
+        swap = bool(sent_ids - {o.get("product_id") for o in old_lines}) and bool(_SWAP_ASK.search(now))
         keep = [o for i, o in enumerate(old_lines) if i not in matched
                 and (o.get("product_id") in sent_ids or not swap or _ADD_MORE.search(now))
                 and not _DROP_LINE.search(now) and str(o.get("product_id") or o.get("title")) not in removed]
@@ -988,6 +998,9 @@ _SEE_MINE = re.compile(r"(طرحم|طرح\s*(من|خودم)|طرحی\s*که\s*(�
 _CHANGE_ASK = re.compile(r"(عوض|تغییر|حذف|جدید|دیگه|دیگر|اضافه|کنسل|لغو)")
 # "one more / also / another": a new line, never a change of the one in the cart.
 _ADD_MORE = re.compile(r"(یکی\s*دیگه|یه\s*دونه\s*دیگه|\S+\s*دیگه\s*هم|\sهم\s|\sهم$|اضافه|علاوه|به\s*علاوه|دوتا|دو\s*تا)")
+# "no, put the mug" / "change it to…": a new product that replaces the cart's line rather than joining it.
+_SWAP_ASK = re.compile(r"((^|\s)(نه|ن)(\s|،|,|$)|بذار|بزار|عوض|جاش|بجای|به\s*جای|فقط|جایگزین)")
+_THIS_ONE = re.compile(r"(^|\s)(این|اینو|اینم|اینرو|همین|همینو)(\s|$)")
 _DROP_LINE = re.compile(r"(حذف|بردار|نمی\s*‌?خوام|نمیخوام|کنسل|لغو|به\s*جای|بجای|جاش|عوضش|فقط\s+(همون|این|اون|یه))")
 _SEE_VERB = re.compile(r"(ببینم|بیینم|ببینمش|ببینیم|نشونم|نشون\s*(بده|بدین|بدید)|نشان\s*(بده|بدهید)|بفرست\s*ببینم)")
 _DESIGN_WORD = re.compile(r"طرح(م|ی\s*که|\s*(رو|را|من|خودم|و\s)|\s*$)")  # "طرح رو", not "طرح ونگوگ"
@@ -1252,6 +1265,7 @@ async def one_product(db: AsyncSession, state: dict[str, Any], p: Product, text:
     out.append(Reply(("بخوای سفارشش بدی، " + (" و ".join(need) + "ش رو بگو" if need else "بگو") +
                       " تا همین‌جا برات ثبت کنم 🌸 سؤالی هم داشتی بپرس."), source="catalog", intent="product"))
     state["listed"] = [p.id]
+    state["shown_one"] = p.id
     state["recent_products"] = [i for i in state.get("recent_products") or [] if i != p.id][-3:] + [p.id]
     return out
 
@@ -1432,6 +1446,28 @@ async def common_question(db: AsyncSession, conv: ChatConversation, agent: ChatA
                 "you'll check with the seller and they'll answer soon, then help with the rest.")
 
 
+# The Persian keyboard's letters on an English layout (ISIRI 9147, as on Windows, macOS and phones).
+_FA_KEYS = dict(zip("qwertyuiop[]asdfghjkl;'zxcvbnm,", "ضصثقفغعهخحجچشسیبلاتنمکگظطزرذدپو"))
+_FA_COMMON = set("""یه یک هم میخوام میخوام میخواستم میخوایم دارین داری دارید داره دارم چی چیه چه سلام رو را این اون من
+برام برای واسه واسم عکس عکسش قیمت قیمتش چنده چند سایز سایزش رنگ رنگش نه بله آره اره مرسی ممنون دو سه کی کجا چطور
+چرا خوبه باشه میشه بده بفرست نشون ببینم سفارش ثبت کن کنید دونه تا با از به که تو توی شلوار هودی تیشرت کفش لباس
+آدرس ادرس شماره اسمم موجود موجوده ندارین خب خوب ممنونم""".split())
+
+
+def from_en_layout(text: str, rows: list[Product] | None = None) -> str:
+    """The message in Persian when it was typed with the keyboard left on English ("ldo,hl" = «میخوام»), else "".
+    Only a message of plain Latin letters whose Persian reading has words of this language or of the shop's titles,
+    so "hi", "ok" or an English sentence stay as they are."""
+    t = text.strip()
+    if t.startswith("/") or not re.fullmatch(r"[A-Za-z,;'\[\]\s]+", t) or not re.search(r"[a-z]", t):
+        return ""
+    fa = "".join(_FA_KEYS.get(c, c) for c in t.lower())
+    said = [w for w in fa.split() if w]
+    vocab = _FA_COMMON | set().union(*[words(p.title) for p in rows or []])
+    known = sum(1 for w in said if w in vocab)
+    return fa if known >= max(1, (len(said) + 1) // 2) else ""
+
+
 async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent: ChatAgent,
                    pending: list[ChatMessage]) -> TurnResult:
     """Decides the answer to the customer's pending messages. Saves nothing that isn't on `conv`/new rows;
@@ -1442,10 +1478,16 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
     state = copy.deepcopy(dict(conv.state or {}))
     text = "\n".join(m.text for m in pending if m.text).strip()[:MAX_INPUT_CHARS]
     photo = next((m.image_url for m in reversed(pending) if m.image_url), "")
+    if text and (fa := from_en_layout(text, await catalog_rows(db, store.id))):
+        text = fa  # "di n,ki i,nd il ldo,hl" = «یه دونه هودی هم میخوام» typed with the keyboard on English
     unsupported = all(not m.text and not m.image_url for m in pending)
     seen_early: dict[str, Any] | None = None  # the photo, when it was already read at the receipt step
 
+    # The product whose photo and details the last answer sent on its own: «✅ ثبت سفارش» now means that one.
+    state["prev_shown"] = state.pop("shown_one", None)
+
     def done() -> TurnResult:
+        state.pop("prev_shown", None)
         conv.state = state
         return result
 
@@ -1710,9 +1752,11 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
             or reply_text
     valid_ids = {p.id for p in products}
     shown = [int(i) for i in out.get("products") or [] if str(i).isdigit() and int(i) in valid_ids]
-    if shown:
-        state["recent_products"] = (list(state.get("recent_products") or []) + shown)[-4:]
-        state["listed"] = shown  # "can I see them?" next means these
+    # "هودی طرح‌دار مشکی و آبی یا هودی ونگوگ؟" with "products" left empty: the products the reply names are still
+    # what «ببینمشون» next means, not the one in the cart that was shown before.
+    if talked := shown or named_in_reply(reply_text, products):
+        state["recent_products"] = (list(state.get("recent_products") or []) + talked)[-4:]
+        state["listed"] = talked  # "can I see them?" next means these
 
     if intent == "off_topic":
         result.replies.append(Reply(store_text(agent.off_topic_message or DEFAULT_OFF_TOPIC, store), source="off_topic",
@@ -1958,6 +2002,15 @@ async def run_turn(db: AsyncSession, conv: ChatConversation, store: Store, agent
         # The seller's own fixed "send us these" message, once per order, instead of asking one by one.
         reply.text, reply.intent = form[:1000], "order"
         state["form_sent"] = True
+    now_ids = {i.get("product_id") for i in (state.get("order") or {}).get("items") or []}
+    gone = [i for i in before.get("items") or [] if i.get("product_id") and i.get("product_id") not in now_ids]
+    if gone and (state.get("order") or {}).get("items") and reply.text:
+        # A line that came off the cart is always said, never dropped silently.
+        names = []
+        for i in gone:
+            gp = await db.get(Product, i["product_id"])
+            names.append(f"«{(gp.title if gp else str(i.get('title') or ''))[:60]}»")
+        reply.text = f"{'، '.join(names)} از سبدت برداشته شد.\n" + reply.text
     if reply.text:
         result.replies.append(reply)
     elif not handoff:
@@ -2332,6 +2385,27 @@ _NO_PHOTO = re.compile(r"(عکس|تصویر)[^.!؟?\n]{0,40}?(نداریم|ند�
 _OFFER = re.compile(r"(بفرستم|بفرستیم|ببینی|ببینید|می‌خوای|میخوای|می‌خواید|میخواید)")
 
 
+def named_in_reply(reply: str, products: list[Product]) -> list[int]:
+    """The products of PRODUCTS a reply names by their title ("هودی ونگوگ"), in the order it names them. A title
+    counts when all its words are there, or at least two of them including one that isn't the kind ("هودی")."""
+    said = words(reply)
+    if not said:
+        return []
+    flat = norm(reply).replace("‌", " ")
+    kinds = set().union(*[words(p.category or "") for p in products]) if products else set()
+    hits: list[tuple[int, int]] = []
+    for p in products:
+        title = {w for w in words(p.title) if len(w) > 1 and w not in ("و", "با", "از", "مدل", "طرح")}
+        if not title:
+            continue
+        got = {w for w in title if _strict_overlap({w}, said)}
+        specific = {w for w in got if not _overlap({w}, kinds)}
+        if got == title or (len(got) >= 2 and specific):
+            spots = [i for w in (specific or got) if (i := flat.find(w)) >= 0]
+            hits.append((min(spots, default=len(flat)), p.id))
+    return [pid for _, pid in sorted(hits)][:CATALOG_SHOW]
+
+
 def resolve_mentioned(products: list[Product], ids: Any, mention: str) -> list[int]:
     """The model sometimes names the right product in words but puts another id ("photos of the brown hoodie" +
     the black one's id). Words that tell the candidates apart decide; the model's ids stand when words don't help."""
@@ -2497,6 +2571,8 @@ def address_ok(value: str) -> bool:
     """An address looks like one: it has a place word (street, alley, a city…) or a postal code, or it is long enough
     to be one. "سلام", "اینجا" or a key-mash isn't: the customer is asked once to write it fully."""
     v = " ".join(to_en_digits(value).split())
+    if re.search(r"([^\W\d_])\1\1", v):
+        return False  # "اذ ذذذ ۶۷۸۸۸…": a letter three times over is a key-mash, even with a postal code after it
     if _ADDRESS_WORDS.search(v) or re.search(r"\d{5,}", v):
         return True
     words = [w for w in v.split() if len(w) > 1]

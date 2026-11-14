@@ -1246,7 +1246,8 @@ async def test_order_edits_at_the_summary_are_read_by_the_model(client, monkeypa
     llm.answers = [{"reply": "باشه", "intent": "order", "order_action": "update",
                     "order": {"items": [{"product_id": brown["id"], "qty": 0}]}}]
     m = await say("قهوه‌ای رو حذف کن")
-    assert "خلاصهٔ سفارشت" in m["text"] and "قهوه" not in m["text"] and "کاپلی" in m["text"]
+    head, _, summ = m["text"].partition("خلاصهٔ سفارشت")
+    assert summ and "قهوه" not in summ and "کاپلی" in summ and "از سبدت برداشته شد" in head  # said, not silent
 
     # the model says yes, re-sending the same order in other words: placed, not shown again
     llm.answers = [{"reply": "", "intent": "order", "order_action": "confirm",
@@ -2600,3 +2601,102 @@ async def test_ali_five_of_the_category_with_buttons_and_the_named_photo(client,
     assert out[-2]["image_url"] == f"/media/x/{rows['10']['id']}.jpg" and "کد 10" in out[-2]["text"]
     assert "همین‌جا برات ثبت کنم" in out[-1]["text"]
     assert len((await _state(sid))["order"]["items"]) == 1  # looking is not ordering
+
+
+async def test_ali_see_them_means_the_hoodies_just_offered_not_the_cart(client, monkeypatch):
+    """ali's store chat test: jeans in the cart at the summary, «یه هودی هم میخوام» typed on the English keyboard
+    («di n,ki i,nd il ldo,hl») re-sent the summary, the assistant asked «هودی طرح‌دار مشکی و آبی یا هودی ونگوگ؟» and
+    «ببینمشون» sent the jeans again instead of those two hoodies."""
+    h, sid, llm, *_ = await _setup(client, monkeypatch, "09125550981")
+    await client.put(f"/stores/{sid}/chat/agent", headers=h, json={
+        "enabled": True, "orders_enabled": True, "payment": {"card_number": "6037991234567890"}})
+    from app.core.db import SessionLocal
+    from app.models import ProductImage
+    rows = {}
+    for title, cat, extra in (("شلوار جین ترک", "شلوار", {"sku": "21", "attributes": {"رنگ": "آبی، آبی تیره، زغالی"}}),
+                              ("هودی طرح‌دار مشکی و آبی", "هودی", {"attributes": {"رنگ": "مشکی، آبی"}}),
+                              ("هودی ونگوگ", "هودی", {}),
+                              ("هودی چارلی چاپلین", "هودی", {}),
+                              ("بافت برند PULLMARK طرح CLUB STUDIOS", "هودی", {}),
+                              ("مجموعه لباس پاییزه مردانه", "هودی", {"description": "New autumn collection"})):
+        rows[title] = (await client.post(f"/stores/{sid}/products", headers=h, json={
+            "title": title, "price": 3000000, "stock_qty": 5, "category": cat, **extra})).json()
+    async with SessionLocal() as db:
+        db.add_all([ProductImage(product_id=r["id"], url=f"/media/x/{r['id']}.jpg") for r in rows.values()])
+        await db.commit()
+    jeans, h1, h2 = rows["شلوار جین ترک"], rows["هودی طرح‌دار مشکی و آبی"], rows["هودی ونگوگ"]
+
+    async def say(t):
+        return (await client.post(f"/stores/{sid}/chat/test", headers=h, json={"text": t})).json()["messages"]
+
+    await say("سلام")
+    out = await say(chat_engine.PICK + "شلوار جین ترک")
+    assert f"/media/x/{jeans['id']}.jpg" in [m["image_url"] for m in out]
+    llm.answers = [{"reply": "ثبت کنم؟", "intent": "order", "order_action": "confirm", "order": {
+        "items": [{"product_id": jeans["id"], "qty": 1, "variant": "آبی تیره"}], "name": "علی",
+        "phone": "09123454545", "address": "تهران خیابان ولیعصر کوچه ۳ پلاک ۷"}}]
+    assert "خلاصهٔ سفارشت" in (await say("آبی تیره میخوام"))[-1]["text"]
+
+    llm.answers = [{"reply": "چه هودی‌ای مد نظرته؟ هودی طرح‌دار مشکی و آبی یا هودی ونگوگ؟ 🧥", "intent": "product"}]
+    out = await say("di n,ki i,nd il ldo,hl")
+    assert "یه دونه هودی هم میخوام" in llm.calls[-1]["prompt"]
+    assert "هودی ونگوگ" in out[-1]["text"]
+
+    n = len(llm.calls)
+    out = await say("ببینمشون")
+    images = [m["image_url"] for m in out if m["image_url"]]
+    assert f"/media/x/{h1['id']}.jpg" in images and f"/media/x/{h2['id']}.jpg" in images, out
+    assert f"/media/x/{jeans['id']}.jpg" not in images and len(llm.calls) == n
+    assert len((await _state(sid))["order"]["items"]) == 1  # the jeans are still the only line in the cart
+
+    # «هودی هارو بهم نشون بده»: the products called a hoodie, not a knit or an autumn set filed under «هودی».
+    out = await say("هودی هارو بهم نشون بده")
+    images = {m["image_url"] for m in out if m["image_url"]}
+    assert {f"/media/x/{h1['id']}.jpg", f"/media/x/{h2['id']}.jpg"} <= images, out
+    assert not images & {f"/media/x/{rows[t]['id']}.jpg" for t in ("شلوار جین ترک", "مجموعه لباس پاییزه مردانه",
+                                                                    "بافت برند PULLMARK طرح CLUB STUDIOS")}, out
+
+    # «✅ ثبت سفارش» right under a product's photo: that product joins the jeans in the order.
+    autumn = rows["مجموعه لباس پاییزه مردانه"]
+    out = await say(chat_engine.PICK + "مجموعه لباس پاییزه مردانه")
+    assert f"/media/x/{autumn['id']}.jpg" in [m["image_url"] for m in out]
+    from app.services import chat_menu
+    m = (await say(chat_menu.ORDER))[-1]
+    assert "به سبدت اضافه شد" in m["text"] and "خلاصهٔ سفارشت" in m["text"], m["text"]
+    assert "شلوار جین ترک" in m["text"] and "مجموعه لباس پاییزه مردانه" in m["text"]
+    assert [i["product_id"] for i in (await _state(sid))["order"]["items"]] == [jeans["id"], autumn["id"]]
+    # A second tap is the same summary, the product isn't added twice.
+    m = (await say(chat_menu.ORDER))[-1]
+    assert "اضافه شد" not in m["text"] and len((await _state(sid))["order"]["items"]) == 2
+
+    # «نه اینو نمیخوام» about a product just shown (not in the cart): the model's empty list doesn't empty the cart.
+    await say(chat_engine.PICK + "هودی ونگوگ")
+    llm.answers = [{"reply": "باشه، کدوم مدل رو می‌خوای؟", "intent": "order", "order_action": "update",
+                    "order": {"items": []}}]
+    await say("نه اینو نمیخوام")
+    assert len((await _state(sid))["order"]["items"]) == 2
+    # «این» picking another product, the model listing only that one: it joins the cart, the jeans stay.
+    await say(chat_engine.PICK + "هودی طرح‌دار مشکی و آبی")
+    llm.answers = [{"reply": "باشه", "intent": "order", "order_action": "update",
+                    "order": {"items": [{"product_id": h1["id"], "qty": 1, "variant": "مشکی"}]}}]
+    m = (await say("این"))[-1]
+    assert [i["product_id"] for i in (await _state(sid))["order"]["items"]] == [h1["id"], jeans["id"], autumn["id"]]
+    assert "برداشته شد" not in m["text"]
+
+
+def test_named_in_reply_and_key_mash_address():
+    from types import SimpleNamespace as P
+    rows = [P(id=1, title="شلوار جین ترک", category="شلوار"), P(id=2, title="هودی طرح‌دار مشکی و آبی", category="هودی"),
+            P(id=3, title="هودی ونگوگ", category="هودی"), P(id=4, title="هودی چارلی چاپلین", category="هودی")]
+    assert chat_engine.named_in_reply("هودی طرح‌دار مشکی و آبی یا هودی ونگوگ؟", rows) == [2, 3]
+    assert chat_engine.named_in_reply("هودی‌هامون پنبه‌ای هستن 🌸", rows) == []
+    rows += [P(id=5, title="بافت برند PULLMARK", category="هودی", category_hint="", tags=[], description=""),
+             P(id=6, title="مجموعه لباس پاییزه مردانه", category="هودی", category_hint="", tags=[], description="")]
+    for r in rows[:4]:
+        r.category_hint, r.tags, r.description = "", [], ""
+    named = chat_engine._named(rows, chat_engine._query_words("هودی هارو بهم نشون بده"))[0]
+    assert sorted(p.id for p in named) == [2, 3, 4]
+    assert not chat_engine.address_ok("لعرلاار اذذ. اذ ذذذ ۶۷۸۸۸۶۶۶۷۸")
+    assert chat_engine.address_ok("تهران خیابان ولیعصر کوچه ۳ پلاک ۷") and chat_engine.address_ok("۱۲۳۴۵۶۷۸۹۰")
+    for t in ("hi", "ok", "thanks", "hello there", "/start"):
+        assert not chat_engine.from_en_layout(t), t

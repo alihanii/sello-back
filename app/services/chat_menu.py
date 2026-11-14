@@ -217,7 +217,18 @@ async def handle(db: AsyncSession, conv: ChatConversation, store: Store, agent: 
         return [_r(EMPTY)]
     if t == ORDER:
         state.pop("menu", None)
-        return await next_step(db, conv, store, agent, state)
+        lead = ""
+        shown = state.get("prev_shown")
+        placed = await ce.open_order(db, store.id, state.get("order_id")) if not items else None
+        if (shown and not placed and shown not in {i.get("product_id") for i in items}
+                and (p := await _product(db, store.id, {"product_id": shown}))):
+            # Tapped right under a product's photo: that product goes in the cart (next to what's there), not only
+            # the old summary again.
+            items.append({"product_id": p.id, "qty": 1, "variant": ""})
+            state["order"] = {**order, "items": items}
+            state.pop("awaiting", None)
+            lead = f"«{p.title[:60]}» به سبدت اضافه شد ✅"
+        return await next_step(db, conv, store, agent, state, lead)
     if t == DETAILS:
         state.pop("menu", None)
         last = await ce.last_order(db, conv)
