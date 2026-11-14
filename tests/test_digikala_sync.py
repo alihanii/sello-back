@@ -1,5 +1,7 @@
 """Digikala after publishing: admin switch, review state → price + stock, orders into the unified list."""
 
+from types import SimpleNamespace
+
 from app.core.db import SessionLocal
 from app.core.security import encrypt_credentials
 from app.models import Channel, ChannelListing, Product
@@ -166,3 +168,35 @@ async def test_retry_after_a_saved_product_does_not_make_a_twin(client):
                              response={"data": {"product_id": 23246846}}))
         await db.flush()
         assert await _dk_saved_before(db, ln) == 23246846
+
+
+async def test_digikala_main_picture_becomes_the_products_main_picture(client, monkeypatch):
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+
+    import app.services.product_images as pi
+    from app.models import ProductImage
+
+    async def made(ctx, **kw):
+        return "/media/1/clean.png"
+
+    async def yes(task="x"):
+        return True
+
+    monkeypatch.setattr(pi, "make_photo", made)
+    monkeypatch.setattr(dk.ai, "ai_available", yes)
+    h = await login(client, "09128830443")
+    sid = (await client.post("/stores", json={"name": "اصلی"}, headers=h)).json()["id"]
+    pid = (await client.post(f"/stores/{sid}/products", headers=h, json={"title": "کت", "price": 1000})).json()["id"]
+    async with SessionLocal() as db:
+        db.add(ProductImage(product_id=pid, url="/media/1/raw.jpg", position=0))
+        await db.commit()
+        product = (await db.execute(select(Product).where(Product.id == pid)
+                                    .options(selectinload(Product.images)))).scalar_one()
+        ctx = SimpleNamespace(db=db)
+        assert await dk.digikala._main_image(ctx, product, "") == "/media/1/clean.png"
+        await db.commit()
+        imgs = (await db.execute(select(ProductImage).where(ProductImage.product_id == pid)
+                                 .order_by(ProductImage.position))).scalars().all()
+        assert [(i.url, i.origin_url) for i in imgs] == [("/media/1/clean.png", "/media/1/raw.jpg"),
+                                                         ("/media/1/raw.jpg", "")]
