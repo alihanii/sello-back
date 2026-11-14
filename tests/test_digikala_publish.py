@@ -87,6 +87,8 @@ async def test_main_image_made_once_with_the_smart_product_pipeline(monkeypatch)
     made = []
 
     async def fake_make_photo(ctx, **kw):
+        from app.services.plans import MARKETPLACE_MAIN_IMAGE
+        assert MARKETPLACE_MAIN_IMAGE.get()  # the plan's AI-pictures switch doesn't apply to the Digikala main picture
         made.append(kw)
         return "/media/1/clean.png"
 
@@ -142,3 +144,24 @@ async def test_category_found_for_seller_words_and_ai_out_of_quota(monkeypatch):
     cat, _ = await dk.digikala._pick_category(ctx, "tok", product)
     assert cat["id"] == 9 and "category_ai" in ctx.steps
     assert dk._category_items({"data": {"categories": [{"id": 2, "title": "پوشاک", "is_leaf": False}]}}) == []
+
+
+async def test_plan_without_ai_pictures_still_makes_the_marketplace_main_picture(client, monkeypatch):
+    from app.core.db import SessionLocal
+    from app.services import plans
+    from app.services.plans import MARKETPLACE_MAIN_IMAGE, credit_problem
+    from tests.conftest import login
+
+    async def no_pictures(db, user):
+        return {"ai_images": False, "monthly_ai_credits": 100}
+
+    h = await login(client, "09128830552")
+    sid = (await client.post("/stores", json={"name": "عکس"}, headers=h)).json()["id"]
+    monkeypatch.setattr(plans, "limits_for", no_pictures)
+    async with SessionLocal() as db:
+        assert "عکس" in await credit_problem(db, sid, "image_edit")  # free plan: no AI pictures
+        token = MARKETPLACE_MAIN_IMAGE.set(True)
+        try:
+            assert await credit_problem(db, sid, "image_edit") == ""
+        finally:
+            MARKETPLACE_MAIN_IMAGE.reset(token)
