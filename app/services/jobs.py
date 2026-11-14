@@ -13,10 +13,10 @@ from sqlalchemy.orm import selectinload
 from app.core.db import utcnow
 from app.core.security import encrypt_credentials
 from app.models import (
-    AiProductRequest, Channel, ChannelListing, CrawlItem, CrawlSource, Operation, Product, ProductImage,
+    AiProductRequest, Channel, ChannelListing, CrawlItem, CrawlSource, Operation, OperationStep, Product, ProductImage,
     Store,
 )
-from app.platforms.base import CrawledItem, EDIT_PRODUCT, PlatformError
+from app.platforms.base import CrawledItem, EDIT_PRODUCT, PlatformError, PublishResult
 from app.platforms.registry import get_adapter
 from app.services import ai, categories, product_code
 from app.services.images import to_jpeg
@@ -103,6 +103,19 @@ async def _paced(ctx: OpContext, channel: Channel) -> bool:
     return True
 
 
+async def _dk_saved_before(db, listing) -> Any:
+    """Digikala product id from an earlier publish of this listing that saved the product but then failed."""
+    if not listing:
+        return None
+    from app.platforms.digikala import _product_id
+
+    rows = (await db.execute(select(OperationStep.response).join(Operation, Operation.id == OperationStep.operation_id)
+                             .where(Operation.type == "publish", Operation.ref_type == "listing",
+                                    Operation.ref_id == listing.id, OperationStep.name == "save")
+                             .order_by(OperationStep.id.desc()).limit(5))).scalars().all()
+    return next((pid for r in rows if (pid := _product_id({"data": r}))), None)
+
+
 async def run_publish(ctx: OpContext) -> None:
     op, db = ctx.op, ctx.db
     fmt = (op.payload or {}).get("format") or "post"
@@ -131,8 +144,17 @@ async def run_publish(ctx: OpContext) -> None:
             s.response = {"errors": errors}
             if errors:
                 raise PlatformError(" ".join(errors), "validation", EDIT_PRODUCT)
-        result = await adapter.publish(ctx, channel, product, store,
-                                       existing_remote_id=listing.remote_id if listing else "")
+        saved_before = await _dk_saved_before(db, listing) if channel.platform == "digikala" else None
+        if saved_before:
+            # An earlier attempt already created the product on Digikala (it failed after saving): don't make a twin.
+            async with ctx.step("already_saved", "محصول در تلاش قبلی در دیجی‌کالا ثبت شده بود",
+                                request={"product_id": saved_before}):
+                pass
+            result = PublishResult(f"DKP-{saved_before}", f"https://www.digikala.com/product/dkp-{saved_before}/",
+                                   {"recovered": True})
+        else:
+            result = await adapter.publish(ctx, channel, product, store,
+                                           existing_remote_id=listing.remote_id if listing else "")
     except Exception as exc:
         if listing:
             listing.status = "failed"

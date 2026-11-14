@@ -139,3 +139,30 @@ async def test_send_code_runs_inline_and_saves_the_challenge(client, monkeypatch
     r = await client.post(f"/stores/{sid}/channels/digikala/send-code", headers=h,
                           json={"platform": "digikala", "data": {"phone": "09121234567"}})
     assert r.status_code == 400 and r.json()["detail"]["message"] == "کپچا لازم است"
+
+
+async def test_retry_after_a_saved_product_does_not_make_a_twin(client):
+    """Digikala saved the product but our step failed after that: the retry reuses the saved product id."""
+    from app.models import Operation, OperationStep
+    from app.services.jobs import _dk_saved_before
+
+    h = await login(client, "09128830661")
+    sid = (await client.post("/stores", json={"name": "تکرار"}, headers=h)).json()["id"]
+    p = (await client.post(f"/stores/{sid}/products", headers=h, json={"title": "ترنچ کت", "price": 1000})).json()
+    async with SessionLocal() as db:
+        ch = Channel(store_id=sid, platform="digikala", status="connected", display_name="د",
+                     credentials_encrypted=encrypt_credentials({"access_token": "t"}), config={})
+        db.add(ch)
+        await db.flush()
+        ln = ChannelListing(product_id=p["id"], channel_id=ch.id, status="failed")
+        db.add(ln)
+        await db.flush()
+        assert await _dk_saved_before(db, ln) is None
+        op = Operation(store_id=sid, type="publish", title_fa="x", channel_id=ch.id, ref_type="listing", ref_id=ln.id,
+                       status="failed")
+        db.add(op)
+        await db.flush()
+        db.add(OperationStep(operation_id=op.id, order=1, name="save", label_fa="ثبت", status="succeeded",
+                             response={"data": {"product_id": 23246846}}))
+        await db.flush()
+        assert await _dk_saved_before(db, ln) == 23246846
