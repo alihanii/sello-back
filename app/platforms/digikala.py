@@ -49,6 +49,48 @@ MISC_BRAND_ID = 719  # «متفرقه»
 def _norm(v: str) -> str:
     return (v or "").strip().replace("ي", "ی").replace("ك", "ک").lower()
 
+# Seller words Digikala doesn't use as category names, mapped to the ones it does.
+_CATEGORY_WORDS = {
+    "اورشرت": ["پیراهن مردانه", "پیراهن"], "اوورشرت": ["پیراهن مردانه", "پیراهن"], "اور": ["پیراهن"],
+    "اورسایز": ["تی شرت"], "شومیز": ["شومیز و بلوز زنانه", "بلوز"], "هودی": ["سویشرت و هودی", "هودی"],
+    "سویشرت": ["سویشرت و هودی"], "بافت": ["پلیور و بافت", "پلیور"], "پلیور": ["پلیور و بافت"],
+    "تیشرت": ["تی شرت", "تی شرت و پولو شرت"], "تی‌شرت": ["تی شرت"], "پولوشرت": ["تی شرت و پولو شرت"],
+    "کاپشن": ["کاپشن و پافر"], "پافر": ["کاپشن و پافر"], "شلوارک": ["شلوارک"], "اسلش": ["شلوار"],
+    "جین": ["شلوار جین"], "کراپ": ["تاپ و کراپ"], "ست": ["ست لباس"],
+}
+
+
+def _ai_skipped(exc: Exception) -> str:
+    return f"هوش مصنوعی جواب نداد ({getattr(exc, 'message_fa', '') or 'خطا'})؛ بدون آن ادامه داده شد."
+
+
+def _category_items(payload: Any) -> list[dict]:
+    """Leaf categories in a search answer, whatever its shape (data.items, data.categories, a list...)."""
+    out: list[dict] = []
+
+    def walk(v: Any, depth: int = 0) -> None:
+        if depth > 5:
+            return
+        if isinstance(v, list):
+            for x in v:
+                walk(x, depth + 1)
+        elif isinstance(v, dict):
+            name = v.get("text") or v.get("title") or v.get("title_fa") or v.get("name")
+            if v.get("id") and name and isinstance(name, str) and v.get("leaf", v.get("is_leaf", True)) is not False:
+                out.append({"id": v["id"], "title": name, "path": v.get("path") or v.get("breadcrumb") or ""})
+            for k, x in v.items():
+                if isinstance(x, (dict, list)) and k not in ("path", "breadcrumb", "parent", "parents"):
+                    walk(x, depth + 1)
+
+    walk(payload.get("data") if isinstance(payload, dict) else payload)
+    seen, uniq = set(), []
+    for c in out:
+        if c["id"] not in seen:
+            seen.add(c["id"])
+            uniq.append(c)
+    return uniq
+
+
 
 def _tokens(*texts: str) -> tuple[str, list[str]]:
     blob = _norm(" ".join(texts))
@@ -617,38 +659,78 @@ class DigikalaAdapter:
         except Exception:  # noqa: BLE001 - copy is optional; the listing still goes with the seller's own text
             return {}
 
-    async def _pick_category(self, ctx, token: str, product: Product) -> tuple[dict, dict]:
-        keywords = [k for k in (product.category_hint, " ".join(product.title.split()[:2]), product.title.split()[0]) if k]
-        candidates: list[dict] = []
-        async with ctx.step("category_search", "جستجوی دستهٔ مناسب در دیجی‌کالا", request={"keywords": keywords}) as s:
-            for kw in dict.fromkeys(keywords):
-                q = httpx.QueryParams({"keyword": kw})
-                data = await self._request("GET", f"/api/v2/product-creation/search/category/v2/{quote(kw)}?{q}",
-                                           token=token, referer=f"{BASE_URL}/pwa/product/create")
-                for it in (data.get("data") or {}).get("items") or []:
-                    if it.get("id") and it.get("leaf", True) and all(c["id"] != it["id"] for c in candidates):
-                        candidates.append({"id": it["id"], "title": it.get("text") or it.get("title") or "",
-                                           "path": it.get("path") or ""})
-                if len(candidates) >= 5:
-                    break
-            s.response = {"candidates": candidates[:10]}
-        if not candidates:
-            raise PlatformError("دستهٔ مناسبی در دیجی‌کالا برای این محصول پیدا نشد؛ «دسته» را در مشخصات محصول دقیق‌تر بنویسید.",
-                                "no_category", EDIT_PRODUCT)
+    async def _search_categories(self, token: str, kw: str) -> tuple[list[dict], Any]:
+        q = httpx.QueryParams({"keyword": kw})
+        data = await self._request("GET", f"/api/v2/product-creation/search/category/v2/{quote(kw)}?{q}",
+                                   token=token, referer=f"{BASE_URL}/pwa/product/create")
+        return _category_items(data), data
 
-        ordered = candidates[:10]
+    async def _category_terms(self, ctx, product: Product) -> list[str]:
+        """What a Digikala seller would type in the category box for this product (e.g. «اورشرت» → «پیراهن مردانه»),
+        written by AI. Empty when AI is off."""
+        if not await ai.ai_available("field_fill"):
+            return []
+        try:
+            res = await ai.generate_json(
+                task="field_fill", store_id=product.store_id,
+                system=("Digikala (Iranian marketplace) category search. Give the Persian names of the Digikala leaf "
+                        "categories this product belongs in, the way Digikala names them (e.g. «پیراهن مردانه», "
+                        "«سویشرت و هودی مردانه», «تی شرت و پولو شرت مردانه», «کیف دستی زنانه»), most likely first, then "
+                        "1-2 shorter general words (e.g. «پیراهن»). No brand names. Reply JSON {\"terms\": [up to 5]}."),
+                prompt=json.dumps({"title": product.title, "category": product.category_hint,
+                                   "description": (product.description or "")[:400]}, ensure_ascii=False))
+            terms = res.get("terms") if isinstance(res, dict) else None
+            return [str(t).strip()[:60] for t in (terms or []) if str(t).strip()][:5]
+        except Exception:  # noqa: BLE001
+            return []
+
+    async def _pick_category(self, ctx, token: str, product: Product) -> tuple[dict, dict]:
+        title = re.sub(r"\s+(برند|مدل|طرح)\s+.*$", "", product.title).strip()  # «اورشرت برند X مدل Y» → «اورشرت»
+        hint = (product.category_hint or "").replace("›", ">").replace("/", ">")
+        keywords = [k.strip() for k in (hint.split(">")[-1], hint, title, " ".join(product.title.split()[:2]),
+                                         product.title.split()[0]) if k and k.strip()]
+        keywords += [w for k in list(keywords) for w in _CATEGORY_WORDS.get(_norm(k.split()[0]), [])]
+        candidates: list[dict] = []
+        tried: dict[str, Any] = {}
+
+        async def search(kws: list[str]) -> None:
+            for kw in dict.fromkeys(kws):
+                if kw in tried or len(candidates) >= 5:
+                    continue
+                items, raw = await self._search_categories(token, kw)
+                tried[kw] = len(items) if items else json.dumps(raw, ensure_ascii=False)[:300]
+                for it in items:
+                    if all(c["id"] != it["id"] for c in candidates):
+                        candidates.append(it)
+
+        async with ctx.step("category_search", "جستجوی دستهٔ مناسب در دیجی‌کالا", request={"keywords": keywords}) as s:
+            await search(keywords)
+            if len(candidates) < 2:  # the seller's words aren't Digikala's: ask AI what Digikala calls it
+                await search(await self._category_terms(ctx, product))
+            s.response = {"candidates": candidates[:10], "searched": tried}
+        if not candidates:
+            raise PlatformError("دستهٔ مناسبی در دیجی‌کالا برای این محصول پیدا نشد؛ «دسته» را در مشخصات محصول دقیق‌تر بنویسید "
+                                "(مثلاً «پیراهن مردانه»).", "no_category", EDIT_PRODUCT, tried)
+
+        # Without AI (off, or its key out of quota) the candidates closest to the product's own words go first.
+        words = set(_norm(f"{product.title} {product.category_hint or ''}").replace("‌", " ").split())
+        ordered = sorted(candidates[:10], key=lambda c: -len(words & set(_norm(c["title"]).replace("‌", " ").split())))
         if len(ordered) > 1 and await ai.ai_available("field_fill"):
             async with ctx.step("category_ai", "انتخاب دسته با هوش مصنوعی") as s:
-                res = await ai.generate_json(
-                    task="field_fill", store_id=product.store_id,
-                    system="You pick the best Digikala leaf category for a product. Reply JSON {\"id\": <id>}.",
-                    prompt=json.dumps({"product": {"title": product.title, "category_hint": product.category_hint,
-                                                   "description": (product.description or "")[:500]},
-                                       "categories": ordered}, ensure_ascii=False))
-                best = next((c for c in ordered if str(c["id"]) == str(res.get("id"))), None)
+                try:
+                    res = await ai.generate_json(
+                        task="field_fill", store_id=product.store_id,
+                        system="You pick the best Digikala leaf category for a product. Reply JSON {\"id\": <id>}.",
+                        prompt=json.dumps({"product": {"title": product.title, "category_hint": product.category_hint,
+                                                       "description": (product.description or "")[:500]},
+                                           "categories": ordered}, ensure_ascii=False))
+                except Exception as exc:  # noqa: BLE001 - publishing goes on with the word match
+                    res = {}
+                    s.message_fa = _ai_skipped(exc)
+                best = next((c for c in ordered if isinstance(res, dict) and str(c["id"]) == str(res.get("id"))), None)
                 if best:
                     ordered = [best] + [c for c in ordered if c is not best]
-                s.response = {"picked": best}
+                s.response = {"picked": best or ordered[0], "by": "ai" if best else "words"}
 
         restricted = []
         for cat in ordered[:4]:
@@ -724,20 +806,24 @@ class DigikalaAdapter:
         if missing and await ai.ai_available("field_fill"):
             n_req = sum(f["required"] for f in missing)
             async with ctx.step("attributes_ai", f"پر کردن {len(missing)} ویژگی ({n_req} اجباری) با هوش مصنوعی") as s:
-                res = await ai.generate_json(
-                    task="field_fill", store_id=product.store_id,
-                    system=("Fill Digikala product attributes from the product text. For select fields answer with one "
-                            "option id, for multi_select a list of option ids, for number a number, else short Persian "
-                            "text. Fields with required=true must always get a value: when the text doesn't say, choose "
-                            "the most neutral/likely option. For optional fields give a value only when the product text "
-                            "makes it clear, else null. Never invent specs that contradict the text. "
-                            "Reply JSON {\"<field id>\": value}."),
-                    prompt=json.dumps({"product": {"title": product.title, "description": (product.description or "")[:1500],
-                                                   "brand": product.brand, "category": product.category_hint,
-                                                   "attributes": product.attributes},
-                                       "fields": [{k: f[k] for k in ("id", "title", "type", "unit", "required", "options")}
-                                                  for f in missing]},
-                                      ensure_ascii=False))
+                try:
+                    res = await ai.generate_json(
+                        task="field_fill", store_id=product.store_id,
+                        system=("Fill Digikala product attributes from the product text. For select fields answer with one "
+                                "option id, for multi_select a list of option ids, for number a number, else short Persian "
+                                "text. Fields with required=true must always get a value: when the text doesn't say, choose "
+                                "the most neutral/likely option. For optional fields give a value only when the product text "
+                                "makes it clear, else null. Never invent specs that contradict the text. "
+                                "Reply JSON {\"<field id>\": value}."),
+                        prompt=json.dumps({"product": {"title": product.title, "description": (product.description or "")[:1500],
+                                                       "brand": product.brand, "category": product.category_hint,
+                                                       "attributes": product.attributes},
+                                           "fields": [{k: f[k] for k in ("id", "title", "type", "unit", "required", "options")}
+                                                      for f in missing]},
+                                          ensure_ascii=False))
+                except Exception as exc:  # noqa: BLE001 - required fields still get the neutral first option below
+                    res = {}
+                    s.message_fa = _ai_skipped(exc)
                 res = res if isinstance(res, dict) else {}
                 values.update({str(k): v for k, v in res.items() if v not in (None, "", [])})
                 s.response = res
