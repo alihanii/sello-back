@@ -104,6 +104,19 @@ def _from_text(field: dict, text: str) -> Any:
     return None
 
 
+def _product_id(payload: Any) -> Any:
+    """The new product's id in a save answer: {data: {product_id}}, {data: {data: {product_id}}}, {data: {product: {id}}}."""
+    for _ in range(4):
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("product_id"):
+            return payload["product_id"]
+        if isinstance(payload.get("product"), dict) and payload["product"].get("id"):
+            return payload["product"]["id"]
+        payload = payload.get("data")
+    return None
+
+
 def _ai_skipped(exc: Exception) -> str:
     return f"هوش مصنوعی جواب نداد ({getattr(exc, 'message_fa', '') or 'خطا'})؛ بدون آن ادامه داده شد."
 
@@ -623,7 +636,7 @@ class DigikalaAdapter:
                                         body={"category_id": cat_id, "draft_product_id": str(draft_id),
                                               "only_b2b": False, "use_temp_images": True})
             data = saved.get("data") or {}
-            product_id = data.get("product_id") or (data.get("product") or {}).get("id") or data.get("id")
+            product_id = _product_id(saved)
             s.response = data
         if not product_id:
             raise PlatformError("دیجی‌کالا محصول را ذخیره نکرد؛ جزئیات در لاگ است.", "save_failed", detail=saved)

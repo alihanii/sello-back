@@ -193,3 +193,10 @@ def test_ai_429_names_the_provider_and_says_credit_is_out():
         _raise_for(r)
     except AIError as exc:
         assert "AvalAI" in exc.message_fa and "اعتبار" in exc.message_fa and exc.code == "ai_rate_limited"
+
+
+def test_product_id_from_any_save_answer():
+    assert dk._product_id({"data": {"data": {"product_id": 23246846}}}) == 23246846
+    assert dk._product_id({"data": {"product_id": 5}}) == 5
+    assert dk._product_id({"data": {"product": {"id": 7}}}) == 7
+    assert dk._product_id({"data": {}}) is None
