@@ -105,3 +105,40 @@ async def test_main_image_made_once_with_the_smart_product_pipeline(monkeypatch)
     product.images[0].origin_url = "/media/1/orig.jpg"  # already cleaned by smart product creation
     product.source_ref = {}
     assert await dk.digikala._main_image(ctx, product, "") == ""
+
+
+async def test_category_found_for_seller_words_and_ai_out_of_quota(monkeypatch):
+    """«اورشرت» isn't a Digikala category name: Digikala's own name is searched too. An AI key out of quota doesn't stop
+    publishing: the closest category by words goes first."""
+    from app.services.ai import AIError
+
+    searched = []
+
+    async def fake_request(self, method, path, *, token=None, body=None, referer=None, files=None, data=None):
+        if "/search/category/" in path:
+            kw = path.split("keyword=")[-1]
+            searched.append(kw)
+            if "%D9%BE%DB%8C%D8%B1%D8%A7%D9%87%D9%86" in kw:  # «پیراهن…»
+                return {"data": {"categories": [{"id": 8, "title": "تی شرت مردانه", "is_leaf": True},
+                                                {"id": 9, "title": "پیراهن مردانه", "is_leaf": True},
+                                                {"id": 2, "title": "پوشاک", "is_leaf": False}]}}
+            return {"data": {"items": []}}
+        if "/category/" in path and path.endswith("/validation"):
+            return {"data": {"is_valid": True, "bind": {"brands": []}}}
+        return {"data": {}}
+
+    async def yes(task="x"):
+        return True
+
+    async def busy(**kw):
+        raise AIError("سقف استفاده از کلید API پر شده است.", code="ai_rate_limited")
+
+    monkeypatch.setattr(dk.DigikalaAdapter, "_request", fake_request)
+    monkeypatch.setattr(dk.ai, "ai_available", yes)
+    monkeypatch.setattr(dk.ai, "generate_json", busy)
+    product = SimpleNamespace(title="اورشرت برند Polizie مدل Win Again پیراهن مردانه", category_hint="", description="",
+                              store_id=1)
+    ctx = Ctx()
+    cat, _ = await dk.digikala._pick_category(ctx, "tok", product)
+    assert cat["id"] == 9 and "category_ai" in ctx.steps
+    assert dk._category_items({"data": {"categories": [{"id": 2, "title": "پوشاک", "is_leaf": False}]}}) == []
