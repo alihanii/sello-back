@@ -314,7 +314,10 @@ def _raise_for(resp: httpx.Response) -> None:
         raise AIError("این مدل روی پلن رایگان گوگل سهمیه ندارد (limit 0)؛ برای استفاده باید Billing را روی پروژهٔ گوگلِ این کلید "
                       "فعال کنی یا کلید دیگری (پولی یا متیس) برای این کار بگذاری.", code="ai_free_tier", detail=resp.text[:500])
     if resp.status_code == 429:
-        raise AIError("سقف استفاده از کلید API پر شده است.", code="ai_rate_limited", detail=resp.text[:500])
+        # The provider's own quota/rate limit on this key (HTTP 429), not a Foroshify rule: plan limits live in admin.
+        raise AIError("سرویس‌دهندهٔ هوش مصنوعی (گوگل/OpenRouter/OpenAI) گفت سهمیهٔ این کلید پر شده (خطای ۴۲۹)؛ این محدودیت "
+                      "از خود سرویس‌دهنده است، نه از پلن‌های فروشیفای. سهمیهٔ کلید را در پنل همان سرویس ببین یا کلید دیگری "
+                      "در ادمین اضافه کن." + (f" ({said})" if said else ""), code="ai_rate_limited", detail=resp.text[:500])
     if resp.status_code in (500, 502, 503, 504):
         raise AIError("سرویس هوش مصنوعی الان شلوغ است (خطای سمت گوگل/سرویس‌دهنده)؛ چند دقیقه بعد دوباره امتحان کن.",
                       code=f"ai_http_{resp.status_code}", detail=resp.text[:500])
